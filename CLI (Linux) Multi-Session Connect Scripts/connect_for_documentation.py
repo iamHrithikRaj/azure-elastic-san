@@ -1,7 +1,40 @@
-import subprocess, sys, os, argparse, json, time
+import argparse
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+try:
+    from urllib.request import ProxyHandler, Request, build_opener
+    from urllib.error import HTTPError, URLError
+except ImportError:
+    from urllib2 import HTTPError, ProxyHandler, Request, URLError, build_opener
+
 # for compatibility between python2 and python3 
 if hasattr(__builtins__, 'raw_input'):
       input = raw_input
+
+try:
+    string_types = (basestring,)
+except NameError:
+    string_types = (str,)
+
+IMDS_COMPUTE_URL = "http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01"
+IMDS_TIMEOUT_SECONDS = 5
+AZ_CLI_TIMEOUT_SECONDS = 30
+MAX_IQN_UTF8_BYTES = 223
+PHYSICAL_ZONE_PATTERN = re.compile(r"^[a-z0-9.-]+$")
+SUBSCRIPTION_ID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+
+class ZonalAffinityError(Exception):
+    pass
 
 # determine os and package manager type
 package_manager = ''
@@ -109,6 +142,248 @@ def get_iqns(subscription, resource_group_name, elastic_san_name, volume_group_n
     target_portal_port = storage_target["targetPortalPort"]
     return target_iqn, target_portal_hostname, target_portal_port
 
+
+def _decode_output(value):
+    return value.decode("utf-8") if isinstance(value, bytes) else value
+
+
+def _run_az_command(command, description):
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as error:
+        raise ZonalAffinityError("{} failed to start: {}".format(description, error))
+
+    result = []
+    communication_errors = []
+
+    def communicate():
+        try:
+            result.append(process.communicate())
+        except (OSError, ValueError) as error:
+            communication_errors.append(error)
+
+    communication_thread = threading.Thread(target=communicate)
+    communication_thread.daemon = True
+    communication_thread.start()
+    communication_thread.join(AZ_CLI_TIMEOUT_SECONDS)
+    if communication_thread.is_alive():
+        process.kill()
+        communication_thread.join()
+        raise ZonalAffinityError(
+            "{} timed out after {} seconds".format(
+                description, AZ_CLI_TIMEOUT_SECONDS
+            )
+        )
+    if communication_errors:
+        raise ZonalAffinityError(
+            "{} failed while collecting output: {}".format(
+                description, communication_errors[0]
+            )
+        )
+
+    out, err = result[0]
+    out = _decode_output(out)
+    err = _decode_output(err).strip()
+    if process.returncode != 0:
+        detail = err if err else "exit code {}".format(process.returncode)
+        raise ZonalAffinityError("{} failed: {}".format(description, detail))
+    return out
+
+
+def get_vm_compute_metadata():
+    request = Request(IMDS_COMPUTE_URL, headers={"Metadata": "true"})
+    opener = build_opener(ProxyHandler({}))
+    try:
+        response = opener.open(request, timeout=IMDS_TIMEOUT_SECONDS)
+        try:
+            payload = _decode_output(response.read())
+        finally:
+            response.close()
+    except HTTPError as error:
+        raise ZonalAffinityError("IMDS request failed with HTTP status {}".format(error.code))
+    except URLError as error:
+        raise ZonalAffinityError("IMDS request failed: {}".format(error.reason))
+    except socket.timeout:
+        raise ZonalAffinityError(
+            "IMDS request timed out after {} seconds".format(IMDS_TIMEOUT_SECONDS)
+        )
+
+    try:
+        compute = json.loads(payload)
+    except ValueError as error:
+        raise ZonalAffinityError("IMDS returned invalid JSON: {}".format(error))
+    if not isinstance(compute, dict):
+        raise ZonalAffinityError("IMDS compute metadata must be a JSON object")
+    return compute
+
+
+def _required_metadata_value(compute, field_name):
+    value = compute.get(field_name)
+    if not isinstance(value, string_types) or not value.strip():
+        raise ZonalAffinityError(
+            "IMDS compute metadata is missing a valid '{}' value".format(field_name)
+        )
+    return value.strip()
+
+
+def canonicalize_subscription_id(subscription_id, source):
+    if not isinstance(subscription_id, string_types):
+        raise ZonalAffinityError("{} subscription ID must be a GUID".format(source))
+    canonical_subscription_id = subscription_id.strip().lower()
+    if SUBSCRIPTION_ID_PATTERN.match(canonical_subscription_id) is None:
+        raise ZonalAffinityError("{} subscription ID must be a GUID".format(source))
+    return canonical_subscription_id
+
+
+def resolve_cli_subscription_id(subscription):
+    command = ["az", "account", "show"]
+    if subscription is not None:
+        command.extend(["--subscription", subscription])
+    command.extend(["--query", "id", "--output", "tsv"])
+    subscription_id = _run_az_command(
+        command, "Azure CLI subscription resolution"
+    ).strip()
+    if not subscription_id:
+        raise ZonalAffinityError("Azure CLI subscription resolution returned an empty ID")
+    return canonicalize_subscription_id(subscription_id, "Azure CLI")
+
+
+def get_azure_locations(subscription_id):
+    subscription_id = canonicalize_subscription_id(subscription_id, "Azure CLI")
+    url = (
+        "https://management.azure.com/subscriptions/{}/locations"
+        "?api-version=2022-12-01"
+    ).format(subscription_id)
+    command = [
+        "az",
+        "rest",
+        "--method",
+        "get",
+        "--url",
+        url,
+    ]
+    payload = _run_az_command(command, "Azure location REST query")
+    try:
+        response = json.loads(payload)
+    except ValueError as error:
+        raise ZonalAffinityError("Azure location REST query returned invalid JSON: {}".format(error))
+    if not isinstance(response, dict):
+        raise ZonalAffinityError("Azure location REST response must be a JSON object")
+    locations = response.get("value")
+    if not isinstance(locations, list):
+        raise ZonalAffinityError(
+            "Azure location REST response must contain a top-level 'value' array"
+        )
+    return locations
+
+
+def map_logical_to_physical_zone(locations, location_name, logical_zone):
+    normalized_location = location_name.strip().lower()
+    region = None
+    for candidate in locations:
+        if not isinstance(candidate, dict):
+            raise ZonalAffinityError("Azure location REST response contains a malformed region entry")
+        candidate_name = candidate.get("name")
+        if (
+            isinstance(candidate_name, string_types)
+            and candidate_name.strip().lower() == normalized_location
+        ):
+            region = candidate
+            break
+
+    if region is None:
+        raise ZonalAffinityError(
+            "Azure location REST response has no region matching IMDS location '{}'".format(
+                location_name
+            )
+        )
+
+    if "availabilityZoneMappings" not in region:
+        raise ZonalAffinityError(
+            "Region '{}' is missing availabilityZoneMappings".format(region.get("name"))
+        )
+
+    mappings = region["availabilityZoneMappings"]
+    if not isinstance(mappings, list) or not mappings:
+        raise ZonalAffinityError(
+            "Region '{}' has malformed availabilityZoneMappings".format(region.get("name"))
+        )
+
+    normalized_logical_zone = logical_zone.strip()
+    physical_zone = None
+    for mapping in mappings:
+        if not isinstance(mapping, dict):
+            raise ZonalAffinityError("availabilityZoneMappings contains a malformed entry")
+        mapped_logical_zone = mapping.get("logicalZone")
+        mapped_physical_zone = mapping.get("physicalZone")
+        if (
+            not isinstance(mapped_logical_zone, string_types)
+            or not mapped_logical_zone.strip()
+            or not isinstance(mapped_physical_zone, string_types)
+            or not mapped_physical_zone.strip()
+        ):
+            raise ZonalAffinityError("availabilityZoneMappings contains a malformed entry")
+        if mapped_logical_zone.strip() == normalized_logical_zone:
+            physical_zone = mapped_physical_zone.strip()
+            break
+
+    if physical_zone is None:
+        raise ZonalAffinityError(
+            "Region '{}' has no availability-zone mapping for logical zone '{}'".format(
+                region.get("name"), logical_zone
+            )
+        )
+    return physical_zone
+
+
+def resolve_physical_zone(subscription):
+    compute = get_vm_compute_metadata()
+    logical_zone = compute.get("zone")
+    if not isinstance(logical_zone, string_types) or not logical_zone.strip():
+        raise ZonalAffinityError(
+            "VM is not availability-zone pinned; IMDS compute.zone is empty or missing"
+        )
+    logical_zone = logical_zone.strip()
+    imds_subscription_id = canonicalize_subscription_id(
+        _required_metadata_value(compute, "subscriptionId"), "IMDS"
+    )
+    location_name = _required_metadata_value(compute, "location")
+
+    cli_subscription_id = resolve_cli_subscription_id(subscription)
+    if cli_subscription_id != imds_subscription_id:
+        raise ZonalAffinityError(
+            "Azure CLI subscription '{}' does not match VM subscription '{}'".format(
+                cli_subscription_id, imds_subscription_id
+            )
+        )
+
+    locations = get_azure_locations(cli_subscription_id)
+    return map_logical_to_physical_zone(locations, location_name, logical_zone)
+
+
+def decorate_target_iqn(target_iqn, physical_zone):
+    normalized_physical_zone = physical_zone.strip().lower()
+    if (
+        not normalized_physical_zone
+        or PHYSICAL_ZONE_PATTERN.match(normalized_physical_zone) is None
+    ):
+        raise ZonalAffinityError(
+            "Physical zone '{}' contains characters that are unsafe for an IQN suffix".format(
+                physical_zone
+            )
+        )
+
+    # Provisional contract: the Elastic SAN front end must parse and strip this suffix
+    # before zonal-affinity routing can be used in production.
+    decorated_iqn = "{}:az-{}".format(target_iqn, normalized_physical_zone)
+    if len(decorated_iqn.encode("utf-8")) > MAX_IQN_UTF8_BYTES:
+        raise ZonalAffinityError(
+            "Decorated target IQN exceeds the {}-byte UTF-8 limit".format(
+                MAX_IQN_UTF8_BYTES
+            )
+        )
+    return decorated_iqn
+
 # check if there are existing connections, if so exit and not connect again
 def check_connection(target_iqn, target_portal_hostname, target_portal_port):
     command = "sudo iscsiadm -m session".split(' ')
@@ -175,7 +450,36 @@ def connect_volume(volume_name, target_iqn, target_portal_hostname, target_porta
     p = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     p.communicate()
 
-if __name__ == "__main__":
+
+def connect_volumes(
+    subscription,
+    resource_group_name,
+    elastic_san_name,
+    volume_group_name,
+    volume_names,
+    number_of_sessions,
+    enable_zonal_affinity=False,
+):
+    physical_zone = resolve_physical_zone(subscription) if enable_zonal_affinity else None
+    for volume_name in volume_names:
+        target_iqn, target_hostname, target_port = get_iqns(
+            subscription,
+            resource_group_name,
+            elastic_san_name,
+            volume_group_name,
+            volume_name,
+        )
+        if enable_zonal_affinity:
+            target_iqn = decorate_target_iqn(target_iqn, physical_zone)
+
+        connected = check_connection(target_iqn, target_hostname, target_port)
+        if connected:
+            print('{} [{}]: Skipped as this volume is already connected'.format(volume_name, target_iqn))
+            continue
+        connect_volume(volume_name, target_iqn, target_hostname, target_port, number_of_sessions)
+
+
+def main(argv=None):
     # check if iSCSI initiator is installed
     check_iscsi()
     
@@ -190,7 +494,15 @@ if __name__ == "__main__":
     parser.add_argument("-v", "--volume-group")
     parser.add_argument("-n", "--volumes", nargs='+')
     parser.add_argument("-s", "--num-of-sessions")
-    args = parser.parse_args(sys.argv[1:])
+    parser.add_argument(
+        "--enable-zonal-affinity",
+        action="store_true",
+        help=(
+            "Opt in to provisional logical-to-physical availability-zone routing. "
+            "Requires Elastic SAN front-end support for parsing the IQN suffix."
+        ),
+    )
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     
     # parameters
     subscription = args.subscription
@@ -203,12 +515,16 @@ if __name__ == "__main__":
     if None in [resource_group_name, elastic_san_name, volume_group_name, volume_names]:
         raise Exception('Need to provide resource_group_name, elastic_san_name, volume_group_name, volume_names to connect to the ElasticSAN volume')
 
-    for volume_name in volume_names:
-        # check connections, if connected, then skip adding new connections
-        target_iqn, target_hostname, target_port = get_iqns(subscription, resource_group_name, elastic_san_name, volume_group_name, volume_name)
-        connected = check_connection(target_iqn, target_hostname, target_port)
-        if connected:
-            print('{} [{}]: Skipped as this volume is already connected'.format(volume_name, target_iqn))
-            continue
-        # if not already connected, proceed with connection 
-        connect_volume(volume_name, target_iqn, target_hostname, target_port, number_of_sessions)
+    connect_volumes(
+        subscription,
+        resource_group_name,
+        elastic_san_name,
+        volume_group_name,
+        volume_names,
+        number_of_sessions,
+        args.enable_zonal_affinity,
+    )
+
+
+if __name__ == "__main__":
+    main()
