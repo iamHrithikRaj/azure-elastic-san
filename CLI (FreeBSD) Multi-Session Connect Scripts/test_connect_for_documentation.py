@@ -501,6 +501,41 @@ class ConfigSplicingTests(unittest.TestCase):
         self.assertEqual(first, second)
 
 
+class PortalMarkerCompatibilityTests(unittest.TestCase):
+    """Both this standalone script and the Azure portal's generated FreeBSD connect script can
+    write to the same /etc/iscsi.conf. They must use byte-for-byte identical managed-block
+    markers so that whichever one ran most recently recognizes and fully replaces the other's
+    managed block, rather than treating it as a stray/corrupted marker (see
+    "MANAGED_BLOCK_BEGIN"/"MANAGED_BLOCK_END" in this file and generateFreeBsdConnectScript in
+    VolumeHelpers.ts). These constants are duplicated here (rather than imported, since the portal
+    generator is TypeScript) and must be kept in sync by hand with VolumeHelpers.ts."""
+
+    PORTAL_MANAGED_BLOCK_BEGIN = "# BEGIN AZURE ELASTIC SAN FREEBSD MANAGED BLOCK -- DO NOT EDIT"
+    PORTAL_MANAGED_BLOCK_END = "# END AZURE ELASTIC SAN FREEBSD MANAGED BLOCK"
+
+    def test_marker_pair_matches_portal_generated_script(self):
+        self.assertEqual(connect.MANAGED_BLOCK_BEGIN, self.PORTAL_MANAGED_BLOCK_BEGIN)
+        self.assertEqual(connect.MANAGED_BLOCK_END, self.PORTAL_MANAGED_BLOCK_END)
+
+    def test_content_rendered_with_portal_markers_is_recognized_and_replaced(self):
+        # Simulate the exact byte content the Azure portal's generated FreeBSD connect script
+        # would have written to /etc/iscsi.conf, then confirm this script's splice logic treats
+        # it as an ordinary existing managed block (not corruption) and fully replaces it.
+        portal_written_content = (
+            self.PORTAL_MANAGED_BLOCK_BEGIN.encode("utf-8")
+            + b"\nesan-portal-vol-s1 {\n\tTargetName    = \"iqn.portal.example\"\n}\n"
+            + self.PORTAL_MANAGED_BLOCK_END.encode("utf-8")
+            + b"\n"
+        )
+        entries = [connect.ManagedConfigEntry("esan-vg-vol-s1", "iqn.example:target", "10.0.0.1:3260")]
+        new_block = connect.render_managed_block(entries)
+
+        result = connect.compute_new_config_content(portal_written_content, new_block)
+
+        self.assertNotIn(b"esan-portal-vol-s1", result)
+        self.assertIn(b"esan-vg-vol-s1", result)
+
+
 class AtomicWriteAndBackupTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.mkdtemp(prefix="esan-freebsd-test-")
