@@ -73,6 +73,7 @@ class ZonalAffinityTests(unittest.TestCase):
         subscription_id = "00000000-0000-0000-0000-000000000001"
         processes = [
             completed_process(subscription_id + "\n"),
+            completed_process(" eastus \n"),
             completed_process(locations_payload(region_name="EaStUs")),
         ]
         compute = {
@@ -83,12 +84,30 @@ class ZonalAffinityTests(unittest.TestCase):
 
         with mock.patch.object(connect, "get_vm_compute_metadata", return_value=compute):
             with mock.patch.object(connect.subprocess, "Popen", side_effect=processes) as popen:
-                physical_zone = connect.resolve_physical_zone(None)
+                physical_zone = connect.resolve_physical_zone(None, "rg", "san")
 
         self.assertEqual("eastus-az3", physical_zone)
         self.assertEqual(
             ["az", "account", "show", "--query", "id", "--output", "tsv"],
             popen.call_args_list[0].args[0],
+        )
+        self.assertEqual(
+            [
+                "az",
+                "elastic-san",
+                "show",
+                "-g",
+                "rg",
+                "-e",
+                "san",
+                "--subscription",
+                subscription_id,
+                "--query",
+                "location",
+                "--output",
+                "tsv",
+            ],
+            popen.call_args_list[1].args[0],
         )
         self.assertEqual(
             [
@@ -103,7 +122,7 @@ class ZonalAffinityTests(unittest.TestCase):
                     "?api-version=2022-12-01"
                 ),
             ],
-            popen.call_args_list[1].args[0],
+            popen.call_args_list[2].args[0],
         )
 
     def test_explicit_subscription_must_match_imds_subscription(self):
@@ -124,7 +143,9 @@ class ZonalAffinityTests(unittest.TestCase):
                     connect.ZonalAffinityError,
                     "Elastic SAN subscription .* does not match VM subscription",
                 ):
-                    connect.resolve_physical_zone("production-subscription")
+                    connect.resolve_physical_zone(
+                        "production-subscription", "rg", "san"
+                    )
 
         self.assertEqual(
             [
@@ -151,7 +172,7 @@ class ZonalAffinityTests(unittest.TestCase):
 
         with mock.patch.object(connect, "get_vm_compute_metadata", return_value=compute):
             with self.assertRaisesRegex(connect.ZonalAffinityError, "not availability-zone pinned"):
-                connect.resolve_physical_zone(None)
+                connect.resolve_physical_zone(None, "rg", "san")
 
     def test_imds_failure_is_explicit(self):
         opener = mock.Mock()
@@ -174,7 +195,7 @@ class ZonalAffinityTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     connect.ZonalAffinityError, "Please run 'az login'"
                 ):
-                    connect.resolve_physical_zone(None)
+                    connect.resolve_physical_zone(None, "rg", "san")
 
     def test_invalid_cli_subscription_guid_is_rejected_before_url_construction(self):
         with mock.patch.object(
@@ -206,7 +227,7 @@ class ZonalAffinityTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     connect.ZonalAffinityError, "IMDS subscription ID must be a GUID"
                 ):
-                    connect.resolve_physical_zone(None)
+                    connect.resolve_physical_zone(None, "rg", "san")
 
         popen.assert_not_called()
 
@@ -246,6 +267,57 @@ class ZonalAffinityTests(unittest.TestCase):
                         connect.get_azure_locations(
                             "00000000-0000-0000-0000-000000000001"
                         )
+
+    def test_elastic_san_location_lookup_uses_canonical_subscription(self):
+        subscription_id = "00000000-0000-0000-0000-000000000001"
+        with mock.patch.object(
+            connect, "_run_az_command", return_value=" eastus2 \n"
+        ) as run:
+            location = connect.get_elastic_san_location(
+                subscription_id, "resource-group", "elastic-san"
+            )
+
+        self.assertEqual("eastus2", location)
+        run.assert_called_once_with(
+            [
+                "az",
+                "elastic-san",
+                "show",
+                "-g",
+                "resource-group",
+                "-e",
+                "elastic-san",
+                "--subscription",
+                subscription_id,
+                "--query",
+                "location",
+                "--output",
+                "tsv",
+            ],
+            "Elastic SAN location lookup",
+        )
+
+    def test_different_vm_and_elastic_san_regions_are_rejected_before_mapping(self):
+        subscription_id = "00000000-0000-0000-0000-000000000001"
+        compute = {
+            "zone": "2",
+            "subscriptionId": subscription_id,
+            "location": "eastus",
+        }
+        processes = [
+            completed_process(subscription_id),
+            completed_process("westus"),
+        ]
+
+        with mock.patch.object(connect, "get_vm_compute_metadata", return_value=compute):
+            with mock.patch.object(connect.subprocess, "Popen", side_effect=processes) as popen:
+                with self.assertRaisesRegex(
+                    connect.ZonalAffinityError,
+                    r"^The VM and Elastic SAN must be in the same region\.$",
+                ):
+                    connect.resolve_physical_zone(None, "rg", "san")
+
+        self.assertEqual(2, popen.call_count)
 
     def test_elastic_san_subscription_options_parse_identically(self):
         parser = connect.create_argument_parser()
@@ -312,6 +384,33 @@ class ZonalAffinityTests(unittest.TestCase):
                 with self.assertRaisesRegex(connect.ZonalAffinityError, error_pattern):
                     connect.map_logical_to_physical_zone(locations, "eastus", "2")
 
+    def test_duplicate_trimmed_logical_zones_are_rejected(self):
+        locations = locations_list(
+            mappings=[
+                {"logicalZone": " 2 ", "physicalZone": " eastus-az2 "},
+                {"logicalZone": "2", "physicalZone": "eastus-az3"},
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            connect.ZonalAffinityError, "duplicate logical zone '2'"
+        ):
+            connect.map_logical_to_physical_zone(locations, " eastus ", " 2 ")
+
+    def test_mapping_trims_logical_and_physical_zones(self):
+        locations = locations_list(
+            mappings=[
+                {"logicalZone": " 2 ", "physicalZone": " eastus-az3 "}
+            ]
+        )
+
+        self.assertEqual(
+            "eastus-az3",
+            connect.map_logical_to_physical_zone(
+                locations, " EASTUS ", " 2 "
+            ),
+        )
+
     def test_iqn_suffix_is_lowercase_and_rejects_unsafe_characters(self):
         self.assertEqual(
             "iqn.2024-01.com.microsoft:volume:az-eastus-az3",
@@ -360,7 +459,7 @@ class ZonalAffinityTests(unittest.TestCase):
     def test_opt_in_uses_decorated_iqn_for_connection_commands(self):
         with mock.patch.object(
             connect, "resolve_physical_zone", return_value="EASTUS-AZ3"
-        ):
+        ) as resolve_physical_zone:
             with mock.patch.object(
                 connect,
                 "get_iqns",
@@ -373,6 +472,7 @@ class ZonalAffinityTests(unittest.TestCase):
                         )
 
         decorated_iqn = "iqn.original:az-eastus-az3"
+        resolve_physical_zone.assert_called_once_with("sub", "rg", "san")
         check.assert_called_once_with(decorated_iqn, "portal.example", 3260)
         connect_volume.assert_called_once_with(
             "volume1", decorated_iqn, "portal.example", 3260, 4
