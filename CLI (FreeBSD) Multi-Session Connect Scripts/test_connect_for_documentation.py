@@ -799,7 +799,8 @@ class ExactCommandArgvTests(unittest.TestCase):
         )
 
     def test_never_calls_iscsictl_remove_all(self):
-        source = open(SCRIPT_PATH, "r", encoding="utf-8").read()
+        with open(SCRIPT_PATH, "r", encoding="utf-8") as handle:
+            source = handle.read()
         # Look for the actual argv-construction pattern, not the prose
         # description of the constraint that legitimately appears in the
         # module docstring.
@@ -924,7 +925,8 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
     def test_failure_during_session_add_rolls_back_config_and_preserves_unrelated_content(self):
         with open(self.config_path, "wb") as handle:
             handle.write(b"# unrelated manual stanza\nmanual { targetname = manual; }\n")
-        original_content = open(self.config_path, "rb").read()
+        with open(self.config_path, "rb") as handle:
+            original_content = handle.read()
 
         plans = self._plans()
         with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"):
