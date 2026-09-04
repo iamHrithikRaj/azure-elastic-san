@@ -257,7 +257,7 @@ def get_elastic_san_location(
         "show",
         "-g",
         resource_group_name,
-        "-e",
+        "--elastic-san-name",
         elastic_san_name,
         "--subscription",
         elastic_san_subscription_id,
