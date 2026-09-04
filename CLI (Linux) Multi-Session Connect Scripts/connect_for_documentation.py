@@ -120,10 +120,10 @@ def check_azcli():
         sys.exit(1)
     
 # get iqn info from the ElasticSAN
-def get_iqns(subscription, resource_group_name, elastic_san_name, volume_group_name, volume_name):
+def get_iqns(elastic_san_subscription, resource_group_name, elastic_san_name, volume_group_name, volume_name):
     check_azcli()
-    subscription = " --subscription "+subscription if subscription is not None else ""
-    command = "az elastic-san volume show -g {} -e {} -v {} -n {} --query storageTarget{}".format(resource_group_name, elastic_san_name, volume_group_name, volume_name, subscription).split(' ')
+    subscription_argument = " --subscription "+elastic_san_subscription if elastic_san_subscription is not None else ""
+    command = "az elastic-san volume show -g {} -e {} -v {} -n {} --query storageTarget{}".format(resource_group_name, elastic_san_name, volume_group_name, volume_name, subscription_argument).split(' ')
     p = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     # timeout in case the extension is not installed and prompts the user to install
     timeout = 10
@@ -235,25 +235,27 @@ def canonicalize_subscription_id(subscription_id, source):
     return canonical_subscription_id
 
 
-def resolve_cli_subscription_id(subscription):
+def resolve_elastic_san_subscription_id(elastic_san_subscription):
     command = ["az", "account", "show"]
-    if subscription is not None:
-        command.extend(["--subscription", subscription])
+    if elastic_san_subscription is not None:
+        command.extend(["--subscription", elastic_san_subscription])
     command.extend(["--query", "id", "--output", "tsv"])
     subscription_id = _run_az_command(
-        command, "Azure CLI subscription resolution"
+        command, "Elastic SAN subscription resolution"
     ).strip()
     if not subscription_id:
-        raise ZonalAffinityError("Azure CLI subscription resolution returned an empty ID")
-    return canonicalize_subscription_id(subscription_id, "Azure CLI")
+        raise ZonalAffinityError("Elastic SAN subscription resolution returned an empty ID")
+    return canonicalize_subscription_id(subscription_id, "Elastic SAN")
 
 
-def get_azure_locations(subscription_id):
-    subscription_id = canonicalize_subscription_id(subscription_id, "Azure CLI")
+def get_azure_locations(elastic_san_subscription_id):
+    elastic_san_subscription_id = canonicalize_subscription_id(
+        elastic_san_subscription_id, "Elastic SAN"
+    )
     url = (
         "https://management.azure.com/subscriptions/{}/locations"
         "?api-version=2022-12-01"
-    ).format(subscription_id)
+    ).format(elastic_san_subscription_id)
     command = [
         "az",
         "rest",
@@ -336,7 +338,7 @@ def map_logical_to_physical_zone(locations, location_name, logical_zone):
     return physical_zone
 
 
-def resolve_physical_zone(subscription):
+def resolve_physical_zone(elastic_san_subscription):
     compute = get_vm_compute_metadata()
     logical_zone = compute.get("zone")
     if not isinstance(logical_zone, string_types) or not logical_zone.strip():
@@ -349,15 +351,17 @@ def resolve_physical_zone(subscription):
     )
     location_name = _required_metadata_value(compute, "location")
 
-    cli_subscription_id = resolve_cli_subscription_id(subscription)
-    if cli_subscription_id != imds_subscription_id:
+    elastic_san_subscription_id = resolve_elastic_san_subscription_id(
+        elastic_san_subscription
+    )
+    if elastic_san_subscription_id != imds_subscription_id:
         raise ZonalAffinityError(
-            "Azure CLI subscription '{}' does not match VM subscription '{}'".format(
-                cli_subscription_id, imds_subscription_id
+            "Elastic SAN subscription '{}' does not match VM subscription '{}'".format(
+                elastic_san_subscription_id, imds_subscription_id
             )
         )
 
-    locations = get_azure_locations(cli_subscription_id)
+    locations = get_azure_locations(elastic_san_subscription_id)
     return map_logical_to_physical_zone(locations, location_name, logical_zone)
 
 
@@ -452,7 +456,7 @@ def connect_volume(volume_name, target_iqn, target_portal_hostname, target_porta
 
 
 def connect_volumes(
-    subscription,
+    elastic_san_subscription,
     resource_group_name,
     elastic_san_name,
     volume_group_name,
@@ -460,10 +464,14 @@ def connect_volumes(
     number_of_sessions,
     enable_zonal_affinity=False,
 ):
-    physical_zone = resolve_physical_zone(subscription) if enable_zonal_affinity else None
+    physical_zone = (
+        resolve_physical_zone(elastic_san_subscription)
+        if enable_zonal_affinity
+        else None
+    )
     for volume_name in volume_names:
         target_iqn, target_hostname, target_port = get_iqns(
-            subscription,
+            elastic_san_subscription,
             resource_group_name,
             elastic_san_name,
             volume_group_name,
@@ -479,16 +487,17 @@ def connect_volumes(
         connect_volume(volume_name, target_iqn, target_hostname, target_port, number_of_sessions)
 
 
-def main(argv=None):
-    # check if iSCSI initiator is installed
-    check_iscsi()
-    
-    # check if multipath-tools is installed
-    check_mpio()
-    
-    # get command line arguments
+def create_argument_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--subscription")
+    parser.add_argument(
+        "--elastic-san-subscription",
+        "--subscription",
+        dest="elastic_san_subscription",
+        help=(
+            "Elastic SAN resource subscription name or ID. "
+            "--subscription is retained as a compatibility alias."
+        ),
+    )
     parser.add_argument("-g", "--resource-group")
     parser.add_argument("-e", "--elastic-san")
     parser.add_argument("-v", "--volume-group")
@@ -502,10 +511,22 @@ def main(argv=None):
             "Requires Elastic SAN front-end support for parsing the IQN suffix."
         ),
     )
+    return parser
+
+
+def main(argv=None):
+    # check if iSCSI initiator is installed
+    check_iscsi()
+
+    # check if multipath-tools is installed
+    check_mpio()
+
+    # get command line arguments
+    parser = create_argument_parser()
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     
     # parameters
-    subscription = args.subscription
+    elastic_san_subscription = args.elastic_san_subscription
     resource_group_name = args.resource_group
     elastic_san_name = args.elastic_san
     volume_group_name = args.volume_group
@@ -516,7 +537,7 @@ def main(argv=None):
         raise Exception('Need to provide resource_group_name, elastic_san_name, volume_group_name, volume_names to connect to the ElasticSAN volume')
 
     connect_volumes(
-        subscription,
+        elastic_san_subscription,
         resource_group_name,
         elastic_san_name,
         volume_group_name,

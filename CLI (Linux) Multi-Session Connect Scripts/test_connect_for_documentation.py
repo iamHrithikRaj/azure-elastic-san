@@ -121,7 +121,8 @@ class ZonalAffinityTests(unittest.TestCase):
                 return_value=completed_process(cli_subscription_id),
             ) as popen:
                 with self.assertRaisesRegex(
-                    connect.ZonalAffinityError, "does not match VM subscription"
+                    connect.ZonalAffinityError,
+                    "Elastic SAN subscription .* does not match VM subscription",
                 ):
                     connect.resolve_physical_zone("production-subscription")
 
@@ -182,7 +183,7 @@ class ZonalAffinityTests(unittest.TestCase):
             return_value=completed_process("../../other-resource"),
         ) as popen:
             with self.assertRaisesRegex(connect.ZonalAffinityError, "must be a GUID"):
-                connect.resolve_cli_subscription_id(None)
+                connect.resolve_elastic_san_subscription_id(None)
 
         self.assertEqual(1, popen.call_count)
 
@@ -245,6 +246,22 @@ class ZonalAffinityTests(unittest.TestCase):
                         connect.get_azure_locations(
                             "00000000-0000-0000-0000-000000000001"
                         )
+
+    def test_elastic_san_subscription_options_parse_identically(self):
+        parser = connect.create_argument_parser()
+        preferred = parser.parse_args(
+            ["--elastic-san-subscription", "san-subscription"]
+        )
+        compatibility = parser.parse_args(["--subscription", "san-subscription"])
+
+        self.assertEqual(
+            "san-subscription", preferred.elastic_san_subscription
+        )
+        self.assertEqual(
+            preferred.elastic_san_subscription,
+            compatibility.elastic_san_subscription,
+        )
+        self.assertFalse(hasattr(preferred, "subscription"))
 
     def test_missing_region_is_rejected(self):
         with self.assertRaisesRegex(connect.ZonalAffinityError, "no region matching"):
