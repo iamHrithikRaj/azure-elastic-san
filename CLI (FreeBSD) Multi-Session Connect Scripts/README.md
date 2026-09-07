@@ -1,9 +1,14 @@
-# Azure Elastic SAN Multi-Session Connect Script -- FreeBSD (PoC)
+# Azure Elastic SAN Connect Script -- FreeBSD (PoC)
 
 Standalone, production-quality **proof of concept** script that connects one
-or more Azure Elastic SAN volumes to a FreeBSD 13+ host with multiple iSCSI
-sessions per volume, using FreeBSD's native iSCSI initiator
+or more Azure Elastic SAN volumes to a FreeBSD 13+ host with **one iSCSI
+session per volume**, using FreeBSD's native iSCSI initiator
 (`iscsid`/`iscsictl`/`iscsi.conf`, `sysrc`/`service`).
+
+Stock FreeBSD rejects attempts to create duplicate sessions for the same target
+name and portal. This PoC therefore requires `--num-of-sessions 1` and does not
+silently reduce larger values. NetApp-specific initiator/target behavior that
+may permit multiple sessions needs separate validation and is outside this PoC.
 
 This is a **separate implementation** from
 [`CLI (Linux) Multi-Session Connect Scripts`](../CLI%20(Linux)%20Multi-Session%20Connect%20Scripts/connect_for_documentation.py).
@@ -40,14 +45,10 @@ This script intentionally does **not**:
 * call `iscsiadm`, `systemd`, or any Linux package manager;
 * call `iscsictl -R -a` (or otherwise disconnect/remove sessions);
 * restart the `iscsid` service, or touch sessions it did not create;
-* assemble `gmultipath` devices. **Creating N iSCSI sessions to a volume is
-  not the same as assembling a multipath device.** This script only brings up
-  sessions; correlating the resulting `/dev/da*` device nodes into a single
-  multipath device requires knowing which `daN` node belongs to which
-  session/LUN, which this PoC does not attempt (there is no generically safe
-  way to do that without also knowing your specific `gmultipath` layout). Do
-  that step yourself, e.g. with `iscsictl -L -v` (see "Device nodes:" per
-  session) and `gmultipath create`.
+* assemble `gmultipath` devices. Session creation is not multipath-device
+  assembly, and this one-session PoC does not automate `gmultipath`. Any future
+  multi-path design must separately map the correct `/dev/da*` devices and
+  validate the platform-specific topology.
 
 ## Usage
 
@@ -55,17 +56,17 @@ This script intentionally does **not**:
 # Preview only -- no root required, no mutating commands are run.
 python3 connect_for_documentation.py \
   -g my-resource-group -e my-elastic-san -v my-volume-group \
-  -n volume1 volume2 -s 4 --dry-run
+  -n volume1 volume2 --dry-run
 
-# Connect volume1 and volume2 with 4 sessions each (run as root).
+# Connect volume1 and volume2 with one session each (run as root).
 python3 connect_for_documentation.py \
   -g my-resource-group -e my-elastic-san -v my-volume-group \
-  -n volume1 volume2 -s 4
+  -n volume1 volume2
 
 # Opt in to provisional zonal-affinity IQN routing.
 python3 connect_for_documentation.py \
   -g my-resource-group -e my-elastic-san -v my-volume-group \
-  -n volume1 -s 4 --enable-zonal-affinity
+  -n volume1 --enable-zonal-affinity
 
 # Target a specific subscription (both spellings are equivalent).
 python3 connect_for_documentation.py --elastic-san-subscription <sub-id-or-name> ...
@@ -79,7 +80,7 @@ python3 connect_for_documentation.py --subscription <sub-id-or-name> ...
 | `-e`, `--elastic-san` | | Elastic SAN name |
 | `-v`, `--volume-group` | | Volume group name |
 | `-n`, `--volumes` | | One or more volume names |
-| `-s`, `--num-of-sessions` | | Sessions per volume (default/max 32 -- see "Session count" below) |
+| `-s`, `--num-of-sessions` | | Sessions per volume; must be exactly 1 (default: 1 -- see "Session count" below) |
 | `--enable-zonal-affinity` | | Opt in to provisional logical→physical AZ IQN suffix (see below) |
 | `--dry-run` | | Read-only discovery/planning only; no mutation (see below) |
 
@@ -89,21 +90,26 @@ python3 connect_for_documentation.py --subscription <sub-id-or-name> ...
 and Azure Resource Manager zonal lookups (if `--enable-zonal-affinity` is
 set), the per-volume storage-target lookup, and nickname/config-block
 computation -- and prints the plan (resolved targets, nicknames, and the
-exact `/etc/iscsi.conf` managed block that would be written). It does **not**
+selected entries that would be merged into the managed block). It does **not**
 run `sysrc`, `service`, or `iscsictl`, and does **not** write
 `/etc/iscsi.conf`. It does not require root.
 
 Because inspecting existing sessions requires opening `/dev/iscsi` (which
 generally requires root), `--dry-run` does not inspect current session state
-and always plans for the full requested session count per volume. The real
-(non-dry-run) run inspects existing sessions and only adds the shortfall --
-see "Idempotency and reruns" below.
+and plans one session per volume. The real run checks readiness before
+submitting a session -- see "Idempotency and reruns" below.
+Because the existing config is intentionally not opened in unprivileged
+dry-run mode, retained managed entries for unselected volumes are not included
+in the preview.
 
 ## What gets written to `/etc/iscsi.conf`
 
-For every `(volume, session index)` pair the script generates a deterministic
-nickname (`esan-<volume-group>-<volume>-<session-index>`, sanitized to
-`[a-z0-9_-]`) and a matching stanza:
+For every volume the script generates a deterministic nickname
+(`esan-<volume-group>-<volume>-s1`, sanitized to `[a-z0-9_-]`) and a matching
+stanza. If that readable nickname would exceed FreeBSD's 128-character limit,
+the readable base is truncated and a `-<12 hex SHA-256>-s1` suffix derived from
+the complete unbounded identity is appended. This keeps the nickname stable,
+bounded, and collision-resistant:
 
 ```
 esan-my-volume-group-volume1-s1 {
@@ -126,15 +132,18 @@ All of this lives inside a clearly delimited managed block:
 This marker pair is intentionally origin-neutral (no "generated by ..." text)
 and is byte-for-byte identical to the one the Azure portal's generated
 FreeBSD connect script uses. Both tools write to the same `/etc/iscsi.conf`,
-so whichever one ran most recently must recognize and fully replace the
-other's managed block rather than seeing it as a stray/corrupted marker.
+so each must recognize the other's managed block.
 
 Anything outside that block -- your own stanzas, comments, CHAP secrets for
 other targets, etc. -- is preserved **byte-for-byte**. If `/etc/iscsi.conf`
 already has a managed block from a previous run (from this script or the
-portal's), it is fully replaced (not appended to); if it has only one of the
-`BEGIN`/`END` markers (hand-edited or corrupted), the script refuses to touch
-the file and tells you to fix it manually rather than guessing.
+portal's), it is parsed strictly. Unknown, malformed, incomplete, or duplicate
+content inside the markers is rejected rather than discarded. Entries selected
+in the current run replace entries with the same deterministic nickname;
+managed entries for unselected volumes are retained. The merged block is sorted
+by nickname, so selecting A then B or B then A converges to the same bytes. If
+the file has only one marker, duplicate markers, or non-standalone marker text,
+the script refuses to touch it rather than guessing.
 
 `TargetName`/`TargetAddress` values are validated before they are written:
 anything containing a quote, brace, `#`, `;`, or a control character
@@ -166,8 +175,9 @@ If starting/configuring the requested sessions then fails partway through,
 the script restores `/etc/iscsi.conf` from that backup (or deletes the file
 entirely if it did not exist before this run) before re-raising the error.
 This only ever rolls back the **config file** -- it never disconnects or
-removes any iSCSI session, including ones this run itself just established
-successfully for an earlier volume in the same invocation.
+removes any iSCSI session. After `iscsictl -A` has been submitted, a session
+may already be live or may become live after a timeout even though the config
+file was restored. Always inspect `iscsictl -L -v` before retrying a failed run.
 
 ## Idempotency and reruns
 
@@ -175,31 +185,21 @@ Re-running the script with the same arguments regenerates an identical
 managed block (nicknames are deterministic), so the config file converges
 rather than accumulating duplicate stanzas.
 
-Before adding sessions for a volume, the script inspects `iscsictl -L -v` and
-counts sessions whose `Target name`/`Target portal` match that volume's
-target. FreeBSD's kernel session state does not retain the nickname a
-session was added under, so this match is necessarily by target identity,
-not by nickname:
+Before adding a session, the script parses `Target name`, `Target portal`,
+`Enable`, and `Session state` from `iscsictl -L -v`. It matches by **target IQN
+only**, not by the original portal: a successful iSCSI `TargetAddress` login
+redirect legitimately changes the portal shown by FreeBSD.
 
-* **Existing count == requested count:** skipped, nothing is added.
-* **Existing count < requested count:** only the shortfall is added, via
-  `iscsictl -A -n <nickname> -c /etc/iscsi.conf -w 30` for each missing
-  nickname (sessions are added **sequentially**, one `iscsictl -A` per
-  session -- FreeBSD has no equivalent of Linux's "reuse this session ID for
-  N more sessions" operation).
-* **Existing count > requested count:** the script **fails with guidance**
-  instead of removing anything. It never calls `iscsictl -R` (targeted) or
-  `iscsictl -R -a` (all sessions) to reconcile a surplus -- if you see this,
-  either raise `-s`/`--num-of-sessions` to match, or disconnect the extra
-  sessions yourself after confirming which ones are safe to drop.
-
-After adding sessions, the script re-inspects `iscsictl -L -v` to confirm the
-expected count is actually observed (`iscsictl -A -w` waits for
-establishment and blocking is best-effort per `iscsictl(8)` -- a non-zero
-exit does not guarantee failure and a zero exit does not guarantee success,
-so this is a second, independent check). If the count still falls short, the
-script fails (triggering the config rollback described above) rather than
-silently reporting success.
+* A matching `Connected` session is idempotent success and is skipped.
+* A matching disconnected, disabled, or otherwise non-connected session fails
+  with recovery guidance. The script neither adds a duplicate nor removes the
+  stale session.
+* Multiple matching sessions fail because this PoC supports exactly one.
+* With no match, the script submits exactly
+  `iscsictl -A -n <nickname> -c /etc/iscsi.conf` (without `-w`), then polls
+  `iscsictl -L -v` for up to 30 seconds until that target IQN is `Connected`.
+  Unrelated disconnected sessions are ignored. A timeout is explicit and does
+  not remove or roll back a session that may already have been created.
 
 ## `iscsid` service management
 
@@ -213,15 +213,11 @@ touches sessions/targets it did not create itself.
 
 ## Session count
 
-The default and maximum is 32 sessions per volume (same cap as the Linux
-script). This is a client-side cap in the script, not a value derived from
-your specific environment -- validate it against your own constraints (link
-bandwidth/IOPS budget, per-target session limits on the Elastic SAN backend,
-and FreeBSD's `kern.iscsi.max_sessions`/initiator worker-thread sizing)
-before relying on the default in production. The script does **not** modify
-`iscsid`'s global `maxproc`/worker-thread configuration; if your session
-count needs exceed the daemon's defaults, that is a separate, deliberate
-tuning decision for the operator to make.
+The default and only accepted value is **1 session per volume**. Stock FreeBSD
+rejects duplicate target-name/portal sessions, so values such as `-s 2` or
+`-s 32` fail before Azure discovery or local mutation; they are never silently
+capped to 1. NetApp-specific multi-session behavior is a separate validation
+track and must not be inferred from this PoC.
 
 ## Zonal affinity (`--enable-zonal-affinity`)
 
@@ -254,25 +250,21 @@ yourself before depending on it in production:
    script**. Confirm this against the exact Elastic SAN backend version/fork
    you are pointed at -- this is a hard gate before production use, since a
    redirect FreeBSD's `iscsid` mishandles would surface as session churn or
-   silent connectivity loss, not a clean error from this script.
+   silent connectivity loss, not a clean error from this script. The
+   readiness check accounts for a successful redirect by correlating by target
+   IQN instead of requiring the original portal.
 3. **`gmultipath` assembly is not automated** (see "What this script
    intentionally does not do" above) -- session creation is not multipath
    device assembly.
-4. **Nickname-to-session correlation on reruns is best-effort.** Because
-   FreeBSD's kernel session state does not track the nickname a session was
-   added under, "add the shortfall using the next unused nicknames" is a
-   reasonable but not perfectly authoritative reconciliation strategy if
-   sessions to the same target were established outside this script.
-5. **iscsictl `-w` wait semantics are best-effort**, per `iscsictl(8)`: a
-   non-zero exit status does not guarantee the session failed, so the
-   post-add `iscsictl -L -v` recount is the authoritative check this script
-   relies on, not the `iscsictl -A` exit code alone.
+4. **Multi-session is not enabled.** Stock FreeBSD's duplicate restriction is
+   enforced as one session per volume. Any NetApp-specific exception needs
+   dedicated interoperability and failure-mode validation.
 
 ## Testing
 
 ```sh
 python3 -m py_compile connect_for_documentation.py test_connect_for_documentation.py
-python3 -m unittest test_connect_for_documentation -v
+python3 -W error::ResourceWarning -m unittest test_connect_for_documentation -v
 ```
 
 All Azure CLI, IMDS, filesystem, and `iscsictl`/`service`/`sysrc` calls are
