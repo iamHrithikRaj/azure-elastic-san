@@ -36,11 +36,17 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - tests also run on non-POSIX developer machines
+    fcntl = None
 
 try:
     from urllib.request import ProxyHandler, Request, build_opener
@@ -73,6 +79,7 @@ SUBSCRIPTION_ID_PATTERN = re.compile(
 )
 
 DEFAULT_ISCSI_CONF_PATH = "/etc/iscsi.conf"
+CONFIG_LOCK_FILENAME = ".azure-elastic-san.lock"
 ISCSI_DEVICE_NODE = "/dev/iscsi"
 REQUIRED_FREEBSD_TOOLS = ("iscsictl", "service", "sysrc")
 
@@ -543,26 +550,34 @@ def sanitize_identity_component(value, field_name):
     return sanitized
 
 
-def build_nickname(volume_group_name, volume_name, session_index):
+def build_nickname(volume_group_name, volume_name, target_name, session_index):
     """Deterministic, collision-resistant iscsi.conf nickname for one
-    (volume group, volume, session index) tuple. Same inputs always produce
-    the same nickname, which is what makes managed-block regeneration
-    idempotent across re-runs."""
+    (volume group, volume, target IQN, session index) tuple.
+
+    The SHA-256 input is the UTF-8 encoding of a compact JSON array containing
+    the raw (unsanitized) values. JSON's string lengths/escaping and array
+    boundaries make the identity unambiguous, while matching JSON.stringify
+    in the Azure portal implementation.
+    """
     sanitized_group = sanitize_identity_component(volume_group_name, "Volume group name")
     sanitized_volume = sanitize_identity_component(volume_name, "Volume name")
+    if not isinstance(target_name, string_types) or not target_name:
+        raise ElasticSanConnectError("Target IQN must be a non-empty string")
     if session_index != 1:
         raise ElasticSanConnectError(
             "Stock FreeBSD supports exactly one session per Elastic SAN volume in this PoC"
         )
 
     readable_base = "esan-{}-{}".format(sanitized_group, sanitized_volume)
-    unbounded_nickname = "{}-s1".format(readable_base)
-    if len(unbounded_nickname) <= 128:
-        nickname = unbounded_nickname
-    else:
-        identity_hash = hashlib.sha256(unbounded_nickname.encode("ascii")).hexdigest()[:12]
-        suffix = "-{}-s1".format(identity_hash)
-        nickname = readable_base[: 128 - len(suffix)].rstrip("-") + suffix
+    identity_json = json.dumps(
+        [volume_group_name, volume_name, target_name, session_index],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    identity_hash = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()[:16]
+    suffix = "-{}-s1".format(identity_hash)
+    readable_prefix = readable_base[: 128 - len(suffix)].rstrip("-")
+    nickname = readable_prefix + suffix
 
     if len(nickname) > 128 or NICKNAME_PATTERN.match(nickname) is None:
         raise ElasticSanConnectError(
@@ -759,6 +774,22 @@ def compute_new_config_content(existing_content_bytes, managed_block_bytes):
 
     merged_by_nickname = {entry.nickname: entry for entry in existing_entries}
     for entry in selected_entries:
+        existing_entry = merged_by_nickname.get(entry.nickname)
+        if existing_entry is not None and (
+            existing_entry.target_name != entry.target_name
+            or existing_entry.target_address != entry.target_address
+        ):
+            raise ElasticSanConnectError(
+                "Generated nickname '{}' conflicts with an existing managed entry: "
+                "existing target/address is '{}'/'{}', selected target/address is "
+                "'{}'/'{}'. Refusing to overwrite it.".format(
+                    entry.nickname,
+                    existing_entry.target_name,
+                    existing_entry.target_address,
+                    entry.target_name,
+                    entry.target_address,
+                )
+            )
         merged_by_nickname[entry.nickname] = entry
     merged_block = render_managed_block(
         [merged_by_nickname[nickname] for nickname in sorted(merged_by_nickname)]
@@ -775,6 +806,74 @@ def read_config_file(path):
     with open(path, "rb") as handle:
         content = handle.read()
     return content, True, os.stat(path)
+
+
+def get_config_lock_path(config_path):
+    """Return the stable lock inode used to serialize config transactions."""
+    return os.path.join(
+        os.path.dirname(os.path.abspath(config_path)), CONFIG_LOCK_FILENAME
+    )
+
+
+def acquire_config_transaction_lock(config_path):
+    """Securely open and exclusively lock the config's separate lock file.
+
+    The lock cannot live on iscsi.conf itself because atomic replacement changes
+    that inode. The returned (path, fd) pair remains owned by the caller until
+    release_config_transaction_lock() is called.
+    """
+    if fcntl is None:
+        raise ElasticSanConnectError(
+            "fcntl.flock is unavailable; config transactions require a POSIX/FreeBSD host"
+        )
+
+    lock_path = get_config_lock_path(config_path)
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    try:
+        lock_fd = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise ElasticSanConnectError(
+            "Failed to securely open config transaction lock '{}': {}".format(
+                lock_path, error
+            )
+        )
+
+    try:
+        opened_stat = os.fstat(lock_fd)
+        path_stat = os.lstat(lock_path)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or stat.S_ISLNK(path_stat.st_mode)
+            or opened_stat.st_dev != path_stat.st_dev
+            or opened_stat.st_ino != path_stat.st_ino
+        ):
+            raise ElasticSanConnectError(
+                "Config transaction lock '{}' must be a non-symlink regular file".format(
+                    lock_path
+                )
+            )
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except ElasticSanConnectError:
+        os.close(lock_fd)
+        raise
+    except OSError as error:
+        os.close(lock_fd)
+        raise ElasticSanConnectError(
+            "Failed to acquire config transaction lock '{}': {}".format(lock_path, error)
+        )
+
+    return lock_path, lock_fd
+
+
+def release_config_transaction_lock(lock_fd):
+    """Release and close a lock handle returned by acquire_config_transaction_lock."""
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
 
 
 def backup_config(path, existing_content_bytes, existed):
@@ -1022,6 +1121,7 @@ def build_connection_plan(
     )
 
     plans = []
+    nickname_owners = {}
     for volume_name in volume_names:
         target_iqn, target_hostname, target_port = get_volume_storage_target(
             elastic_san_subscription,
@@ -1039,19 +1139,38 @@ def build_connection_plan(
             "Target address for '{}'".format(volume_name),
         )
         nicknames = [
-            build_nickname(volume_group_name, volume_name, session_index)
+            build_nickname(volume_group_name, volume_name, target_name, session_index)
             for session_index in range(1, number_of_sessions + 1)
         ]
+        for nickname in nicknames:
+            previous_volume = nickname_owners.get(nickname)
+            if previous_volume is not None:
+                raise ElasticSanConnectError(
+                    "Connection plan generated duplicate nickname '{}' for volumes '{}' and "
+                    "'{}'; refusing to continue".format(
+                        nickname, previous_volume, volume_name
+                    )
+                )
+            nickname_owners[nickname] = volume_name
         plans.append(VolumeConnectionPlan(volume_name, target_name, target_address, nicknames))
     return plans
 
 
 def render_full_managed_block(plans):
-    entries = [
-        ManagedConfigEntry(nickname, plan.target_name, plan.target_address)
-        for plan in plans
-        for nickname in plan.nicknames
-    ]
+    entries = []
+    seen_nicknames = set()
+    for plan in plans:
+        for nickname in plan.nicknames:
+            if nickname in seen_nicknames:
+                raise ElasticSanConnectError(
+                    "Connection plan contains duplicate nickname '{}'; refusing to render it".format(
+                        nickname
+                    )
+                )
+            seen_nicknames.add(nickname)
+            entries.append(
+                ManagedConfigEntry(nickname, plan.target_name, plan.target_address)
+            )
     if not entries:
         raise ElasticSanConnectError(
             "Refusing to render an empty Azure Elastic SAN connection plan"
@@ -1142,27 +1261,31 @@ def execute_connection_plan(plans, config_path, number_of_sessions):
             "Stock FreeBSD supports exactly one session per volume in this PoC"
         )
     check_freebsd_mutation_prerequisites()
-    existing_content_bytes, existed, original_stat = read_config_file(config_path)
-    new_managed_block = render_full_managed_block(plans)
-    new_content = compute_new_config_content(existing_content_bytes, new_managed_block)
-
-    ensure_iscsid_enabled_and_running()
-    backup_path = backup_config(config_path, existing_content_bytes, existed)
-    write_config_atomically(config_path, new_content, original_stat)
-
+    _, lock_fd = acquire_config_transaction_lock(config_path)
     try:
-        for plan in plans:
-            add_sessions_for_volume(plan, config_path, number_of_sessions)
-    except (ElasticSanConnectError, OSError) as error:
-        restore_config_from_backup(config_path, backup_path, existed, original_stat)
-        raise ElasticSanConnectError(
-            "Failed while establishing iSCSI sessions; restored {} to its pre-run state. "
-            "This rollback only restores the config file: an iscsictl add request may already "
-            "have created or may still create a live session, and this script never removes "
-            "sessions. Inspect 'iscsictl -L -v' before retrying. Original error: {}".format(
-                config_path, error
+        existing_content_bytes, existed, original_stat = read_config_file(config_path)
+        new_managed_block = render_full_managed_block(plans)
+        new_content = compute_new_config_content(existing_content_bytes, new_managed_block)
+
+        ensure_iscsid_enabled_and_running()
+        backup_path = backup_config(config_path, existing_content_bytes, existed)
+        write_config_atomically(config_path, new_content, original_stat)
+
+        try:
+            for plan in plans:
+                add_sessions_for_volume(plan, config_path, number_of_sessions)
+        except (ElasticSanConnectError, OSError) as error:
+            restore_config_from_backup(config_path, backup_path, existed, original_stat)
+            raise ElasticSanConnectError(
+                "Failed while establishing iSCSI sessions; restored {} to its pre-run state. "
+                "This rollback only restores the config file: an iscsictl add request may already "
+                "have created or may still create a live session, and this script never removes "
+                "sessions. Inspect 'iscsictl -L -v' before retrying. Original error: {}".format(
+                    config_path, error
+                )
             )
-        )
+    finally:
+        release_config_transaction_lock(lock_fd)
 
 
 # ---------------------------------------------------------------------------
