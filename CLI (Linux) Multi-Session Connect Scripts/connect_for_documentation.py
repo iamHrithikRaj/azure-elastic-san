@@ -743,11 +743,16 @@ def _state_host(host):
     return str(address)
 
 
-def _parse_state_portal(text):
+def _parse_state_portal(text, flat_node=False):
     match = re.fullmatch(r"(?:\[([^\]]+)\]|([^:\s]+)):(\d+),(-?\d+)", text)
     if match is None:
         raise _zonal_state_error("Cannot establish persistent portal: " + text)
     tpgt = int(match.group(4))
+    # Released open-iscsi prints the signed unknown node TPGT (-1) through
+    # PRIu16, which expands to %u on glibc. The scoped node --op show below
+    # must still confirm node.tpgt = -1 before accepting an existing layout.
+    if flat_node and tpgt == 4294967295:
+        tpgt = -1
     if not -1 <= tpgt <= 65535:
         raise _zonal_state_error("Invalid target portal group tag")
     return (
@@ -778,7 +783,9 @@ def _read_zonal_inventory(mode):
                 raise _zonal_state_error("Cannot parse iSCSI node inventory")
             portal, iqn = match.groups()
             sid = None
-        entries.append(dict(sid=sid, portal=_parse_state_portal(portal), iqn=iqn))
+        entries.append(dict(
+            sid=sid, portal=_parse_state_portal(portal, flat_node=mode == "node"), iqn=iqn
+        ))
     if mode == "session" and len(set(e["sid"] for e in entries)) != len(entries):
         raise _zonal_state_error("Duplicate session IDs in inventory")
     return entries

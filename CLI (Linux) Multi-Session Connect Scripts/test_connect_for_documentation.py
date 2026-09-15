@@ -509,6 +509,7 @@ class NativeIscsi(object):
         self.login_hosts = []
         self.fail_at = None
         self.suppress_login = False
+        self.unsigned_node_tpgt = False
         self.session_filter = lambda output: output
 
     def node(self, iqn, host, port, count=1):
@@ -594,7 +595,8 @@ Target: {iqn} (non-flash)
             return result("\n".join(
                 "{},{} {}".format(
                     connect.format_target_portal(n["node.conn[0].address"], n["node.conn[0].port"]),
-                    n["node.tpgt"], n["node.name"],
+                    "4294967295" if self.unsigned_node_tpgt and n["node.tpgt"] == "-1"
+                    else n["node.tpgt"], n["node.name"],
                 ) for n in self.nodes
             ))
         if args[:2] == ["-m", "session"] and args[-2:] == ["-P", "3"]:
@@ -727,6 +729,35 @@ class ZonalNativeTests(unittest.TestCase):
         for node in self.native.nodes:
             node["node.tpgt"] = "7"
         self.connect()
+        self.assertEqual([], self.native.mutations)
+
+    def test_native_unsigned_unknown_node_tpgt_supports_fresh_and_existing_layout(self):
+        self.native.unsigned_node_tpgt = True
+        self.connect()
+        self.assertEqual(32, len(self.native.sessions))
+        mutations = list(self.native.mutations)
+        self.connect()
+        self.assertEqual(mutations, self.native.mutations)
+        self.assertEqual([-1, -1, -1], [
+            entry["portal"][2] for entry in connect._read_zonal_inventory("node")
+        ])
+
+    def test_unsigned_unknown_tpgt_is_only_accepted_in_flat_node_inventory(self):
+        with self.assertRaisesRegex(connect.ZonalAffinityError, "portal group"):
+            connect._parse_state_portal("10.0.0.1:3260,4294967295")
+        self.native.seed_layout(make_plan())
+        self.native.unsigned_node_tpgt = True
+        original = self.native
+
+        def changed_node_config(command, **kwargs):
+            result = original(command, **kwargs)
+            if command[-2:] == ["--op", "show"]:
+                result.stdout = result.stdout.replace(b"node.tpgt = -1", b"node.tpgt = 7")
+            return result
+
+        self.run.side_effect = changed_node_config
+        with self.assertRaisesRegex(connect.ZonalAffinityError, "persistent node"):
+            self.connect()
         self.assertEqual([], self.native.mutations)
 
     def test_returned_nondefault_port_is_used_for_all_node_and_session_operations(self):
