@@ -120,6 +120,22 @@ original portal for each SID separately, along with negotiated CRC32C
 digests, running SCSI devices, automatic node startup, and the full persistent
 11/11/10 counts. It does not adopt custom-interface or incomplete node records.
 
+Windows uses the existing `Root\ISCSIPRT\0000_0` initiator selection and
+requires a running initiator plus installed Multipath I/O; it does not
+enable services or install features. A read-only
+[`ReportIScsiPersistentLoginsW`](https://learn.microsoft.com/windows/win32/api/iscsidsc/nf-iscsidsc-reportiscsipersistentloginsw)
+interop helper reads original portals and optional native session mappings.
+When Windows does not expose a unique persistent-to-live mapping, a later
+run refuses to infer it from current endpoints, even if their counts look
+correct. During a new connection, the script can instead correlate each
+successful login request with the one newly observed session and validate
+its persistence. Those observations are invocation-local, not saved as
+another state database.
+
+Windows checks the native process status and `iscsicli`'s terminal English
+success message. Localized or unrecognized status output fails explicitly;
+it is not treated as success.
+
 No automatic disconnect, node deletion, rebalance, or partial-session repair
 is performed. Inspect the selected target's live and persistent state before
 retrying. On Linux use read-only `iscsiadm -m session -P 3` and a target-scoped
