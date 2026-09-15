@@ -58,6 +58,13 @@ def canonicalize_vips(addresses):
     for text in addresses:
         if not isinstance(text, str) or "%" in text:
             raise VipResolutionError("DNS returned an invalid or scoped IP address")
+        # Older ipaddress versions accepted leading zeros. Apply the same
+        # decimal-only rule to IPv4 and the dotted tail of an IPv6 address.
+        if "." in text and re.fullmatch(
+            r"(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]{0,2})){3}",
+            text.rsplit(":", 1)[-1],
+        ) is None:
+            raise VipResolutionError("DNS returned an invalid IP address: {!r}".format(text))
         try:
             address = ipaddress.ip_address(text)
         except ValueError:
@@ -608,6 +615,356 @@ def connect_volume(volume_name, target_iqn, target_portal_hostname, target_porta
     p.communicate()
 
 
+ISCSI_COMMAND_TIMEOUT_SECONDS = 30
+ISCSI_READY_ATTEMPTS = 5
+ISCSI_READY_DELAY_SECONDS = 1
+ZONAL_RECOVERY_GUIDANCE = (
+    " No automatic rollback or cleanup was attempted; node records or sessions may remain. "
+    "Inspect 'sudo iscsiadm -m session -P 3' and 'sudo iscsiadm -m node --op show'. "
+    "Have the storage administrator reconcile the selected target during an approved "
+    "maintenance window before retrying; do not disconnect active workloads."
+)
+
+
+def _zonal_state_error(message):
+    return ZonalAffinityError(message + ZONAL_RECOVERY_GUIDANCE)
+
+
+def _run_zonal_iscsiadm(arguments, empty_message=None):
+    # Noninteractive sudo and a fixed locale keep both execution and parsing bounded.
+    environment = os.environ.copy()
+    environment.update({"LC_ALL": "C", "LANG": "C"})
+    command = ["sudo", "-n", "iscsiadm"] + arguments
+    try:
+        result = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=ISCSI_COMMAND_TIMEOUT_SECONDS, env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise _zonal_state_error("iSCSI command failed: {}".format(error))
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace").strip()
+    # open-iscsi uses 21 for an empty inventory. Do not confuse permission,
+    # daemon, or malformed-output failures with an empty machine.
+    if result.returncode == 21 and empty_message:
+        messages = (stdout + "\n" + stderr).strip()
+        if messages in (empty_message, "iscsiadm: " + empty_message):
+            return ""
+    if result.returncode != 0:
+        raise _zonal_state_error(
+            "iSCSI command {} failed (exit {}): {}".format(
+                arguments, result.returncode, stderr or "no diagnostic"
+            )
+        )
+    if empty_message and not stdout.strip():
+        raise _zonal_state_error("iSCSI inventory returned no evidence of its state")
+    return stdout
+
+
+def _get_zonal_storage_target(subscription, resource_group, san, group, volume):
+    command = [
+        "az", "elastic-san", "volume", "show", "-g", resource_group,
+        "-e", san, "-v", group, "-n", volume,
+        "--query", "storageTarget", "--output", "json",
+    ]
+    if subscription is not None:
+        command.extend(["--subscription", subscription])
+    try:
+        target = json.loads(_run_az_command(command, "Volume target lookup"))
+        return (
+            target["targetIqn"], target["targetPortalHostname"],
+            target["targetPortalPort"],
+        )
+    except (ValueError, KeyError, TypeError) as error:
+        raise ZonalAffinityError("Invalid volume storage target: {}".format(error))
+
+
+def build_zonal_plan(subscription, resource_group, san, group, volumes, count):
+    if count != ZONAL_SESSION_COUNT:
+        raise ZonalAffinityError("Zonal affinity requires exactly 32 sessions per volume")
+    if not volumes:
+        raise ZonalAffinityError("At least one volume must be selected")
+    if sys.version_info < (3, 5):
+        raise ZonalAffinityError("Zonal affinity requires Python 3.5 or later")
+    zone = resolve_physical_zone(subscription, resource_group, san)
+    plans, seen_volumes, seen_iqns = [], set(), {}
+    for volume in volumes:
+        if volume in seen_volumes:
+            continue
+        seen_volumes.add(volume)
+        raw_iqn, hostname, port = _get_zonal_storage_target(
+            subscription, resource_group, san, group, volume
+        )
+        if (
+            not isinstance(raw_iqn, str)
+            or re.fullmatch(r"iqn\.[a-z0-9.:-]+", raw_iqn) is None
+            or ":az-" in raw_iqn
+        ):
+            raise ZonalAffinityError("Invalid or already decorated target IQN")
+        iqn = decorate_target_iqn(raw_iqn, zone)
+        port = validate_target_port(port)
+        if (
+            not isinstance(hostname, str)
+            or not hostname.strip(".")
+            or re.fullmatch(r"[A-Za-z0-9_.-]+", hostname) is None
+        ):
+            raise VipResolutionError("Invalid target portal hostname")
+        identity = (hostname.lower(), port)
+        if raw_iqn in seen_iqns:
+            if seen_iqns[raw_iqn] != identity:
+                raise ZonalAffinityError("Conflicting portal selections for " + raw_iqn)
+            continue
+        seen_iqns[raw_iqn] = identity
+        plans.append(dict(volume=volume, raw_iqn=raw_iqn, iqn=iqn,
+                          hostname=hostname, port=port))
+
+    # Validate all discovery/IQN/port data before resolving any target, and
+    # finish all DNS plans before inspecting or changing native state.
+    cache = {}
+    for plan in plans:
+        plan["vips"] = resolve_target_vips(plan["hostname"], cache)
+        plan["slots"] = allocate_vip_sessions(plan["vips"], count)
+    return plans
+
+
+def _state_host(host):
+    import ipaddress
+    if "%" in host:
+        raise _zonal_state_error("Scoped portal address in iSCSI inventory")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        # Legacy FQDN records must remain visible, not be mistaken for emptiness.
+        if re.fullmatch(r"[A-Za-z0-9_.-]+", host) is None:
+            raise _zonal_state_error("Invalid portal in iSCSI inventory")
+        return host.lower()
+    if address.version == 6 and address.ipv4_mapped is not None:
+        address = address.ipv4_mapped
+    return str(address)
+
+
+def _parse_state_portal(text):
+    match = re.fullmatch(r"(?:\[([^\]]+)\]|([^:\s]+)):(\d+),(-?\d+)", text)
+    if match is None:
+        raise _zonal_state_error("Cannot establish persistent portal: " + text)
+    tpgt = int(match.group(4))
+    if not -1 <= tpgt <= 65535:
+        raise _zonal_state_error("Invalid target portal group tag")
+    return (
+        _state_host(match.group(1) or match.group(2)),
+        validate_target_port(match.group(3)), tpgt,
+    )
+
+
+def _read_zonal_inventory(mode):
+    output = _run_zonal_iscsiadm(
+        ["-m", mode],
+        "No active sessions." if mode == "session" else "No records found",
+    )
+    entries = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        if mode == "session":
+            match = re.fullmatch(
+                r"\S+: \[(\d+)\] (\S+) (\S+)(?: \((?:non-flash|flash)\))?", line.strip()
+            )
+            if match is None:
+                raise _zonal_state_error("Cannot parse iSCSI session inventory")
+            sid, portal, iqn = match.groups()
+        else:
+            match = re.fullmatch(r"(\S+) (\S+)", line.strip())
+            if match is None:
+                raise _zonal_state_error("Cannot parse iSCSI node inventory")
+            portal, iqn = match.groups()
+            sid = None
+        entries.append(dict(sid=sid, portal=_parse_state_portal(portal), iqn=iqn))
+    if mode == "session" and len(set(e["sid"] for e in entries)) != len(entries):
+        raise _zonal_state_error("Duplicate session IDs in inventory")
+    return entries
+
+
+def _selected_zonal_entries(plan, entries):
+    return [
+        entry for entry in entries
+        if entry["iqn"] == plan["raw_iqn"]
+        or entry["iqn"].startswith(plan["raw_iqn"] + ":az-")
+    ]
+
+
+def _node_arguments(plan, host, tpgt=None):
+    portal = format_target_portal(host, plan["port"])
+    if tpgt is not None:
+        portal += "," + str(tpgt)
+    return [
+        "-m", "node", "--targetname", plan["iqn"], "--portal", portal,
+        "--interface", "default",
+    ]
+
+
+def _read_zonal_node(plan, entry):
+    # No interface filter on inspection: multiple iface records must be rejected.
+    output = _run_zonal_iscsiadm([
+        "-m", "node", "--targetname", entry["iqn"],
+        "--portal", format_target_portal(*entry["portal"][:2]) + "," + str(entry["portal"][2]),
+        "--op", "show",
+    ])
+    fields = {}
+    for line in output.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        key, separator, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if not separator or key in fields:
+            raise _zonal_state_error("Ambiguous selected node configuration")
+        fields[key] = value
+    expected = {
+        "node.name": plan["iqn"],
+        "node.tpgt": str(entry["portal"][2]),
+        "iface.iscsi_ifacename": "default",
+        "iface.transport_name": "tcp",
+        "node.conn[0].port": str(plan["port"]),
+        "node.startup": "automatic",
+        "node.session.nr_sessions": str(plan["slots"].count(entry["portal"][0])),
+        "node.conn[0].iscsi.HeaderDigest": "CRC32C",
+        "node.conn[0].iscsi.DataDigest": "CRC32C",
+    }
+    if (
+        any(fields.get(key) != value for key, value in expected.items())
+        or _state_host(fields.get("node.conn[0].address", "")) != entry["portal"][0]
+    ):
+        raise _zonal_state_error("Conflicting or incomplete persistent node configuration")
+
+
+def _read_zonal_session(entry):
+    # A grouped -P listing suppresses repeated portals based on the CURRENT
+    # endpoint. Query each SID separately: redirected sessions may share that
+    # endpoint while having DIFFERENT original/persistent VIPs.
+    output = _run_zonal_iscsiadm(["-m", "session", "-r", entry["sid"], "-P", "3"])
+
+    def field(name):
+        values = re.findall(r"^\s*" + re.escape(name) + r":\s*(.*?)\s*$", output, re.M)
+        if len(values) != 1:
+            raise _zonal_state_error("Missing or ambiguous session field: " + name)
+        return values[0]
+
+    target = field("Target").split()[0]
+    if (
+        target != entry["iqn"] or field("SID") != entry["sid"]
+        or _parse_state_portal(field("Persistent Portal")) != entry["portal"]
+        or field("Iface Name") != "default" or field("Iface Transport") != "tcp"
+    ):
+        raise _zonal_state_error("Session identity or original VIP cannot be proved")
+    _parse_state_portal(field("Current Portal"))
+    healthy = (
+        field("iSCSI Connection State") == "LOGGED IN"
+        and field("iSCSI Session State") == "LOGGED_IN"
+        and field("Internal iscsid Session State") == "NO CHANGE"
+        and field("HeaderDigest") == "CRC32C"
+        and field("DataDigest") == "CRC32C"
+    )
+    disks = re.findall(r"Attached scsi disk\s+\S+\s+State:\s*(\S+)", output)
+    hosts = re.findall(r"Host Number:\s*\d+\s+State:\s*(\S+)", output)
+    return healthy and bool(disks) and all(s == "running" for s in disks) and hosts == ["running"]
+
+
+def check_zonal_layout(plan, sessions, nodes):
+    sessions = _selected_zonal_entries(plan, sessions)
+    nodes = _selected_zonal_entries(plan, nodes)
+    if not sessions and not nodes:
+        return False
+    expected = dict((vip, plan["slots"].count(vip)) for vip in plan["vips"])
+    if (
+        len(sessions) != ZONAL_SESSION_COUNT or len(nodes) != 3
+        or any(e["iqn"] != plan["iqn"] or e["portal"][:2] not in
+               [(vip, plan["port"]) for vip in plan["vips"]] for e in sessions + nodes)
+        or any(sum(e["portal"][0] == vip for e in sessions) != count
+               for vip, count in expected.items())
+        or len(set(e["portal"][0] for e in nodes)) != 3
+    ):
+        raise _zonal_state_error(
+            "Partial, extra, or conflicting state for " + plan["raw_iqn"]
+        )
+    for node in nodes:
+        _read_zonal_node(plan, node)
+    by_host = dict((node["portal"][0], node) for node in nodes)
+    for session in sessions:
+        node = by_host[session["portal"][0]]
+        # Static records commonly have an unknown TPGT (-1). A known TPGT must
+        # agree; the unique persistent portal and iface provide the correlation.
+        if (
+            node["portal"][2] not in (-1, session["portal"][2])
+            or not _read_zonal_session(session)
+        ):
+            raise _zonal_state_error("Unhealthy or mismatched session for " + plan["iqn"])
+    return True
+
+
+def _wait_for_zonal_session(plan, previous, host):
+    for attempt in range(ISCSI_READY_ATTEMPTS):
+        entries = _selected_zonal_entries(plan, _read_zonal_inventory("session"))
+        current = dict((entry["sid"], entry) for entry in entries)
+        added = set(current) - set(previous)
+        if (
+            any(current.get(sid) != entry for sid, entry in previous.items())
+            or len(added) > 1
+            or any(entry["iqn"] != plan["iqn"] for entry in entries)
+        ):
+            raise _zonal_state_error("Session layout changed unexpectedly during login")
+        if added:
+            sid = next(iter(added))
+            entry = current[sid]
+            if entry["portal"][:2] != (host, plan["port"]):
+                raise _zonal_state_error("New session did not retain its allocated VIP")
+            if _read_zonal_session(entry):
+                return sid, current
+        if attempt + 1 < ISCSI_READY_ATTEMPTS:
+            time.sleep(ISCSI_READY_DELAY_SECONDS)
+    raise _zonal_state_error("Timed out waiting for a healthy session through " + host)
+
+
+def connect_zonal_volume(plan):
+    print("{} [{}]: Connecting with 32 zonal sessions".format(plan["volume"], plan["iqn"]))
+    for host in plan["vips"]:
+        arguments = _node_arguments(plan, host)
+        _run_zonal_iscsiadm(arguments + ["--op", "new"])
+        # Keep seed logins at one regardless of system-wide defaults. Persist
+        # the full allocation only after all explicitly requested slots are up.
+        for key, value in (
+            ("node.startup", "manual"),
+            ("node.session.nr_sessions", "1"),
+            ("node.conn[0].iscsi.HeaderDigest", "CRC32C"),
+            ("node.conn[0].iscsi.DataDigest", "CRC32C"),
+        ):
+            _run_zonal_iscsiadm(arguments + ["--op", "update", "-n", key, "-v", value])
+    seeds, sessions = {}, {}
+    for host in plan["slots"]:
+        if host in seeds:
+            arguments = ["-m", "session", "-r", seeds[host], "--op", "new"]
+        else:
+            arguments = _node_arguments(plan, host) + ["--login"]
+        _run_zonal_iscsiadm(arguments)
+        sid, sessions = _wait_for_zonal_session(plan, sessions, host)
+        if host not in seeds:
+            seeds[host] = sid
+    for host in plan["vips"]:
+        for key, value in (
+            ("node.session.nr_sessions", str(plan["slots"].count(host))),
+            ("node.startup", "automatic"),
+        ):
+            _run_zonal_iscsiadm(
+                _node_arguments(plan, host)
+                + ["--op", "update", "-n", key, "-v", value]
+            )
+    if not check_zonal_layout(
+        plan, _read_zonal_inventory("session"), _read_zonal_inventory("node")
+    ):
+        raise _zonal_state_error("New zonal connection disappeared before verification")
+    print("{} [{}]: Verified 32 healthy persistent sessions (11/11/10)".format(
+        plan["volume"], plan["iqn"]
+    ))
+
+
 def connect_volumes(
     elastic_san_subscription,
     resource_group_name,
@@ -617,13 +974,23 @@ def connect_volumes(
     number_of_sessions,
     enable_zonal_affinity=False,
 ):
-    physical_zone = (
-        resolve_physical_zone(
-            elastic_san_subscription, resource_group_name, elastic_san_name
+    if enable_zonal_affinity:
+        plans = build_zonal_plan(
+            elastic_san_subscription, resource_group_name, elastic_san_name,
+            volume_group_name, volume_names, number_of_sessions,
         )
-        if enable_zonal_affinity
-        else None
-    )
+        sessions = _read_zonal_inventory("session")
+        nodes = _read_zonal_inventory("node")
+        connected = [check_zonal_layout(plan, sessions, nodes) for plan in plans]
+        for plan, already_connected in zip(plans, connected):
+            if already_connected:
+                print("{} [{}]: Skipped; verified healthy persistent 11/11/10 layout".format(
+                    plan["volume"], plan["iqn"]
+                ))
+            else:
+                connect_zonal_volume(plan)
+        return
+
     for volume_name in volume_names:
         target_iqn, target_hostname, target_port = get_iqns(
             elastic_san_subscription,
@@ -632,9 +999,6 @@ def connect_volumes(
             volume_group_name,
             volume_name,
         )
-        if enable_zonal_affinity:
-            target_iqn = decorate_target_iqn(target_iqn, physical_zone)
-
         connected = check_connection(target_iqn, target_hostname, target_port)
         if connected:
             print('{} [{}]: Skipped as this volume is already connected'.format(volume_name, target_iqn))
@@ -686,6 +1050,13 @@ def main(argv=None):
     elastic_san_name = args.elastic_san
     volume_group_name = args.volume_group
     volume_names = args.volumes
+    if args.enable_zonal_affinity and args.num_of_sessions is not None:
+        try:
+            requested_sessions = int(args.num_of_sessions)
+        except (TypeError, ValueError):
+            raise ZonalAffinityError("Zonal affinity requires exactly 32 sessions per volume")
+        if requested_sessions != ZONAL_SESSION_COUNT:
+            raise ZonalAffinityError("Zonal affinity requires exactly 32 sessions per volume")
     number_of_sessions = min(32, int(args.num_of_sessions)) if args.num_of_sessions is not None else 32 # default is 32, also the maximum allowed number of sessions
     
     if None in [resource_group_name, elastic_san_name, volume_group_name, volume_names]:
