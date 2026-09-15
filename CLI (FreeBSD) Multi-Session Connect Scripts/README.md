@@ -6,9 +6,12 @@ session per volume**, using FreeBSD's native iSCSI initiator
 (`iscsid`/`iscsictl`/`iscsi.conf`, `sysrc`/`service`).
 
 Stock FreeBSD rejects attempts to create duplicate sessions for the same target
-name and portal. This PoC therefore requires `--num-of-sessions 1` and does not
-silently reduce larger values. NetApp-specific initiator/target behavior that
-may permit multiple sessions needs separate validation and is outside this PoC.
+name and portal. Normal, non-opt-in operation therefore requires
+`--num-of-sessions 1` and never silently reduces larger values.
+`--enable-zonal-affinity` performs read-only mapping, exact-three-VIP DNS
+validation, and 32-session allocation, then explicitly refuses the unsupported
+connection operation before any mutation. NetApp-specific initiator/target
+behavior needs separate validation and is outside this PoC.
 
 This is a **separate implementation** from
 [`CLI (Linux) Multi-Session Connect Scripts`](../CLI%20(Linux)%20Multi-Session%20Connect%20Scripts/connect_for_documentation.py).
@@ -26,7 +29,7 @@ the two scripts.
   the `GENERIC` kernel; if you run a custom kernel, add
   `device iscsi` / `device iscsi_initiator`, or load it at boot with
   `iscsi_load="YES"` in `/boot/loader.conf`, or `kldload iscsi`).
-* **Python 3** (the script uses only the standard library).
+* **Python 3** (3.5 or later for zonal preflight; standard library only).
 * **Azure CLI (`az`) with the `elastic-san` extension.** On FreeBSD, Azure CLI
   is provided by the FreeBSD Ports Collection / community packages (e.g.
   [`sysutils/py-azure-cli`](https://www.freshports.org/sysutils/py-azure-cli/)),
@@ -63,7 +66,7 @@ python3 connect_for_documentation.py \
   -g my-resource-group -e my-elastic-san -v my-volume-group \
   -n volume1 volume2
 
-# Opt in to provisional zonal-affinity IQN routing.
+# Run zonal preflight; exits with an explicit unsupported-32-session error.
 python3 connect_for_documentation.py \
   -g my-resource-group -e my-elastic-san -v my-volume-group \
   -n volume1 --enable-zonal-affinity
@@ -80,19 +83,24 @@ python3 connect_for_documentation.py --subscription <sub-id-or-name> ...
 | `-e`, `--elastic-san` | | Elastic SAN name |
 | `-v`, `--volume-group` | | Volume group name |
 | `-n`, `--volumes` | | One or more volume names |
-| `-s`, `--num-of-sessions` | | Sessions per volume; must be exactly 1 (default: 1 -- see "Session count" below) |
-| `--enable-zonal-affinity` | | Opt in to provisional logical→physical AZ IQN suffix (see below) |
+| `-s`, `--num-of-sessions` | | Exactly 1 without opt-in (default); exactly 32 for zonal preflight, which refuses connection setup |
+| `--enable-zonal-affinity` | | Read-only logical-to-physical mapping, IQN decoration, DNS and allocation; then unsupported-operation failure |
 | `--dry-run` | | Read-only discovery/planning only; no mutation (see below) |
 
 ## `--dry-run`
 
-`--dry-run` performs every read-only step -- Azure CLI/extension check, IMDS
-and Azure Resource Manager zonal lookups (if `--enable-zonal-affinity` is
-set), the per-volume storage-target lookup, and nickname/config-block
+Without zonal affinity, `--dry-run` performs the Azure CLI/extension check,
+per-volume storage-target lookup, and nickname/config-block
 computation -- and prints the plan (resolved targets, nicknames, and the
 selected entries that would be merged into the managed block). It does **not**
 run `sysrc`, `service`, or `iscsictl`, and does **not** write
 `/etc/iscsi.conf`. It does not require root.
+
+With `--enable-zonal-affinity`, dry-run follows the same read-only mapping,
+DNS validation, and 11/11/10 allocation as a regular opted-in invocation.
+It then exits nonzero with the unsupported-32-session explanation. It does
+not print an apparently runnable 32-session configuration or acquire the
+mutation lock. Earlier mapping/DNS failures are reported at their own stage.
 
 Because inspecting existing sessions requires opening `/dev/iscsi` (which
 generally requires root), `--dry-run` does not inspect current session state
@@ -241,23 +249,51 @@ touches sessions/targets it did not create itself.
 
 ## Session count
 
-The default and only accepted value is **1 session per volume**. Stock FreeBSD
-rejects duplicate target-name/portal sessions, so values such as `-s 2` or
-`-s 32` fail before Azure discovery or local mutation; they are never silently
-capped to 1. NetApp-specific multi-session behavior is a separate validation
-track and must not be inferred from this PoC.
+Without opt-in, the default and only accepted value remains **1 session per
+volume**. Values such as `-s 2` or `-s 32` fail before Azure discovery or local
+mutation; they are never silently capped.
+
+With opt-in, the default and only accepted count is **32**. This is a
+read-only allocation requirement, not a claim of FreeBSD session support:
+after successful preflight the script always refuses the operation. An
+explicit count other than 32 is rejected before discovery.
 
 ## Zonal affinity (`--enable-zonal-affinity`)
 
-Identical semantics to the Linux script: resolves the VM's availability zone
+Identical mapping semantics to the Linux and Windows scripts: resolves the VM's availability zone
 via IMDS, confirms the Elastic SAN subscription/region match the VM's, maps
 the VM's logical zone to a physical zone via the ARM Locations API, and
 appends a provisional `:az-<physical-zone>` suffix to the target IQN
 (`[a-z0-9.-]+`, and the resulting IQN must stay within 223 UTF-8 bytes per
 RFC 3720). **This is provisional**: the Elastic SAN front end must parse and
 strip this suffix before zonal-affinity routing has any effect in
-production. Without `--enable-zonal-affinity` (the default), the original,
-undecorated IQN is used.
+production.
+
+The opted-in preflight then resolves each target FQDN through the host's local
+resolver, with three bounded attempts (five seconds each, delays of one and
+two seconds). It requires exactly three unique usable IPv4/IPv6 unicast
+addresses in a single answer. IPv4-mapped IPv6 is normalized before
+deduplication; addresses are sorted by family (IPv4 first) and network bytes.
+The allocation is 11/11/10 over the sorted VIPs. Private addresses are valid.
+An invalid/count-mismatched result is never replaced with the FQDN or combined
+with another lookup's answers.
+
+Stock FreeBSD's
+[`iscsi_ioctl_session_add()`](https://github.com/freebsd/freebsd-src/blob/25985322095d073354d31431da34da1e6871cca5/sys/dev/iscsi/iscsi.c#L1978-L1998)
+and
+[`iscsi_ioctl_session_modify()`](https://github.com/freebsd/freebsd-src/blob/25985322095d073354d31431da34da1e6871cca5/sys/dev/iscsi/iscsi.c#L2198-L2230)
+reject duplicate normal target-IQN/target-address sessions with `EBUSY`.
+Three canonical VIP:port addresses permit at most three such configured
+sessions, not 32. Nicknames, different initiator names/ISIDs, MaxConnections,
+TPGT, aliases, alternate spellings, and login redirects are not supported
+workarounds. The script therefore reports its read-only allocation and fails
+before lock acquisition, configuration/backup writes, services, or sessions.
+This source evidence is not live NetApp qualification.
+
+Without `--enable-zonal-affinity` (the default), the original undecorated IQN
+and target FQDN continue to be used. See the
+[cross-platform contract](../docs/standalone-zonal-affinity.md) for scope and
+recovery guidance (ADO 39679867, dependent on FreeBSD task 39568949).
 
 ## Known limitations / external validation gates
 
@@ -284,9 +320,10 @@ yourself before depending on it in production:
 3. **`gmultipath` assembly is not automated** (see "What this script
    intentionally does not do" above) -- session creation is not multipath
    device assembly.
-4. **Multi-session is not enabled.** Stock FreeBSD's duplicate restriction is
-   enforced as one session per volume. Any NetApp-specific exception needs
-   dedicated interoperability and failure-mode validation.
+4. **Multi-session is not enabled.** Non-opt-in operation remains one session
+   per volume. Zonal mode completes read-only preflight and explicitly fails;
+   it never pretends that three or 32 generated entries satisfy the requirement.
+   Any NetApp-specific exception needs separate interoperability validation.
 
 ## Testing
 

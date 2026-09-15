@@ -27,6 +27,10 @@ This script intentionally does NOT:
     * restart the iscsid service or touch sessions it did not create;
     * assemble gmultipath devices (session creation is not multipath device
       assembly -- see README.md).
+
+Zonal affinity performs read-only mapping and exact-three-VIP DNS preflight,
+then refuses the required 32-session operation. Stock FreeBSD cannot establish
+multiple normal sessions for the same target IQN and canonical VIP:port.
 """
 
 import argparse
@@ -1188,6 +1192,84 @@ def wait_for_connected_session(
 # Connection planning (shared by --dry-run and the real execution path)
 # ---------------------------------------------------------------------------
 
+class ZonalVolumePreflight(object):
+    __slots__ = ("volume_name", "target_name", "target_port", "vips", "session_hosts")
+
+    def __init__(self, volume_name, target_name, target_port, vips):
+        self.volume_name = volume_name
+        self.target_name = target_name
+        self.target_port = target_port
+        self.vips = vips
+        self.session_hosts = allocate_vip_sessions(vips)
+
+
+def build_zonal_preflight(
+    elastic_san_subscription,
+    resource_group_name,
+    elastic_san_name,
+    volume_group_name,
+    volume_names,
+    number_of_sessions=ZONAL_SESSION_COUNT,
+):
+    """Read-only parity with the other platforms, not an executable iscsi.conf plan."""
+    if not volume_names:
+        raise ElasticSanConnectError("At least one volume must be selected")
+    if number_of_sessions != ZONAL_SESSION_COUNT:
+        raise ElasticSanConnectError("Zonal affinity requires exactly 32 sessions per volume")
+    if len(set(volume_names)) != len(volume_names):
+        raise ElasticSanConnectError("Duplicate selected volumes are not permitted")
+    physical_zone = resolve_physical_zone(
+        elastic_san_subscription, resource_group_name, elastic_san_name
+    )
+    cache = {}
+    plans = []
+    seen_targets = set()
+    for volume_name in volume_names:
+        target_iqn, hostname, port = get_volume_storage_target(
+            elastic_san_subscription, resource_group_name, elastic_san_name,
+            volume_group_name, volume_name,
+        )
+        validate_config_scalar(target_iqn, "Target IQN for '{}'".format(volume_name))
+        if any(character.isspace() for character in target_iqn):
+            raise ElasticSanConnectError("Target IQN must not contain whitespace")
+        target_name = decorate_target_iqn(target_iqn, physical_zone)
+        if target_name in seen_targets:
+            raise ElasticSanConnectError("Selected volumes resolve to duplicate target IQNs")
+        seen_targets.add(target_name)
+        port = validate_target_port(port)
+        vips = resolve_target_vips(hostname, cache)
+        plans.append(ZonalVolumePreflight(volume_name, target_name, port, vips))
+    return plans
+
+
+def refuse_unsupported_zonal_connections(plans):
+    allocations = [
+        "{} [{}]: {}".format(
+            plan.volume_name,
+            plan.target_name,
+            ", ".join(
+                "{} ({} sessions)".format(
+                    format_target_portal(vip, plan.target_port), plan.session_hosts.count(vip)
+                )
+                for vip in plan.vips
+            ),
+        )
+        for plan in plans
+    ]
+    raise ElasticSanConnectError(
+        "Read-only zonal preflight completed:\n{}\n"
+        "Unsupported 32-session zonal connection setup on stock FreeBSD: the initiator "
+        "rejects duplicate normal sessions for the same target IQN and VIP:port. Three "
+        "canonical VIPs allow at most three configured normal sessions, not the required "
+        "11/11/10 distribution. No mutation lock, configuration, service, or session "
+        "changes were made. This refusal also applies to --dry-run; no runnable "
+        "32-session configuration is generated. Disable --enable-zonal-affinity for "
+        "the existing one-session FQDN mode, or use a qualified Windows/Linux initiator. "
+        "Do not use aliases or alternate address spellings to bypass this restriction."
+        .format("\n".join(allocations))
+    )
+
+
 class VolumeConnectionPlan(object):
     __slots__ = ("volume_name", "target_name", "target_address", "nicknames")
 
@@ -1215,18 +1297,18 @@ def build_connection_plan(
         raise ElasticSanConnectError(
             "At least one volume must be selected; refusing to build an empty connection plan"
         )
+    if enable_zonal_affinity:
+        preflight = build_zonal_preflight(
+            elastic_san_subscription, resource_group_name, elastic_san_name,
+            volume_group_name, volume_names, number_of_sessions,
+        )
+        refuse_unsupported_zonal_connections(preflight)
     if number_of_sessions != 1:
         raise ElasticSanConnectError(
             "Stock FreeBSD rejects duplicate target-name/portal sessions, so this PoC supports "
             "exactly one session per volume. NetApp-specific multi-session behavior requires "
             "separate validation."
         )
-
-    physical_zone = (
-        resolve_physical_zone(elastic_san_subscription, resource_group_name, elastic_san_name)
-        if enable_zonal_affinity
-        else None
-    )
 
     plans = []
     nickname_owners = {}
@@ -1238,9 +1320,6 @@ def build_connection_plan(
             volume_group_name,
             volume_name,
         )
-        if enable_zonal_affinity:
-            target_iqn = decorate_target_iqn(target_iqn, physical_zone)
-
         target_name = validate_config_scalar(target_iqn, "Target IQN for '{}'".format(volume_name))
         target_address = validate_config_scalar(
             "{}:{}".format(target_hostname, target_port),
@@ -1424,15 +1503,18 @@ def create_argument_parser():
         "-s",
         "--num-of-sessions",
         dest="num_of_sessions",
-        default="1",
-        help="Sessions per volume; stock FreeBSD supports exactly 1 in this PoC (default: 1)",
+        default=None,
+        help=(
+            "Sessions per volume: exactly 1 by default without zonal affinity; "
+            "enabled preflight requires exactly 32 and then refuses unsupported setup"
+        ),
     )
     parser.add_argument(
         "--enable-zonal-affinity",
         action="store_true",
         help=(
-            "Opt in to provisional logical-to-physical availability-zone routing. Requires "
-            "Elastic SAN front-end support for parsing the IQN suffix."
+            "Perform logical-to-physical mapping and exact-three-VIP DNS/allocation preflight, "
+            "then refuse the 32-session setup unsupported by stock FreeBSD. No mutation occurs."
         ),
     )
     parser.add_argument(
@@ -1443,7 +1525,8 @@ def create_argument_parser():
             "without running sysrc, service, or iscsictl, and without writing "
             + DEFAULT_ISCSI_CONF_PATH
             + ". Does not require root. Existing session counts are not inspected in this mode "
-            "(inspecting them requires root); the plan assumes zero pre-existing sessions."
+            "(inspecting them requires root); the plan assumes zero pre-existing sessions. "
+            "With zonal affinity, preflight still ends with the unsupported-32-session error."
         ),
     )
     parser.add_argument(
@@ -1468,15 +1551,22 @@ def main(argv=None):
             "Need to provide resource_group_name, elastic_san_name, volume_group_name, "
             "volume_names to connect to the Elastic SAN volume(s)"
         )
+    expected_sessions = ZONAL_SESSION_COUNT if args.enable_zonal_affinity else 1
     try:
-        number_of_sessions = int(args.num_of_sessions)
+        number_of_sessions = (
+            expected_sessions if args.num_of_sessions is None else int(args.num_of_sessions)
+        )
     except (TypeError, ValueError):
+        if args.enable_zonal_affinity:
+            raise ElasticSanConnectError("Zonal affinity requires exactly 32 sessions per volume")
         raise ElasticSanConnectError(
             "--num-of-sessions must be exactly 1 for stock FreeBSD (got {!r})".format(
                 args.num_of_sessions
             )
         )
-    if number_of_sessions != 1:
+    if args.enable_zonal_affinity and number_of_sessions != ZONAL_SESSION_COUNT:
+        raise ElasticSanConnectError("Zonal affinity requires exactly 32 sessions per volume")
+    if not args.enable_zonal_affinity and number_of_sessions != 1:
         raise ElasticSanConnectError(
             "Stock FreeBSD rejects duplicate target-name/portal sessions, so "
             "--num-of-sessions must be exactly 1 (got {}). NetApp-specific multi-session "

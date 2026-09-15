@@ -112,7 +112,7 @@ class ArgumentParsingTests(unittest.TestCase):
         args = parser.parse_args(["-g", "rg", "-e", "san", "-v", "vg", "-n", "vol1"])
         self.assertFalse(args.dry_run)
         self.assertFalse(args.enable_zonal_affinity)
-        self.assertEqual("1", args.num_of_sessions)
+        self.assertIsNone(args.num_of_sessions)
 
     def test_missing_required_arguments_raise_before_any_azure_or_freebsd_call(self):
         with mock.patch.object(connect, "check_az_cli_available") as check_az:
@@ -1242,14 +1242,23 @@ class BuildConnectionPlanTests(unittest.TestCase):
             with mock.patch.object(
                 connect,
                 "get_volume_storage_target",
-                return_value=("iqn.original", "portal.example", 3260),
+                side_effect=[
+                    ("iqn.original1", "portal.example", 3260),
+                    ("iqn.original2", "portal.example", 3260),
+                ],
             ):
-                plans = connect.build_connection_plan(
-                    "sub", "rg", "san", "vg", ["volume1", "volume2"], 1, enable_zonal_affinity=True
-                )
+                with mock.patch.object(
+                    connect, "_lookup_target_addresses",
+                    return_value=["10.0.0.10", "fd00::1", "10.0.0.2"],
+                ) as lookup:
+                    plans = connect.build_zonal_preflight(
+                        "sub", "rg", "san", "vg", ["volume1", "volume2"], 32
+                    )
         resolve_zone.assert_called_once_with("sub", "rg", "san")
-        for plan in plans:
-            self.assertEqual("iqn.original:az-eastus-az3", plan.target_name)
+        lookup.assert_called_once_with("portal.example")
+        for index, plan in enumerate(plans, 1):
+            self.assertEqual("iqn.original{}:az-eastus-az3".format(index), plan.target_name)
+            self.assertEqual([11, 11, 10], [plan.session_hosts.count(vip) for vip in plan.vips])
 
     def test_empty_volume_selection_is_rejected_before_discovery(self):
         with mock.patch.object(connect, "resolve_physical_zone") as resolve_zone:
@@ -1575,9 +1584,138 @@ class DryRunTests(unittest.TestCase):
                     return_value=("iqn.original", "portal.example", 3260),
                 ):
                     with mock.patch.object(connect, "check_freebsd_mutation_prerequisites") as preflight:
-                        connect.main(argv)
+                        with mock.patch.object(
+                            connect, "_lookup_target_addresses",
+                            return_value=["10.0.0.1", "10.0.0.2", "fd00::1"],
+                        ):
+                            with self.assertRaisesRegex(
+                                connect.ElasticSanConnectError, "Unsupported 32-session"
+                            ):
+                                connect.main(argv)
         resolve_zone.assert_called_once()
         preflight.assert_not_called()
+
+
+class ZonalRefusalTests(unittest.TestCase):
+    ARGV = ["-g", "rg", "-e", "san", "-v", "vg", "-n", "vol1", "--enable-zonal-affinity"]
+    MUTATION_BOUNDARIES = (
+        "execute_connection_plan", "check_freebsd_mutation_prerequisites",
+        "acquire_config_transaction_lock", "read_config_file", "backup_config",
+        "ensure_iscsid_enabled_and_running", "write_config_atomically", "restore_config_from_backup",
+        "add_iscsi_session", "list_iscsi_sessions", "render_full_managed_block", "build_nickname",
+        "_run_command", "_run_subprocess",
+    )
+
+    def test_enabled_and_enabled_dry_run_finish_preflight_then_refuse_without_mutation(self):
+        for extra in ([], ["--dry-run"], ["-s", "32"]):
+            with self.subTest(extra=extra):
+                order = []
+
+                def zone(*_):
+                    order.append("zone")
+                    return "eastus-az3"
+
+                def target(*_):
+                    order.append("target")
+                    return "iqn.original", "portal.example", 3260
+
+                def lookup(_):
+                    order.append("dns")
+                    return ["fd00::1", "::ffff:10.0.0.2", "10.0.0.1"]
+
+                with mock.patch.object(connect, "check_az_cli_available"):
+                    with mock.patch.object(connect, "resolve_physical_zone", side_effect=zone):
+                        with mock.patch.object(connect, "get_volume_storage_target", side_effect=target):
+                            with mock.patch.object(connect, "_lookup_target_addresses", side_effect=lookup):
+                                with mock.patch.multiple(
+                                    connect, **{name: mock.DEFAULT for name in self.MUTATION_BOUNDARIES}
+                                ) as boundaries:
+                                    with self.assertRaisesRegex(
+                                        connect.ElasticSanConnectError, "Unsupported 32-session"
+                                    ) as raised:
+                                        connect.main(self.ARGV + extra)
+                self.assertEqual(["zone", "target", "dns"], order)
+                self.assertIn("iqn.original:az-eastus-az3", str(raised.exception))
+                self.assertIn("10.0.0.1:3260 (11 sessions)", str(raised.exception))
+                self.assertIn("10.0.0.2:3260 (11 sessions)", str(raised.exception))
+                self.assertIn("[fd00::1]:3260 (10 sessions)", str(raised.exception))
+                for boundary in boundaries.values():
+                    boundary.assert_not_called()
+
+    def test_stage_failure_is_not_hidden_by_platform_refusal(self):
+        for stage in ("zone", "dns"):
+            with self.subTest(stage=stage):
+                with mock.patch.object(connect, "check_az_cli_available"):
+                    with mock.patch.object(
+                        connect, "resolve_physical_zone",
+                        side_effect=connect.ElasticSanConnectError("mapping failed") if stage == "zone" else None,
+                        return_value="eastus-az3",
+                    ):
+                        with mock.patch.object(
+                            connect, "get_volume_storage_target",
+                            return_value=("iqn.original", "portal.example", 3260),
+                        ):
+                            with mock.patch.object(connect, "_lookup_target_addresses", return_value=["10.0.0.1"]):
+                                with mock.patch.object(connect.time, "sleep"):
+                                    with mock.patch.multiple(
+                                        connect, **{name: mock.DEFAULT for name in self.MUTATION_BOUNDARIES}
+                                    ) as boundaries:
+                                        expected = connect.ElasticSanConnectError if stage == "zone" else connect.VipResolutionError
+                                        with self.assertRaises(expected) as raised:
+                                            connect.main(self.ARGV)
+                self.assertNotIn("Unsupported 32-session", str(raised.exception))
+                for boundary in boundaries.values():
+                    boundary.assert_not_called()
+
+    def test_later_volume_dns_failure_leaves_all_volumes_untouched(self):
+        argv = ["-g", "rg", "-e", "san", "-v", "vg", "-n", "vol1", "vol2", "--enable-zonal-affinity"]
+        with mock.patch.object(connect, "check_az_cli_available"):
+            with mock.patch.object(connect, "resolve_physical_zone", return_value="eastus-az3"):
+                with mock.patch.object(connect, "get_volume_storage_target", side_effect=[
+                    ("iqn.first", "first.example", 3260), ("iqn.second", "second.example", 3260),
+                ]):
+                    with mock.patch.object(connect, "_lookup_target_addresses", side_effect=[
+                        ["10.0.0.1", "10.0.0.2", "fd00::1"], [], [], [],
+                    ]) as lookup:
+                        with mock.patch.object(connect.time, "sleep"):
+                            with mock.patch.multiple(
+                                connect, **{name: mock.DEFAULT for name in self.MUTATION_BOUNDARIES}
+                            ) as boundaries:
+                                with self.assertRaisesRegex(connect.VipResolutionError, "second.example"):
+                                    connect.main(argv)
+        self.assertEqual(4, lookup.call_count)
+        for boundary in boundaries.values():
+            boundary.assert_not_called()
+
+    def test_wrong_opted_in_counts_fail_before_discovery(self):
+        for value in ("1", "0", "31", "33", "not-a-number"):
+            with self.subTest(value=value):
+                with mock.patch.object(connect, "check_az_cli_available") as check:
+                    with self.assertRaisesRegex(connect.ElasticSanConnectError, "exactly 32"):
+                        connect.main(self.ARGV + ["-s", value])
+                check.assert_not_called()
+
+    def test_opt_out_keeps_one_session_fqdn_plan_without_zonal_lookups(self):
+        with mock.patch.object(connect, "check_az_cli_available"):
+            with mock.patch.object(connect, "get_volume_storage_target", return_value=("iqn.original", "portal.example", 3260)):
+                with mock.patch.object(connect, "resolve_physical_zone") as zone:
+                    with mock.patch.object(connect, "resolve_target_vips") as dns:
+                        with mock.patch.object(connect, "execute_connection_plan") as execute:
+                            connect.main(self.ARGV[:-1])
+        zone.assert_not_called()
+        dns.assert_not_called()
+        self.assertEqual(1, execute.call_args.args[2])
+        self.assertEqual("portal.example:3260", execute.call_args.args[0][0].target_address)
+
+    def test_duplicate_selection_and_targets_are_rejected(self):
+        with mock.patch.object(connect, "resolve_physical_zone", return_value="eastus-az3") as zone:
+            with self.assertRaisesRegex(connect.ElasticSanConnectError, "Duplicate selected"):
+                connect.build_zonal_preflight(None, "rg", "san", "vg", ["vol1", "vol1"])
+            zone.assert_not_called()
+            with mock.patch.object(connect, "get_volume_storage_target", return_value=("iqn.same", "portal.example", 3260)):
+                with mock.patch.object(connect, "_lookup_target_addresses", return_value=["10.0.0.1", "10.0.0.2", "fd00::1"]):
+                    with self.assertRaisesRegex(connect.ElasticSanConnectError, "duplicate target IQNs"):
+                        connect.build_zonal_preflight(None, "rg", "san", "vg", ["vol1", "vol2"])
 
 
 if __name__ == "__main__":
