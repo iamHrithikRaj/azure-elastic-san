@@ -248,6 +248,32 @@ def resolve_elastic_san_subscription_id(elastic_san_subscription):
     return canonicalize_subscription_id(subscription_id, "Elastic SAN")
 
 
+def get_elastic_san_location(
+    elastic_san_subscription_id, resource_group_name, elastic_san_name
+):
+    command = [
+        "az",
+        "elastic-san",
+        "show",
+        "-g",
+        resource_group_name,
+        "-e",
+        elastic_san_name,
+        "--subscription",
+        elastic_san_subscription_id,
+        "--query",
+        "location",
+        "--output",
+        "tsv",
+    ]
+    location = _run_az_command(
+        command, "Elastic SAN location lookup"
+    ).strip()
+    if not location:
+        raise ZonalAffinityError("Elastic SAN location lookup returned an empty location")
+    return location
+
+
 def get_azure_locations(elastic_san_subscription_id):
     elastic_san_subscription_id = canonicalize_subscription_id(
         elastic_san_subscription_id, "Elastic SAN"
@@ -295,7 +321,7 @@ def map_logical_to_physical_zone(locations, location_name, logical_zone):
 
     if region is None:
         raise ZonalAffinityError(
-            "Azure location REST response has no region matching IMDS location '{}'".format(
+            "Azure location REST response has no region matching Elastic SAN location '{}'".format(
                 location_name
             )
         )
@@ -312,7 +338,7 @@ def map_logical_to_physical_zone(locations, location_name, logical_zone):
         )
 
     normalized_logical_zone = logical_zone.strip()
-    physical_zone = None
+    zone_map = {}
     for mapping in mappings:
         if not isinstance(mapping, dict):
             raise ZonalAffinityError("availabilityZoneMappings contains a malformed entry")
@@ -325,20 +351,28 @@ def map_logical_to_physical_zone(locations, location_name, logical_zone):
             or not mapped_physical_zone.strip()
         ):
             raise ZonalAffinityError("availabilityZoneMappings contains a malformed entry")
-        if mapped_logical_zone.strip() == normalized_logical_zone:
-            physical_zone = mapped_physical_zone.strip()
-            break
+        mapped_logical_zone = mapped_logical_zone.strip()
+        mapped_physical_zone = mapped_physical_zone.strip()
+        if mapped_logical_zone in zone_map:
+            raise ZonalAffinityError(
+                "availabilityZoneMappings contains duplicate logical zone '{}'".format(
+                    mapped_logical_zone
+                )
+            )
+        zone_map[mapped_logical_zone] = mapped_physical_zone
 
-    if physical_zone is None:
+    if normalized_logical_zone not in zone_map:
         raise ZonalAffinityError(
             "Region '{}' has no availability-zone mapping for logical zone '{}'".format(
                 region.get("name"), logical_zone
             )
         )
-    return physical_zone
+    return zone_map[normalized_logical_zone]
 
 
-def resolve_physical_zone(elastic_san_subscription):
+def resolve_physical_zone(
+    elastic_san_subscription, resource_group_name, elastic_san_name
+):
     compute = get_vm_compute_metadata()
     logical_zone = compute.get("zone")
     if not isinstance(logical_zone, string_types) or not logical_zone.strip():
@@ -361,8 +395,18 @@ def resolve_physical_zone(elastic_san_subscription):
             )
         )
 
+    elastic_san_location = get_elastic_san_location(
+        elastic_san_subscription_id, resource_group_name, elastic_san_name
+    )
+    if elastic_san_location.strip().lower() != location_name.strip().lower():
+        raise ZonalAffinityError(
+            "The VM and Elastic SAN must be in the same region."
+        )
+
     locations = get_azure_locations(elastic_san_subscription_id)
-    return map_logical_to_physical_zone(locations, location_name, logical_zone)
+    return map_logical_to_physical_zone(
+        locations, elastic_san_location, logical_zone
+    )
 
 
 def decorate_target_iqn(target_iqn, physical_zone):
@@ -465,7 +509,9 @@ def connect_volumes(
     enable_zonal_affinity=False,
 ):
     physical_zone = (
-        resolve_physical_zone(elastic_san_subscription)
+        resolve_physical_zone(
+            elastic_san_subscription, resource_group_name, elastic_san_name
+        )
         if enable_zonal_affinity
         else None
     )
