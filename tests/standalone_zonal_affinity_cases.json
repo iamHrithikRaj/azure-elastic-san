@@ -29,6 +29,7 @@
     {"name": "whitespace", "addresses": [" 10.0.0.1", "10.0.0.2", "10.0.0.3"], "error": true},
     {"name": "short-ipv4", "addresses": ["10.1", "10.0.0.2", "10.0.0.3"], "error": true},
     {"name": "octal-ipv4", "addresses": ["010.0.0.1", "10.0.0.2", "10.0.0.3"], "error": true},
+    {"name": "octal-mapped-tail", "addresses": ["::ffff:010.0.0.1", "10.0.0.2", "10.0.0.3"], "error": true},
     {"name": "ipv4-unspecified", "addresses": ["0.0.0.0", "10.0.0.2", "10.0.0.3"], "error": true},
     {"name": "ipv6-unspecified", "addresses": ["::", "10.0.0.2", "10.0.0.3"], "error": true},
     {"name": "mapped-loopback", "addresses": ["::ffff:127.0.0.1", "10.0.0.2", "10.0.0.3"], "error": true},

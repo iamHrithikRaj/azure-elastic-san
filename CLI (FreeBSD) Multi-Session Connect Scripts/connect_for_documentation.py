@@ -126,6 +126,12 @@ def canonicalize_vips(addresses):
     for text in addresses:
         if not isinstance(text, str) or "%" in text:
             raise VipResolutionError("DNS returned an invalid or scoped IP address")
+        # Older ipaddress versions accepted leading zeros; keep all downloads
+        # consistent with strict dotted-decimal parsing, including mapped tails.
+        if "." in text and re.fullmatch(
+            r"(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}", text.rsplit(":", 1)[-1]
+        ) is None:
+            raise VipResolutionError("DNS returned an invalid IPv4 address: {!r}".format(text))
         try:
             address = ipaddress.ip_address(text)
         except ValueError:

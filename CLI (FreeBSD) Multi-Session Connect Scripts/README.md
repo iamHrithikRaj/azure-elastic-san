@@ -137,7 +137,7 @@ remaining within 128 characters and `[a-z0-9][a-z0-9_-]*`:
 ```
 esan-my-volume-group-volume1-<16-hex-digest>-s1 {
 	TargetName    = "iqn.2005-03.com.microsoft:<...>"
-	TargetAddress = "10.0.0.4:3260"
+	TargetAddress = "portal.example:3260"
 	HeaderDigest  = CRC32C
 	DataDigest    = CRC32C
 	Enable        = On
@@ -289,6 +289,11 @@ TPGT, aliases, alternate spellings, and login redirects are not supported
 workarounds. The script therefore reports its read-only allocation and fails
 before lock acquisition, configuration/backup writes, services, or sessions.
 This source evidence is not live NetApp qualification.
+
+The opted-in path does not even run `iscsictl -L`:
+[`iscsictl` startup](https://github.com/freebsd/freebsd-src/blob/25985322095d073354d31431da34da1e6871cca5/usr.bin/iscsictl/iscsictl.c#L881-L891)
+can load the kernel module when `/dev/iscsi` is missing. Avoiding all
+`iscsictl` invocations keeps preflight genuinely read-only.
 
 Without `--enable-zonal-affinity` (the default), the original undecorated IQN
 and target FQDN continue to be used. See the
