@@ -101,6 +101,114 @@ class ElasticSanConnectError(Exception):
     """Raised for any expected, actionable failure in this script."""
 
 
+class VipResolutionError(ValueError):
+    """The local resolver could not establish the exact-three-VIP contract."""
+
+
+DNS_ATTEMPT_TIMEOUT_SECONDS = 5
+DNS_RETRY_DELAYS_SECONDS = (1, 2)
+ZONAL_SESSION_COUNT = 32
+
+
+def canonicalize_vips(addresses):
+    """Keep this standalone helper consistent with the shared contract fixtures."""
+    if sys.version_info < (3, 5):
+        raise VipResolutionError("Zonal VIP resolution requires Python 3.5 or later")
+    import ipaddress
+
+    if not isinstance(addresses, (list, tuple)):
+        raise VipResolutionError("DNS must return an address list")
+    unique = {}
+    for text in addresses:
+        if not isinstance(text, str) or "%" in text:
+            raise VipResolutionError("DNS returned an invalid or scoped IP address")
+        try:
+            address = ipaddress.ip_address(text)
+        except ValueError:
+            raise VipResolutionError("DNS returned an invalid IP address: {!r}".format(text))
+        if address.version == 6 and address.ipv4_mapped is not None:
+            address = address.ipv4_mapped
+        if (
+            address.is_unspecified
+            or address.is_loopback
+            or address.is_multicast
+            or address.is_link_local
+            or str(address) == "255.255.255.255"
+        ):
+            raise VipResolutionError("DNS returned an unusable unicast VIP: {}".format(address))
+        unique[(address.version, address.packed)] = str(address)
+    if len(unique) != 3:
+        raise VipResolutionError(
+            "Expected exactly three unique usable SLB VIPs; DNS returned {}".format(len(unique))
+        )
+    return [unique[key] for key in sorted(unique)]
+
+
+def _lookup_target_addresses(hostname):
+    # getaddrinfo has no portable timeout. A child process bounds native resolver
+    # stalls; subprocess.run kills and reaps it on TimeoutExpired.
+    worker = (
+        "import json,socket,sys;"
+        "print(json.dumps([r[4][0] for r in socket.getaddrinfo("
+        "sys.argv[1],None,socket.AF_UNSPEC,socket.SOCK_STREAM)]))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", worker, hostname],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=DNS_ATTEMPT_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise OSError("Local DNS lookup failed: {}".format(detail or result.returncode))
+    return json.loads(result.stdout.decode("utf-8"))
+
+
+def resolve_target_vips(hostname, cache=None):
+    if sys.version_info < (3, 5):
+        raise VipResolutionError("Zonal VIP resolution requires Python 3.5 or later")
+    if (
+        not isinstance(hostname, str)
+        or not hostname.strip(".")
+        or re.fullmatch(r"[A-Za-z0-9_.-]+", hostname) is None
+    ):
+        raise VipResolutionError("Invalid target portal hostname: {!r}".format(hostname))
+    key = hostname.lower()
+    if cache is not None and key in cache:
+        return list(cache[key])
+    for attempt in range(len(DNS_RETRY_DELAYS_SECONDS) + 1):
+        try:
+            vips = canonicalize_vips(_lookup_target_addresses(hostname))
+        except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+            if attempt == len(DNS_RETRY_DELAYS_SECONDS):
+                raise VipResolutionError(
+                    "Cannot resolve '{}' to exactly three unique usable SLB VIPs after "
+                    "{} attempts: {}".format(hostname, attempt + 1, error)
+                )
+            time.sleep(DNS_RETRY_DELAYS_SECONDS[attempt])
+        else:
+            if cache is not None:
+                cache[key] = tuple(vips)
+            return vips
+
+
+def allocate_vip_sessions(vips, number_of_sessions=ZONAL_SESSION_COUNT):
+    if number_of_sessions != ZONAL_SESSION_COUNT:
+        raise VipResolutionError("Zonal affinity requires exactly 32 sessions per volume")
+    ordered = canonicalize_vips(vips)
+    return [ordered[index % 3] for index in range(ZONAL_SESSION_COUNT)]
+
+
+def validate_target_port(port):
+    if isinstance(port, bool) or not str(port).isdigit() or not 1 <= int(port) <= 65535:
+        raise VipResolutionError("Invalid target portal port: {!r}".format(port))
+    return int(port)
+
+
+def format_target_portal(host, port):
+    return "{}:{}".format("[{}]".format(host) if ":" in host else host, validate_target_port(port))
+
+
 # ---------------------------------------------------------------------------
 # Bounded subprocess execution (shared by Azure CLI and FreeBSD tool calls)
 # ---------------------------------------------------------------------------
