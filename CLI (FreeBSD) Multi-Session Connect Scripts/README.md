@@ -104,15 +104,30 @@ in the preview.
 
 ## What gets written to `/etc/iscsi.conf`
 
-For every volume the script generates a deterministic nickname
-(`esan-<volume-group>-<volume>-s1`, sanitized to `[a-z0-9_-]`) and a matching
-stanza. If that readable nickname would exceed FreeBSD's 128-character limit,
-the readable base is truncated and a `-<12 hex SHA-256>-s1` suffix derived from
-the complete unbounded identity is appended. This keeps the nickname stable,
-bounded, and collision-resistant:
+For every volume the script generates a deterministic nickname with this exact
+cross-tool contract (the Azure portal generator must use the same algorithm):
+
+1. Build the identity as a compact JSON array with no spaces:
+   `[rawVolumeGroupName,rawVolumeName,rawTargetName,sessionIndex]`, where
+   `rawTargetName` is the resolved, unsanitized IQN written as `TargetName`
+   (including the zonal-affinity suffix when enabled). Python uses
+   `json.dumps(..., ensure_ascii=False, separators=(",", ":"))`; the portal
+   equivalent is `JSON.stringify([...])`. SHA-256 hashes the UTF-8 bytes of this
+   JSON. The first 16 lowercase hexadecimal characters are the digest.
+2. Trim and lowercase the group and volume independently, replace each run of
+   characters outside `[a-z0-9]` with `-`, and trim leading/trailing `-`.
+   Form the readable base `esan-<sanitized-group>-<sanitized-volume>`.
+3. Form the suffix `-<16-hex-digest>-s1`. Truncate the readable base to the
+   first `128 - len(suffix)` characters, trim trailing `-` from that prefix,
+   and append the suffix.
+
+Every nickname includes the digest, even when the readable base is short. This
+keeps names stable and distinguishes raw identities that sanitize to the same
+text, different group/volume boundaries, and different target IQNs while
+remaining within 128 characters and `[a-z0-9][a-z0-9_-]*`:
 
 ```
-esan-my-volume-group-volume1-s1 {
+esan-my-volume-group-volume1-<16-hex-digest>-s1 {
 	TargetName    = "iqn.2005-03.com.microsoft:<...>"
 	TargetAddress = "10.0.0.4:3260"
 	HeaderDigest  = CRC32C
@@ -139,11 +154,13 @@ other targets, etc. -- is preserved **byte-for-byte**. If `/etc/iscsi.conf`
 already has a managed block from a previous run (from this script or the
 portal's), it is parsed strictly. Unknown, malformed, incomplete, or duplicate
 content inside the markers is rejected rather than discarded. Entries selected
-in the current run replace entries with the same deterministic nickname;
-managed entries for unselected volumes are retained. The merged block is sorted
-by nickname, so selecting A then B or B then A converges to the same bytes. If
-the file has only one marker, duplicate markers, or non-standalone marker text,
-the script refuses to touch it rather than guessing.
+in the current run that already exist with the same nickname and identical
+target/address are idempotent. A nickname collision with a different target or
+address is rejected rather than overwritten. Managed entries for unselected
+volumes are retained. The merged block is sorted by nickname, so selecting A
+then B or B then A converges to the same bytes. If the file has only one marker,
+duplicate markers, or non-standalone marker text, the script refuses to touch it
+rather than guessing.
 
 `TargetName`/`TargetAddress` values are validated before they are written:
 anything containing a quote, brace, `#`, `;`, or a control character
@@ -162,14 +179,25 @@ managed block, so they survive reruns.
 
 ### Atomic write, backup, and rollback
 
-Every write to `/etc/iscsi.conf` goes through: write a temp file in the same
-directory → `fsync` → preserve the original file's permissions and ownership
-(where the platform supports it) → `os.replace` (atomic rename). Before any
-of that, if `/etc/iscsi.conf` already existed, its exact current bytes are
-copied to a backup file (`/etc/iscsi.conf.bak.pre-esan-connect.<pid>`,
-created with restrictive `0600` permissions regardless of the original file's
-mode, since preserved unrelated stanzas may contain CHAP secrets). The backup
-is **not** deleted automatically; it's left behind for manual recovery.
+Mutating runs are serialized with an exclusive `fcntl.flock` on the separate
+`/etc/.azure-elastic-san.lock` file. The separate inode is required because
+`/etc/iscsi.conf` itself is atomically replaced. The lock is securely opened
+without following symlinks where the platform supports `O_NOFOLLOW`, must be a
+regular non-symlink file, and is created with mode `0600`. It is acquired before
+reading or merging the config and held through backup, atomic write, `iscsid`
+setup, session setup, and any rollback. This prevents concurrent standalone or
+portal-generated runs that honor the same lock contract from losing each
+other's updates. `--dry-run` neither creates nor acquires the lock.
+
+While holding that lock, every write to `/etc/iscsi.conf` goes through: write a
+temp file in the same directory → `fsync` → preserve the original file's
+permissions and ownership (where the platform supports it) → `os.replace`
+(atomic rename). Before any of that, if `/etc/iscsi.conf` already existed, its
+exact current bytes are copied to a backup file
+(`/etc/iscsi.conf.bak.pre-esan-connect.<pid>`, created with restrictive `0600`
+permissions regardless of the original file's mode, since preserved unrelated
+stanzas may contain CHAP secrets). The backup is **not** deleted automatically;
+it's left behind for manual recovery.
 
 If starting/configuring the requested sessions then fails partway through,
 the script restores `/etc/iscsi.conf` from that backup (or deletes the file

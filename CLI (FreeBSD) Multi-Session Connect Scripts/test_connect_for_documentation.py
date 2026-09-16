@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -372,40 +373,72 @@ class ConfigValueValidationTests(unittest.TestCase):
 
 class NicknameTests(unittest.TestCase):
     def test_deterministic_across_calls(self):
-        first = connect.build_nickname("vg-1", "vol-1", 1)
-        second = connect.build_nickname("vg-1", "vol-1", 1)
+        first = connect.build_nickname("vg-1", "vol-1", "iqn.example:target", 1)
+        second = connect.build_nickname("vg-1", "vol-1", "iqn.example:target", 1)
         self.assertEqual(first, second)
 
     def test_rejects_session_index_other_than_one(self):
         with self.assertRaisesRegex(connect.ElasticSanConnectError, "exactly one session"):
-            connect.build_nickname("vg-1", "vol-1", 2)
+            connect.build_nickname("vg-1", "vol-1", "iqn.example:target", 2)
 
     def test_distinct_for_different_volumes(self):
         self.assertNotEqual(
-            connect.build_nickname("vg-1", "vol-1", 1),
-            connect.build_nickname("vg-1", "vol-2", 1),
+            connect.build_nickname("vg-1", "vol-1", "iqn.example:target", 1),
+            connect.build_nickname("vg-1", "vol-2", "iqn.example:target", 1),
         )
 
     def test_sanitizes_unsafe_characters_and_lowercases(self):
-        nickname = connect.build_nickname("VG_1", "Volume One!", 1)
+        nickname = connect.build_nickname(
+            "VG_1", "Volume One!", "iqn.example:target", 1
+        )
         self.assertRegex(nickname, r"^[a-z0-9][a-z0-9_-]*$")
-        self.assertTrue(nickname.startswith("esan-vg-1-volume-one-s1"))
+        self.assertEqual(
+            "esan-vg-1-volume-one-929b9d9f44aabac7-s1",
+            nickname,
+        )
 
     def test_raises_when_no_usable_characters_remain(self):
         with self.assertRaisesRegex(connect.ElasticSanConnectError, "no \\[a-z0-9\\] characters"):
-            connect.build_nickname("!!!", "vol", 1)
+            connect.build_nickname("!!!", "vol", "iqn.example:target", 1)
 
     def test_maximum_resource_names_produce_bounded_ascii_nickname(self):
-        nickname = connect.build_nickname("g" * 63, "v" * 63, 1)
+        nickname = connect.build_nickname(
+            "g" * 63, "v" * 63, "iqn.example:target", 1
+        )
         self.assertLessEqual(len(nickname), 128)
-        self.assertRegex(nickname, r"^esan-[a-z0-9-]+-[0-9a-f]{12}-s1$")
-        self.assertEqual(nickname, connect.build_nickname("g" * 63, "v" * 63, 1))
+        self.assertRegex(nickname, r"^esan-[a-z0-9-]+-[0-9a-f]{16}-s1$")
+        self.assertEqual(
+            nickname,
+            connect.build_nickname("g" * 63, "v" * 63, "iqn.example:target", 1),
+        )
 
     def test_long_identities_with_same_readable_prefix_do_not_collide(self):
-        first = connect.build_nickname("g" * 63, "v" * 62 + "a", 1)
-        second = connect.build_nickname("g" * 63, "v" * 62 + "b", 1)
+        first = connect.build_nickname(
+            "g" * 63, "v" * 62 + "a", "iqn.example:target", 1
+        )
+        second = connect.build_nickname(
+            "g" * 63, "v" * 62 + "b", "iqn.example:target", 1
+        )
         self.assertNotEqual(first, second)
         self.assertEqual(first[:100], second[:100])
+
+    def test_group_volume_boundary_is_unambiguous(self):
+        self.assertNotEqual(
+            connect.build_nickname("prod-a", "data", "iqn.example:target", 1),
+            connect.build_nickname("prod", "a-data", "iqn.example:target", 1),
+        )
+
+    def test_sanitization_collision_is_disambiguated(self):
+        self.assertNotEqual(
+            connect.build_nickname("prod", "data-a", "iqn.example:target", 1),
+            connect.build_nickname("prod", "data--a", "iqn.example:target", 1),
+        )
+
+    def test_target_iqn_is_part_of_identity(self):
+        self.assertNotEqual(
+            connect.build_nickname("prod", "data", "iqn.example:first", 1),
+            connect.build_nickname("prod", "data", "iqn.example:second", 1),
+        )
 
 
 class ManagedBlockRenderTests(unittest.TestCase):
@@ -434,25 +467,24 @@ class ConfigSplicingTests(unittest.TestCase):
         self.assertTrue(result.startswith(existing))
         self.assertTrue(result.endswith(new_block))
 
-    def test_replaces_selected_entry_and_preserves_surrounding_content_byte_for_byte(self):
-        old_block = connect.render_managed_block(
-            [connect.ManagedConfigEntry("esan-vg-vol-s1", "iqn.example:old", "old:3260")]
+    def test_idempotent_entry_preserves_surrounding_content_byte_for_byte(self):
+        existing_block = connect.render_managed_block(
+            [connect.ManagedConfigEntry("esan-vg-vol-s1", "iqn.example:target", "target:3260")]
         )
         existing = (
             b"# my manual stanza\n"
             b"manual { targetname = manual.target; }\n"
-            + old_block
+            + existing_block
             + b"# trailing manual comment\n"
         )
-        new_block = connect.render_managed_block(
-            [connect.ManagedConfigEntry("esan-vg-vol-s1", "iqn.example:new", "new:3260")]
+        selected_block = connect.render_managed_block(
+            [connect.ManagedConfigEntry("esan-vg-vol-s1", "iqn.example:target", "target:3260")]
         )
-        result = connect.compute_new_config_content(existing, new_block)
+        result = connect.compute_new_config_content(existing, selected_block)
 
         self.assertIn(b"# my manual stanza\nmanual { targetname = manual.target; }\n", result)
         self.assertIn(b"# trailing manual comment\n", result)
-        self.assertIn(b"iqn.example:new", result)
-        self.assertNotIn(b"iqn.example:old", result)
+        self.assertIn(b"iqn.example:target", result)
         self.assertEqual(
             b"# trailing manual comment\n",
             result[result.index(b"# trailing manual comment\n") :],
@@ -544,6 +576,27 @@ class ConfigSplicingTests(unittest.TestCase):
     def test_empty_selected_block_is_rejected(self):
         with self.assertRaisesRegex(connect.ElasticSanConnectError, "empty"):
             connect.compute_new_config_content(b"", connect.render_managed_block([]))
+
+    def test_conflicting_existing_nickname_is_not_overwritten(self):
+        nickname = "esan-vg-vol-0123456789abcdef-s1"
+        existing = connect.render_managed_block(
+            [connect.ManagedConfigEntry(nickname, "iqn.example:old", "old:3260")]
+        )
+        selected = connect.render_managed_block(
+            [connect.ManagedConfigEntry(nickname, "iqn.example:new", "new:3260")]
+        )
+
+        with self.assertRaisesRegex(connect.ElasticSanConnectError, "conflicts"):
+            connect.compute_new_config_content(existing, selected)
+
+    def test_identical_existing_nickname_is_idempotent(self):
+        entry = connect.ManagedConfigEntry(
+            "esan-vg-vol-0123456789abcdef-s1",
+            "iqn.example:target",
+            "portal:3260",
+        )
+        block = connect.render_managed_block([entry])
+        self.assertEqual(block, connect.compute_new_config_content(block, block))
 
 
 class PortalMarkerCompatibilityTests(unittest.TestCase):
@@ -699,6 +752,101 @@ class AtomicWriteAndBackupTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.config_path))
 
 
+class RecordingFcntl(object):
+    LOCK_EX = 2
+    LOCK_UN = 8
+
+    def __init__(self):
+        self.operations = []
+
+    def flock(self, file_descriptor, operation):
+        self.operations.append((file_descriptor, operation))
+
+
+class BlockingFcntl(object):
+    LOCK_EX = 2
+    LOCK_UN = 8
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.acquire_count = 0
+        self.second_acquire_attempted = threading.Event()
+
+    def flock(self, _file_descriptor, operation):
+        if operation == self.LOCK_EX:
+            self.acquire_count += 1
+            if self.acquire_count == 2:
+                self.second_acquire_attempted.set()
+            self.lock.acquire()
+        else:
+            self.lock.release()
+
+
+class ConfigTransactionLockTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.mkdtemp(prefix="esan-freebsd-lock-test-")
+        self.config_path = os.path.join(self.tempdir, "iscsi.conf")
+
+    def tearDown(self):
+        for name in os.listdir(self.tempdir):
+            os.remove(os.path.join(self.tempdir, name))
+        os.rmdir(self.tempdir)
+
+    def test_lock_path_is_stable_and_separate_from_replaceable_config_inode(self):
+        self.assertEqual(
+            os.path.join(self.tempdir, connect.CONFIG_LOCK_FILENAME),
+            connect.get_config_lock_path(self.config_path),
+        )
+
+    def test_secure_open_acquires_and_releases_exclusive_lock(self):
+        fake_fcntl = RecordingFcntl()
+        with mock.patch.object(connect, "fcntl", fake_fcntl):
+            with mock.patch.object(connect.os, "open", wraps=os.open) as open_mock:
+                lock_path, lock_fd = connect.acquire_config_transaction_lock(
+                    self.config_path
+                )
+            opened_path, flags, mode = open_mock.call_args.args
+            self.assertEqual(lock_path, opened_path)
+            self.assertEqual(0o600, mode)
+            self.assertTrue(flags & os.O_CREAT)
+            self.assertTrue(flags & os.O_RDWR)
+            if hasattr(os, "O_NOFOLLOW"):
+                self.assertTrue(flags & os.O_NOFOLLOW)
+
+            connect.release_config_transaction_lock(lock_fd)
+
+        self.assertEqual(
+            [fake_fcntl.LOCK_EX, fake_fcntl.LOCK_UN],
+            [operation for _, operation in fake_fcntl.operations],
+        )
+
+    def test_non_regular_lock_file_is_rejected_and_handle_is_closed(self):
+        fake_fcntl = RecordingFcntl()
+        directory_stat = os.stat_result((stat.S_IFDIR | 0o700,) + (0,) * 9)
+        with mock.patch.object(connect, "fcntl", fake_fcntl):
+            with mock.patch.object(connect.os, "fstat", return_value=directory_stat):
+                with mock.patch.object(connect.os, "close", wraps=os.close) as close_mock:
+                    with self.assertRaisesRegex(
+                        connect.ElasticSanConnectError, "non-symlink regular file"
+                    ):
+                        connect.acquire_config_transaction_lock(self.config_path)
+        close_mock.assert_called_once()
+        self.assertEqual([], fake_fcntl.operations)
+
+    def test_symlink_lock_file_is_rejected_and_handle_is_closed(self):
+        fake_fcntl = RecordingFcntl()
+        symlink_stat = os.stat_result((stat.S_IFLNK | 0o777,) + (0,) * 9)
+        with mock.patch.object(connect, "fcntl", fake_fcntl):
+            with mock.patch.object(connect.os, "lstat", return_value=symlink_stat):
+                with mock.patch.object(connect.os, "close", wraps=os.close) as close_mock:
+                    with self.assertRaisesRegex(
+                        connect.ElasticSanConnectError, "non-symlink regular file"
+                    ):
+                        connect.acquire_config_transaction_lock(self.config_path)
+        close_mock.assert_called_once()
+        self.assertEqual([], fake_fcntl.operations)
+
+
 class SessionParsingTests(unittest.TestCase):
     def test_parses_target_name_and_portal_from_verbose_output(self):
         output = verbose_session_block("iqn.example:target", "10.0.0.4:3260")
@@ -752,7 +900,7 @@ class AddSessionsForVolumeTests(unittest.TestCase):
             "vol1",
             "iqn.example:target",
             "10.0.0.4:3260",
-            [connect.build_nickname("vg", "vol1", 1)],
+            [connect.build_nickname("vg", "vol1", "iqn.example:target", 1)],
         )
 
     def test_skips_connected_session_even_when_target_address_was_redirected(self):
@@ -1113,13 +1261,55 @@ class BuildConnectionPlanTests(unittest.TestCase):
         resolve_zone.assert_not_called()
         get_target.assert_not_called()
 
+    def test_target_iqn_is_resolved_before_nickname_generation(self):
+        with mock.patch.object(
+            connect,
+            "get_volume_storage_target",
+            return_value=("iqn.example:resolved", "portal.example", 3260),
+        ):
+            with mock.patch.object(
+                connect, "build_nickname", return_value="esan-vg-volume1-deadbeefdeadbeef-s1"
+            ) as build_nickname:
+                connect.build_connection_plan(
+                    None, "rg", "san", "vg", ["volume1"], 1
+                )
+
+        build_nickname.assert_called_once_with(
+            "vg", "volume1", "iqn.example:resolved", 1
+        )
+
+    def test_duplicate_generated_nicknames_are_rejected(self):
+        with mock.patch.object(
+            connect,
+            "get_volume_storage_target",
+            side_effect=[
+                ("iqn.example:first", "first.example", 3260),
+                ("iqn.example:second", "second.example", 3260),
+            ],
+        ):
+            with mock.patch.object(
+                connect,
+                "build_nickname",
+                return_value="esan-collision-deadbeefdeadbeef-s1",
+            ):
+                with self.assertRaisesRegex(
+                    connect.ElasticSanConnectError, "duplicate nickname"
+                ):
+                    connect.build_connection_plan(
+                        None, "rg", "san", "vg", ["volume1", "volume2"], 1
+                    )
+
 
 class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.mkdtemp(prefix="esan-freebsd-exec-test-")
         self.config_path = os.path.join(self.tempdir, "iscsi.conf")
+        self.fake_fcntl = RecordingFcntl()
+        self.fcntl_patch = mock.patch.object(connect, "fcntl", self.fake_fcntl)
+        self.fcntl_patch.start()
 
     def tearDown(self):
+        self.fcntl_patch.stop()
         for name in os.listdir(self.tempdir):
             os.remove(os.path.join(self.tempdir, name))
         os.rmdir(self.tempdir)
@@ -1146,6 +1336,10 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
                     with mock.patch.object(connect, "add_iscsi_session") as add_mock:
                         connect.execute_connection_plan(plans, self.config_path, 1)
         self.assertEqual(1, add_mock.call_count)
+        self.assertEqual(
+            [self.fake_fcntl.LOCK_EX, self.fake_fcntl.LOCK_UN],
+            [operation for _, operation in self.fake_fcntl.operations],
+        )
         with open(self.config_path, "r", encoding="utf-8") as handle:
             content = handle.read()
         self.assertIn("esan-vg-vol1-s1", content)
@@ -1157,19 +1351,37 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
             original_content = handle.read()
 
         plans = self._plans()
+        original_restore = connect.restore_config_from_backup
+
+        def restore_while_locked(*args):
+            self.assertEqual(
+                [self.fake_fcntl.LOCK_EX],
+                [operation for _, operation in self.fake_fcntl.operations],
+            )
+            return original_restore(*args)
+
         with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"):
             with mock.patch.object(connect, "ensure_iscsid_enabled_and_running"):
                 with mock.patch.object(connect, "list_iscsi_sessions", return_value=[]):
                     with mock.patch.object(
                         connect, "add_iscsi_session", side_effect=connect.ElasticSanConnectError("boom")
                     ):
-                        with self.assertRaisesRegex(connect.ElasticSanConnectError, "restored"):
-                            connect.execute_connection_plan(plans, self.config_path, 1)
+                        with mock.patch.object(
+                            connect,
+                            "restore_config_from_backup",
+                            side_effect=restore_while_locked,
+                        ):
+                            with self.assertRaisesRegex(connect.ElasticSanConnectError, "restored"):
+                                connect.execute_connection_plan(plans, self.config_path, 1)
 
         with open(self.config_path, "rb") as handle:
             restored_content = handle.read()
         self.assertEqual(original_content, restored_content)
         self.assertNotIn(b"esan-vg-vol1-s1", restored_content)
+        self.assertEqual(
+            [self.fake_fcntl.LOCK_EX, self.fake_fcntl.LOCK_UN],
+            [operation for _, operation in self.fake_fcntl.operations],
+        )
 
     def test_failure_when_config_did_not_exist_before_removes_it_on_rollback(self):
         self.assertFalse(os.path.exists(self.config_path))
@@ -1229,6 +1441,63 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
                     connect.execute_connection_plan(self._plans(), self.config_path, 1)
         ensure.assert_not_called()
 
+    def test_concurrent_transactions_serialize_without_lost_updates(self):
+        first_plan = connect.VolumeConnectionPlan(
+            "vol1",
+            "iqn.example:vol1",
+            "10.0.0.4:3260",
+            ["esan-vg-vol1-1111111111111111-s1"],
+        )
+        second_plan = connect.VolumeConnectionPlan(
+            "vol2",
+            "iqn.example:vol2",
+            "10.0.0.5:3260",
+            ["esan-vg-vol2-2222222222222222-s1"],
+        )
+        blocking_fcntl = BlockingFcntl()
+        first_in_session_setup = threading.Event()
+        allow_first_to_finish = threading.Event()
+        session_setup_volumes = []
+        errors = []
+
+        def add_sessions(plan, _config_path, _desired_sessions):
+            session_setup_volumes.append(plan.volume_name)
+            if plan.volume_name == "vol1":
+                first_in_session_setup.set()
+                if not allow_first_to_finish.wait(5):
+                    raise AssertionError("test timed out waiting to release first transaction")
+
+        def execute(plan):
+            try:
+                connect.execute_connection_plan([plan], self.config_path, 1)
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch.object(connect, "fcntl", blocking_fcntl):
+            with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"):
+                with mock.patch.object(connect, "ensure_iscsid_enabled_and_running"):
+                    with mock.patch.object(
+                        connect, "add_sessions_for_volume", side_effect=add_sessions
+                    ):
+                        first = threading.Thread(target=execute, args=(first_plan,))
+                        second = threading.Thread(target=execute, args=(second_plan,))
+                        first.start()
+                        self.assertTrue(first_in_session_setup.wait(5))
+                        second.start()
+                        self.assertTrue(blocking_fcntl.second_acquire_attempted.wait(5))
+                        self.assertEqual(["vol1"], session_setup_volumes)
+                        allow_first_to_finish.set()
+                        first.join(5)
+                        second.join(5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual([], errors)
+        with open(self.config_path, "rb") as handle:
+            content = handle.read()
+        self.assertIn(first_plan.nicknames[0].encode("ascii"), content)
+        self.assertIn(second_plan.nicknames[0].encode("ascii"), content)
+
 
 class DryRunTests(unittest.TestCase):
     def test_dry_run_performs_no_mutation_and_calls_no_freebsd_tooling(self):
@@ -1257,7 +1526,10 @@ class DryRunTests(unittest.TestCase):
                             with mock.patch.object(connect, "_run_subprocess") as run_subprocess:
                                 with mock.patch.object(connect.os, "replace") as os_replace:
                                     with mock.patch("builtins.open", mock.mock_open()) as open_mock:
-                                        connect.main(argv)
+                                        with mock.patch.object(
+                                            connect, "acquire_config_transaction_lock"
+                                        ) as acquire_lock:
+                                            connect.main(argv)
 
         check_az.assert_called_once()
         preflight.assert_not_called()
@@ -1266,6 +1538,7 @@ class DryRunTests(unittest.TestCase):
         run_subprocess.assert_not_called()
         os_replace.assert_not_called()
         open_mock.assert_not_called()
+        acquire_lock.assert_not_called()
 
     def test_dry_run_does_not_require_root(self):
         argv = ["-g", "rg", "-e", "san", "-v", "vg", "-n", "volume1", "--dry-run"]
