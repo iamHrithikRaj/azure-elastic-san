@@ -23,13 +23,6 @@ SPEC.loader.exec_module(connect)
 if not hasattr(os, "chown"):
     os.chown = lambda *_args, **_kwargs: None
 
-def completed_process(stdout="", stderr="", returncode=0):
-    process = mock.Mock()
-    process.communicate.return_value = (stdout.encode("utf-8"), stderr.encode("utf-8"))
-    process.returncode = returncode
-    return process
-
-
 def locations_payload(region_name="eastus", mappings=None):
     if mappings is None:
         mappings = [{"logicalZone": "2", "physicalZone": "eastus-az3"}]
@@ -184,7 +177,7 @@ class ZonalAffinityTests(unittest.TestCase):
 
         with mock.patch.object(connect, "get_vm_compute_metadata", return_value=compute):
             with mock.patch.object(
-                connect.subprocess, "Popen", return_value=completed_process(cli_subscription_id)
+                connect, "_run_az_command", return_value=cli_subscription_id
             ):
                 with self.assertRaisesRegex(
                     connect.ElasticSanConnectError,
@@ -201,9 +194,8 @@ class ZonalAffinityTests(unittest.TestCase):
     def test_different_vm_and_elastic_san_regions_are_rejected(self):
         subscription_id = "00000000-0000-0000-0000-000000000001"
         compute = {"zone": "2", "subscriptionId": subscription_id, "location": "eastus"}
-        processes = [completed_process(subscription_id), completed_process("westus")]
         with mock.patch.object(connect, "get_vm_compute_metadata", return_value=compute):
-            with mock.patch.object(connect.subprocess, "Popen", side_effect=processes):
+            with mock.patch.object(connect, "_run_az_command", side_effect=[subscription_id, "westus"]):
                 with self.assertRaisesRegex(
                     connect.ElasticSanConnectError,
                     r"^The VM and Elastic SAN must be in the same region\.$",
@@ -254,6 +246,19 @@ class ZonalAffinityTests(unittest.TestCase):
             "eastus-az3", connect.map_logical_to_physical_zone(locations, " EASTUS ", " 2 ")
         )
 
+    def test_duplicate_matching_regions_are_rejected_regardless_of_order(self):
+        regions = [
+            json.loads(locations_payload())["value"][0],
+            json.loads(locations_payload(
+                region_name=" EASTUS ",
+                mappings=[{"logicalZone": "2", "physicalZone": "eastus-az1"}],
+            ))["value"][0],
+        ]
+        for locations in (regions, list(reversed(regions)), [regions[0], regions[0]]):
+            with self.subTest(locations=locations):
+                with self.assertRaisesRegex(connect.ElasticSanConnectError, "duplicate.*region"):
+                    connect.map_logical_to_physical_zone(locations, "eastus", "2")
+
     def test_iqn_suffix_is_lowercase_and_rejects_unsafe_characters(self):
         self.assertEqual(
             "iqn.2024-01.com.microsoft:volume:az-eastus-az3",
@@ -264,7 +269,10 @@ class ZonalAffinityTests(unittest.TestCase):
 
     def test_iqn_length_is_enforced_in_utf8_bytes(self):
         suffix = ":az-eastus-az3"
-        allowed_iqn = "i" * (connect.MAX_IQN_UTF8_BYTES - len(suffix))
+        prefix = "iqn.2024-01.com.microsoft:"
+        allowed_iqn = prefix + "v" * (
+            connect.MAX_IQN_UTF8_BYTES - len((prefix + suffix).encode("utf-8"))
+        )
         self.assertEqual(
             connect.MAX_IQN_UTF8_BYTES,
             len(connect.decorate_target_iqn(allowed_iqn, "eastus-az3").encode("utf-8")),
@@ -272,26 +280,57 @@ class ZonalAffinityTests(unittest.TestCase):
         with self.assertRaisesRegex(connect.ElasticSanConnectError, "223-byte"):
             connect.decorate_target_iqn(allowed_iqn + "x", "eastus-az3")
 
+    def test_complete_iqn_rejects_unsafe_characters_without_normalizing_identity(self):
+        prefix = "iqn.2024-01.com.microsoft:"
+        invalid_iqns = [
+            prefix.upper() + "volume",
+            prefix + "Volume",
+            prefix + "volume_name",
+            prefix + "volume/name",
+            prefix + "volume@name",
+            " " + prefix + "volume",
+            prefix + "volume ",
+            prefix + "volume\n",
+            prefix + "volume\x00",
+            prefix + "volume\x7f",
+            prefix + "volume\u00e9",
+            prefix + "volume\ud800",
+        ]
+        for iqn in invalid_iqns:
+            with self.subTest(iqn=repr(iqn)):
+                with self.assertRaisesRegex(connect.ElasticSanConnectError, "unsafe"):
+                    connect.decorate_target_iqn(iqn, "eastus-az3")
+
+    def test_target_iqn_must_be_a_nonempty_string_before_decoration(self):
+        for iqn in (None, "", 123, {}, [], b"iqn.example:volume"):
+            with self.subTest(iqn=iqn):
+                with self.assertRaisesRegex(connect.ElasticSanConnectError, "non-empty string"):
+                    connect.decorate_target_iqn(iqn, "eastus-az3")
+
+    def test_multibyte_iqn_is_rejected_even_when_character_count_fits(self):
+        prefix = "iqn.2024-01.com.microsoft:"
+        suffix = ":az-eastus-az3"
+        target = prefix + "\u00e9" * 100
+        self.assertLess(len(target + suffix), connect.MAX_IQN_UTF8_BYTES)
+        self.assertGreater(
+            len((target + suffix).encode("utf-8")), connect.MAX_IQN_UTF8_BYTES
+        )
+        with self.assertRaises(connect.ElasticSanConnectError):
+            connect.decorate_target_iqn(target, "eastus-az3")
+
     def test_azure_cli_timeout_kills_and_reaps_process(self):
-        class HangingProcess(object):
-            def __init__(self):
-                self.release = threading.Event()
-                self.killed = False
-
-            def communicate(self):
-                self.release.wait()
-                return b"", b""
-
-            def kill(self):
-                self.killed = True
-                self.release.set()
-
-        process = HangingProcess()
+        process = mock.Mock()
+        process.wait.side_effect = [
+            connect.subprocess.TimeoutExpired(["az", "account", "show"], 0.01), -9,
+        ]
         with mock.patch.object(connect.subprocess, "Popen", return_value=process):
             with mock.patch.object(connect, "AZ_CLI_TIMEOUT_SECONDS", 0.01):
                 with self.assertRaisesRegex(connect.ElasticSanConnectError, "timed out"):
                     connect._run_az_command(["az", "account", "show"], "Azure CLI test")
-        self.assertTrue(process.killed)
+        process.kill.assert_called_once_with()
+        self.assertEqual([
+            mock.call(timeout=0.01), mock.call(timeout=connect.PROCESS_REAP_TIMEOUT_SECONDS),
+        ], process.wait.call_args_list)
 
 
 class AzCliAvailabilityTests(unittest.TestCase):
@@ -316,6 +355,64 @@ class AzCliAvailabilityTests(unittest.TestCase):
                 connect, "_run_az_command", return_value="elastic-san\n"
             ):
                 connect.check_az_cli_available()  # should not raise
+
+
+class BoundedSubprocessTests(unittest.TestCase):
+    def test_descendant_output_handle_does_not_block_timeout_cleanup(self):
+        inherited_handles = []
+        process = mock.Mock()
+        process.wait.side_effect = [
+            connect.subprocess.TimeoutExpired(["az"], 0.01), -9,
+        ]
+
+        def start(command, stdout, stderr):
+            # A descendant may retain these handles after the direct child dies.
+            # Regular-file capture must not wait for that descendant to close them.
+            self.assertNotEqual(connect.subprocess.PIPE, stdout)
+            self.assertNotEqual(connect.subprocess.PIPE, stderr)
+            inherited_handles.extend([os.dup(stdout.fileno()), os.dup(stderr.fileno())])
+            return process
+
+        try:
+            with mock.patch.object(connect.subprocess, "Popen", side_effect=start):
+                with self.assertRaisesRegex(connect.ElasticSanConnectError, "timed out"):
+                    connect._run_subprocess(["az"], "Azure CLI test", 0.01)
+            process.kill.assert_called_once_with()
+            self.assertEqual(2, process.wait.call_count)
+            self.assertTrue(all(call.kwargs["timeout"] > 0 for call in process.wait.call_args_list))
+            process.communicate.assert_not_called()
+        finally:
+            for descriptor in inherited_handles:
+                os.close(descriptor)
+
+    def test_post_kill_reaping_is_bounded_and_reported(self):
+        process = mock.Mock()
+        process.wait.side_effect = connect.subprocess.TimeoutExpired(["az"], 0.01)
+        with mock.patch.object(connect.subprocess, "Popen", return_value=process):
+            with self.assertRaisesRegex(connect.ElasticSanConnectError, "could not be reaped"):
+                connect._run_subprocess(["az"], "Azure CLI test", 0.01)
+        process.kill.assert_called_once_with()
+        self.assertEqual(2, process.wait.call_count)
+        self.assertTrue(all(call.kwargs["timeout"] > 0 for call in process.wait.call_args_list))
+
+    def test_output_exit_status_and_handle_cleanup_are_preserved(self):
+        captured_handles = []
+        process = mock.Mock(returncode=7)
+
+        def start(command, stdout, stderr):
+            captured_handles.extend([stdout, stderr])
+            stdout.write(b"output\n")
+            stderr.write(b"problem\n")
+            stdout.flush()
+            stderr.flush()
+            return process
+
+        with mock.patch.object(connect.subprocess, "Popen", side_effect=start):
+            self.assertEqual(
+                (7, "output\n", "problem"),
+                connect._run_subprocess(["az"], "Azure CLI test", 1),
+            )
+        self.assertTrue(all(handle.closed for handle in captured_handles))
 
 
 class FreeBsdMutationPreflightTests(unittest.TestCase):
@@ -1237,8 +1334,27 @@ class BuildConnectionPlanTests(unittest.TestCase):
         self.assertEqual("portal.example:3260", plans[0].target_address)
         self.assertEqual(1, len(plans[0].nicknames))
 
+    def test_opt_out_does_not_apply_enabled_iqn_normalization_or_validation(self):
+        original_iqn = "iqn.2024-01.com.microsoft:Legacy_Volume"
+        with mock.patch.object(connect, "resolve_physical_zone") as resolve_zone:
+            with mock.patch.object(
+                connect,
+                "get_volume_storage_target",
+                return_value=(original_iqn, "portal.example", 3260),
+            ):
+                plans = connect.build_connection_plan(
+                    None, "rg", "san", "vg", ["volume1"], 1
+                )
+        resolve_zone.assert_not_called()
+        self.assertEqual(original_iqn, plans[0].target_name)
+        self.assertEqual("portal.example:3260", plans[0].target_address)
+        self.assertEqual(
+            [connect.build_nickname("vg", "volume1", original_iqn, 1)],
+            plans[0].nicknames,
+        )
+
     def test_opt_in_decorates_iqn_for_all_volumes(self):
-        with mock.patch.object(connect, "resolve_physical_zone", return_value="EASTUS-AZ3") as resolve_zone:
+        with mock.patch.object(connect, "resolve_physical_zone", return_value=("EASTUS-AZ3", "sub")) as resolve_zone:
             with mock.patch.object(
                 connect,
                 "get_volume_storage_target",
@@ -1499,6 +1615,163 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
         self.assertIn(second_plan.nicknames[0].encode("ascii"), content)
 
 
+class EnabledInputPreflightTests(unittest.TestCase):
+    def test_malformed_later_portal_fails_before_execution(self):
+        invalid_portals = [
+            (None, 3260), ("", 3260), (" ", 3260), (True, 3260), ([], 3260),
+            ("portal..example", 3260), ("portal.example/path", 3260),
+            ("portal.example", None), ("portal.example", True),
+            ("portal.example", 0), ("portal.example", 70000),
+            ("portal.example", 3260.5), ("portal.example", "3260"),
+        ]
+        for enabled in (False, True):
+            for dry_run in (False, True):
+                for hostname, port in invalid_portals:
+                    with self.subTest(enabled=enabled, dry_run=dry_run, hostname=hostname, port=port):
+                        argv = ["-g", "rg", "-e", "san", "-v", "vg", "-n", "first", "second"]
+                        if enabled:
+                            argv.append("--enable-zonal-affinity")
+                        if dry_run:
+                            argv.append("--dry-run")
+                        with mock.patch.object(connect, "check_az_cli_available"):
+                            with mock.patch.object(connect, "resolve_physical_zone", return_value=("eastus-az3", "sub")):
+                                with mock.patch.object(connect, "get_volume_storage_target", side_effect=[
+                                    ("iqn.example:first", "first.example", 3260),
+                                    ("iqn.example:second", hostname, port),
+                                ]):
+                                    with mock.patch.object(connect, "execute_connection_plan") as execute:
+                                        with self.assertRaises(connect.ElasticSanConnectError):
+                                            connect.main(argv)
+                        execute.assert_not_called()
+
+    def test_enabled_volume_queries_pin_resolved_subscription_after_context_change(self):
+        subscription_id = "00000000-0000-0000-0000-000000000001"
+        compute = {"zone": "2", "subscriptionId": subscription_id, "location": "eastus"}
+        for requested_subscription in (None, "friendly-name", subscription_id):
+            with self.subTest(requested_subscription=requested_subscription):
+                commands = []
+                context_changed = False
+
+                def run(command, description):
+                    nonlocal context_changed
+                    commands.append(command)
+                    if command[:3] == ["az", "account", "show"]:
+                        self.assertFalse(context_changed)
+                        return subscription_id
+                    if command[:3] == ["az", "elastic-san", "show"]:
+                        return "eastus"
+                    if command[:2] == ["az", "rest"]:
+                        context_changed = True
+                        return locations_payload()
+                    self.assertTrue(context_changed)
+                    self.assertEqual(["--subscription", subscription_id], command[-2:])
+                    volume = command[command.index("-n") + 1]
+                    return json.dumps({
+                        "targetIqn": "iqn.example:" + volume,
+                        "targetPortalHostname": volume + ".example",
+                        "targetPortalPort": 3260,
+                    })
+
+                with mock.patch.object(connect, "get_vm_compute_metadata", return_value=compute):
+                    with mock.patch.object(connect, "_run_az_command", side_effect=run):
+                        plans = connect.build_connection_plan(
+                            requested_subscription, "rg", "san", "vg", ["first", "second"], 1, True
+                        )
+                self.assertEqual(1, sum(command[:3] == ["az", "account", "show"] for command in commands))
+                self.assertEqual(
+                    ["iqn.example:first:az-eastus-az3", "iqn.example:second:az-eastus-az3"],
+                    [plan.target_name for plan in plans],
+                )
+
+    def test_later_invalid_volume_fails_before_execution_in_live_and_dry_run_modes(self):
+        valid_target = ("iqn.2024-01.com.microsoft:first", "portal.example", 3260)
+        invalid_targets = [
+            ("iqn.2024-01.com.microsoft:Second", "portal.example", 3260),
+            ("iqn.2024-01.com.microsoft:second\u00e9", "portal.example", 3260),
+            ("i" * 211, "portal.example", 3260),
+            (None, "portal.example", 3260),
+            ("iqn.2024-01.com.microsoft:second", 'portal"example', 3260),
+        ]
+        for dry_run in (False, True):
+            for invalid_target in invalid_targets:
+                with self.subTest(dry_run=dry_run, invalid_target=invalid_target):
+                    argv = [
+                        "-g", "rg", "-e", "san", "-v", "vg", "-n", "first", "second",
+                        "--enable-zonal-affinity",
+                    ]
+                    if dry_run:
+                        argv.append("--dry-run")
+                    with mock.patch.object(connect, "check_az_cli_available"):
+                        with mock.patch.object(
+                            connect, "resolve_physical_zone", return_value=("eastus-az3", "sub")
+                        ):
+                            with mock.patch.object(
+                                connect, "get_volume_storage_target",
+                                side_effect=[valid_target, invalid_target],
+                            ) as storage_target:
+                                with mock.patch.object(connect, "execute_connection_plan") as execute:
+                                    with mock.patch.object(connect, "_run_subprocess") as run:
+                                        with self.assertRaises(connect.ElasticSanConnectError):
+                                            connect.main(argv)
+                    self.assertEqual(2, storage_target.call_count)
+                    execute.assert_not_called()
+                    run.assert_not_called()
+
+    def test_enabled_discovery_uses_explicit_subscription_rest_and_plans_all_fqdns(self):
+        subscription_id = "00000000-0000-0000-0000-000000000001"
+        compute = {"zone": "2", "subscriptionId": subscription_id, "location": "eastus"}
+        targets = [
+            {
+                "targetIqn": "iqn.2024-01.com.microsoft:" + volume,
+                "targetPortalHostname": volume + ".example",
+                "targetPortalPort": 3260,
+            }
+            for volume in ("first", "second")
+        ]
+        outputs = [
+            "elastic-san\n", subscription_id, "eastus", locations_payload(),
+        ] + [json.dumps(target) for target in targets]
+        with mock.patch.object(connect.shutil, "which", return_value="az"):
+            with mock.patch.object(connect, "get_vm_compute_metadata", return_value=compute):
+                with mock.patch.object(
+                    connect, "_run_subprocess",
+                    side_effect=[(0, output, "") for output in outputs],
+                ) as run:
+                    with mock.patch.object(connect, "execute_connection_plan") as execute:
+                        connect.main([
+                            "--elastic-san-subscription", subscription_id,
+                            "-g", "rg", "-e", "san", "-v", "vg", "-n", "first", "second",
+                            "--enable-zonal-affinity",
+                        ])
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual([
+            "az", "elastic-san", "show", "-g", "rg", "--elastic-san-name", "san",
+            "--subscription", subscription_id, "--query", "location", "--output", "tsv",
+        ], commands[2])
+        self.assertEqual([
+            "az", "rest", "--method", "get", "--url",
+            "https://management.azure.com/subscriptions/{}/locations"
+            "?api-version=2022-12-01".format(subscription_id),
+        ], commands[3])
+        for command in commands[4:]:
+            self.assertEqual(["--subscription", subscription_id], command[-2:])
+        for call in run.call_args_list:
+            self.assertEqual(connect.AZ_CLI_TIMEOUT_SECONDS, call.args[2])
+        execute.assert_called_once()
+        plans, _, session_count = execute.call_args.args
+        self.assertEqual(1, session_count)
+        self.assertEqual(
+            [target["targetIqn"] + ":az-eastus-az3" for target in targets],
+            [plan.target_name for plan in plans],
+        )
+        self.assertEqual(
+            ["first.example:3260", "second.example:3260"],
+            [plan.target_address for plan in plans],
+        )
+        self.assertTrue(all(len(plan.nicknames) == 1 for plan in plans))
+
+
 class DryRunTests(unittest.TestCase):
     def test_dry_run_performs_no_mutation_and_calls_no_freebsd_tooling(self):
         argv = [
@@ -1567,7 +1840,7 @@ class DryRunTests(unittest.TestCase):
         ]
         with mock.patch.object(connect, "check_az_cli_available"):
             with mock.patch.object(
-                connect, "resolve_physical_zone", return_value="eastus-az1"
+                connect, "resolve_physical_zone", return_value=("eastus-az1", "sub")
             ) as resolve_zone:
                 with mock.patch.object(
                     connect,

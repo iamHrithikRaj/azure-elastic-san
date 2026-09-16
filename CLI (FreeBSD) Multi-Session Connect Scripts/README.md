@@ -1,6 +1,6 @@
 # Azure Elastic SAN Connect Script -- FreeBSD (PoC)
 
-Standalone, production-quality **proof of concept** script that connects one
+Standalone **proof of concept** script that connects one
 or more Azure Elastic SAN volumes to a FreeBSD 13+ host with **one iSCSI
 session per volume**, using FreeBSD's native iSCSI initiator
 (`iscsid`/`iscsictl`/`iscsi.conf`, `sysrc`/`service`).
@@ -9,6 +9,9 @@ Stock FreeBSD rejects attempts to create duplicate sessions for the same target
 name and portal. This PoC therefore requires `--num-of-sessions 1` and does not
 silently reduce larger values. NetApp-specific initiator/target behavior that
 may permit multiple sessions needs separate validation and is outside this PoC.
+Both default and opted-in connections retain the service-provided FQDN; this
+script has no VIP discovery, allocation, or dependency on a Linux script or an
+adjacent runtime module. The Python file can be downloaded independently.
 
 This is a **separate implementation** from
 [`CLI (Linux) Multi-Session Connect Scripts`](../CLI%20(Linux)%20Multi-Session%20Connect%20Scripts/connect_for_documentation.py).
@@ -94,10 +97,22 @@ selected entries that would be merged into the managed block). It does **not**
 run `sysrc`, `service`, or `iscsictl`, and does **not** write
 `/etc/iscsi.conf`. It does not require root.
 
+Subprocess output is captured in temporary files, including during dry-run,
+so inherited output handles cannot make timeout cleanup wait indefinitely.
+Each command has an execution timeout plus at most five seconds for post-kill
+reaping. Only the direct child is terminated on timeout; deliberately started
+services and other descendants are not killed as a process group.
+
 Because inspecting existing sessions requires opening `/dev/iscsi` (which
 generally requires root), `--dry-run` does not inspect current session state
 and plans one session per volume. The real run checks readiness before
 submitting a session -- see "Idempotency and reruns" below.
+Native inspection is not inherently read-only:
+[`iscsictl` startup](https://github.com/freebsd/freebsd-src/blob/25985322095d073354d31431da34da1e6871cca5/usr.bin/iscsictl/iscsictl.c#L881-L891)
+can load the kernel module when `/dev/iscsi` is missing. Dry-run avoids all
+`iscsictl` calls, not just session-add commands. A mutating run requires the
+device node to exist, but does not provide a globally read-only native-state
+preflight guarantee.
 Because the existing config is intentionally not opened in unprivileged
 dry-run mode, retained managed entries for unselected volumes are not included
 in the preview.
@@ -129,7 +144,7 @@ remaining within 128 characters and `[a-z0-9][a-z0-9_-]*`:
 ```
 esan-my-volume-group-volume1-<16-hex-digest>-s1 {
 	TargetName    = "iqn.2005-03.com.microsoft:<...>"
-	TargetAddress = "10.0.0.4:3260"
+	TargetAddress = "portal.example:3260"
 	HeaderDigest  = CRC32C
 	DataDigest    = CRC32C
 	Enable        = On
@@ -168,6 +183,10 @@ anything containing a quote, brace, `#`, `;`, or a control character
 `iscsi.conf(5)`'s grammar has no documented escape sequence for those
 characters -- allowing them through could let a malformed API response inject
 a second statement or stanza into the file.
+Before formatting `TargetAddress`, the raw portal hostname must be a nonempty
+ASCII hostname with valid DNS labels, and the raw port must be an integer from
+1 through 65535 (not a Boolean or string). No hostname rewriting or DNS lookup
+is performed.
 
 We deliberately do not set `LoginTimeout`/`PingTimeout` in the generated
 stanzas. `iscsi.conf(5)` exposes both, but this PoC has no evidence-based
@@ -206,6 +225,9 @@ This only ever rolls back the **config file** -- it never disconnects or
 removes any iSCSI session. After `iscsictl -A` has been submitted, a session
 may already be live or may become live after a timeout even though the config
 file was restored. Always inspect `iscsictl -L -v` before retrying a failed run.
+Service enablement/start is not rolled back either. Input preflight is not an
+all-volume transaction: if connecting a later volume fails, earlier volumes
+may remain connected.
 
 ## Idempotency and reruns
 
@@ -247,17 +269,44 @@ rejects duplicate target-name/portal sessions, so values such as `-s 2` or
 capped to 1. NetApp-specific multi-session behavior is a separate validation
 track and must not be inferred from this PoC.
 
+**VIP/32-session support remains blocked and is not part of this script.**
+Stock FreeBSD's add/modify checks reject duplicate target IQN plus configured
+portal text with `EBUSY`; three canonical portals permit at most three normal
+configured sessions, not 32. Different textual spellings of a portal, ISIDs,
+or nicknames are not a supported workaround. This limitation does not remove
+the useful one-session FQDN path, including its zonal-affinity opt-in.
+
 ## Zonal affinity (`--enable-zonal-affinity`)
 
 Identical semantics to the Linux script: resolves the VM's availability zone
 via IMDS, confirms the Elastic SAN subscription/region match the VM's, maps
 the VM's logical zone to a physical zone via the ARM Locations API, and
-appends a provisional `:az-<physical-zone>` suffix to the target IQN
-(`[a-z0-9.-]+`, and the resulting IQN must stay within 223 UTF-8 bytes per
-RFC 3720). **This is provisional**: the Elastic SAN front end must parse and
+appends a provisional `:az-<physical-zone>` suffix to the target IQN.
+The canonical subscription ID resolved for that mapping is pinned on every
+selected-volume query, even when the caller initially used a subscription name
+or the current Azure CLI context. Duplicate matching region entries or logical
+zone mappings are rejected rather than selected by response order.
+The physical zone is trimmed and lowercased and must match `[a-z0-9.-]+`.
+The **complete decorated IQN**, including the original service identity, must
+contain only lowercase ASCII letters, digits, `.`, `:`, and `-`, and fit within
+223 UTF-8 bytes. Invalid, uppercase, or non-ASCII service identities are
+rejected, never trimmed, lowercased, or otherwise rewritten.
+
+All selected volumes' mapping, complete IQNs, config scalar values, and
+nicknames are resolved and validated before acquiring the config lock or
+changing config, service, or session state. Native session inspection happens
+only in the mutating execution path, not during this input preflight.
+
+**This is provisional**: the Elastic SAN front end must parse and
 strip this suffix before zonal-affinity routing has any effect in
 production. Without `--enable-zonal-affinity` (the default), the original,
 undecorated IQN is used.
+
+This is connect-only support, not a migration or disconnect tool. Disabling
+the opt-in does not clean up decorated sessions or managed entries; changing
+the target IQN changes its nickname, and old managed entries are preserved.
+Inspect and reconcile the affected sessions/config explicitly before switching
+modes. Existing Linux/Windows disconnect scripts are not FreeBSD cleanup tools.
 
 ## Known limitations / external validation gates
 
@@ -286,7 +335,12 @@ yourself before depending on it in production:
    device assembly.
 4. **Multi-session is not enabled.** Stock FreeBSD's duplicate restriction is
    enforced as one session per volume. Any NetApp-specific exception needs
-   dedicated interoperability and failure-mode validation.
+   dedicated interoperability and failure-mode validation against the exact
+   initiator fork, scripts, and target/backend version before production use.
+5. **Native and end-to-end qualification is outstanding.** Unit tests do not
+   establish suffix parsing/routing support, native login or redirect behavior,
+   reboot recovery, dual-stack operation, zone-failure recovery, or an
+   approximately 30-second recovery-time objective.
 
 ## Testing
 
@@ -295,6 +349,7 @@ python3 -m py_compile connect_for_documentation.py test_connect_for_documentatio
 python3 -W error::ResourceWarning -m unittest test_connect_for_documentation -v
 ```
 
-All Azure CLI, IMDS, filesystem, and `iscsictl`/`service`/`sysrc` calls are
-mocked in the test suite -- it does not require FreeBSD, root, or network
-access to run.
+Azure CLI, IMDS, and `iscsictl`/`service`/`sysrc` calls are mocked in the test
+suite; filesystem tests use temporary files. It does not require FreeBSD,
+root, or network access to run. Keep `ResourceWarning` treated as an error
+to retain coverage for unclosed file handles.

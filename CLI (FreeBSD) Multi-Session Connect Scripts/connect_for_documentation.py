@@ -40,7 +40,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 
 try:
@@ -67,6 +66,7 @@ except NameError:
 IMDS_COMPUTE_URL = "http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01"
 IMDS_TIMEOUT_SECONDS = 5
 AZ_CLI_TIMEOUT_SECONDS = 30
+PROCESS_REAP_TIMEOUT_SECONDS = 5
 SHORT_COMMAND_TIMEOUT_SECONDS = 15
 ISCSICTL_COMMAND_TIMEOUT_SECONDS = 15
 SESSION_READY_TIMEOUT_SECONDS = 30
@@ -74,6 +74,11 @@ SESSION_POLL_INTERVAL_SECONDS = 1
 
 MAX_IQN_UTF8_BYTES = 223
 PHYSICAL_ZONE_PATTERN = re.compile(r"^[a-z0-9.-]+$")
+DECORATED_IQN_PATTERN = re.compile(r"^[a-z0-9.:-]+$")
+PORTAL_HOSTNAME_PATTERN = re.compile(
+    r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+    r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.?"
+)
 SUBSCRIPTION_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
@@ -110,41 +115,46 @@ def _decode_output(value):
 
 
 def _run_subprocess(command, description, timeout):
-    """Run *command* (an argv list; never a shell string) with a hard wall-clock
-    timeout, returning (returncode, stdout, stderr). Never raises on a non-zero
-    exit code -- callers decide whether that is fatal."""
+    """Run an argv list with bounded execution and post-kill reaping.
+
+    Temporary output files avoid waiting for pipe EOF from descendants (including
+    a deliberately started daemon). Only the direct child is killed on timeout.
+    Non-zero exit codes are returned for callers to interpret.
+    """
     try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            process = subprocess.Popen(command, stdout=stdout, stderr=stderr)
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.wait(timeout=PROCESS_REAP_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    raise ElasticSanConnectError(
+                        "{} timed out after {} seconds and process {} could not be reaped "
+                        "within {} additional seconds; inspect its state before retrying".format(
+                            description, timeout, process.pid, PROCESS_REAP_TIMEOUT_SECONDS
+                        )
+                    )
+                raise ElasticSanConnectError(
+                    "{} timed out after {} seconds; only the direct child was terminated. "
+                    "Service or session changes may remain; inspect state before retrying".format(
+                        description, timeout
+                    )
+                )
+            # Snapshot sizes so a surviving descendant cannot extend collection
+            # indefinitely by continuing to write after the direct child exits.
+            out_size = os.fstat(stdout.fileno()).st_size
+            err_size = os.fstat(stderr.fileno()).st_size
+            stdout.seek(0)
+            stderr.seek(0)
+            out = stdout.read(out_size)
+            err = stderr.read(err_size)
     except OSError as error:
-        raise ElasticSanConnectError("{} failed to start: {}".format(description, error))
-
-    result = []
-    communication_errors = []
-
-    def communicate():
-        try:
-            result.append(process.communicate())
-        except (OSError, ValueError) as error:
-            communication_errors.append(error)
-
-    communication_thread = threading.Thread(target=communicate)
-    communication_thread.daemon = True
-    communication_thread.start()
-    communication_thread.join(timeout)
-    if communication_thread.is_alive():
-        process.kill()
-        communication_thread.join()
         raise ElasticSanConnectError(
-            "{} timed out after {} seconds".format(description, timeout)
+            "{} failed during process execution or output collection: {}".format(description, error)
         )
-    if communication_errors:
-        raise ElasticSanConnectError(
-            "{} failed while collecting output: {}".format(
-                description, communication_errors[0]
-            )
-        )
-
-    out, err = result[0]
     return process.returncode, _decode_output(out), _decode_output(err).strip()
 
 
@@ -350,8 +360,13 @@ def map_logical_to_physical_zone(locations, location_name, logical_zone):
             isinstance(candidate_name, string_types)
             and candidate_name.strip().lower() == normalized_location
         ):
+            if region is not None:
+                raise ElasticSanConnectError(
+                    "Azure location REST response contains duplicate entries for region '{}'".format(
+                        location_name
+                    )
+                )
             region = candidate
-            break
 
     if region is None:
         raise ElasticSanConnectError(
@@ -405,6 +420,7 @@ def map_logical_to_physical_zone(locations, location_name, logical_zone):
 
 
 def resolve_physical_zone(elastic_san_subscription, resource_group_name, elastic_san_name):
+    """Return (physical zone, canonical subscription ID) for scoped volume discovery."""
     compute = get_vm_compute_metadata()
     logical_zone = compute.get("zone")
     if not isinstance(logical_zone, string_types) or not logical_zone.strip():
@@ -432,10 +448,16 @@ def resolve_physical_zone(elastic_san_subscription, resource_group_name, elastic
         raise ElasticSanConnectError("The VM and Elastic SAN must be in the same region.")
 
     locations = get_azure_locations(elastic_san_subscription_id)
-    return map_logical_to_physical_zone(locations, elastic_san_location, logical_zone)
+    return (
+        map_logical_to_physical_zone(locations, elastic_san_location, logical_zone),
+        elastic_san_subscription_id,
+    )
 
 
 def decorate_target_iqn(target_iqn, physical_zone):
+    if not isinstance(target_iqn, string_types) or not target_iqn:
+        raise ElasticSanConnectError("Target IQN must be a non-empty string")
+
     normalized_physical_zone = physical_zone.strip().lower()
     if (
         not normalized_physical_zone
@@ -450,6 +472,13 @@ def decorate_target_iqn(target_iqn, physical_zone):
     # Provisional contract: the Elastic SAN front end must parse and strip this
     # suffix before zonal-affinity routing can be used in production.
     decorated_iqn = "{}:az-{}".format(target_iqn, normalized_physical_zone)
+    # Validate the service identity unchanged; lowercasing or trimming it here
+    # would hide a front-end contract mismatch and change session correlation.
+    if DECORATED_IQN_PATTERN.fullmatch(decorated_iqn) is None:
+        raise ElasticSanConnectError(
+            "Decorated target IQN contains unsafe characters; only lowercase ASCII "
+            "letters, digits, '.', ':', and '-' are permitted"
+        )
     if len(decorated_iqn.encode("utf-8")) > MAX_IQN_UTF8_BYTES:
         raise ElasticSanConnectError(
             "Decorated target IQN exceeds the {}-byte UTF-8 limit".format(MAX_IQN_UTF8_BYTES)
@@ -534,6 +563,28 @@ def validate_config_scalar(value, field_name):
             )
         )
     return value
+
+
+def format_target_address(hostname, port, volume_name):
+    """Validate raw ARM portal fields before interpolation can conceal nulls/types."""
+    if (
+        not isinstance(hostname, string_types)
+        or not hostname
+        or len(hostname.rstrip(".")) > 253
+        or PORTAL_HOSTNAME_PATTERN.fullmatch(hostname) is None
+    ):
+        raise ElasticSanConnectError(
+            "Target portal hostname for '{}' must be a valid non-empty ASCII hostname".format(
+                volume_name
+            )
+        )
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ElasticSanConnectError(
+            "Target portal port for '{}' must be an integer from 1 to 65535".format(volume_name)
+        )
+    return validate_config_scalar(
+        "{}:{}".format(hostname, port), "Target address for '{}'".format(volume_name)
+    )
 
 
 def sanitize_identity_component(value, field_name):
@@ -1100,9 +1151,9 @@ def build_connection_plan(
     enable_zonal_affinity=False,
 ):
     """Resolve targets and compute the deterministic nickname set for every
-    volume. This performs only read-only discovery (IMDS, Azure CLI) and pure
-    computation -- no filesystem or iscsictl calls -- so it is identical for
-    --dry-run and the real execution path."""
+    volume. Discovery queries IMDS/Azure CLI (with temporary subprocess output
+    capture); it does not access iSCSI config, locks, services, or sessions.
+    This is identical for --dry-run and the real execution path."""
     if not volume_names:
         raise ElasticSanConnectError(
             "At least one volume must be selected; refusing to build an empty connection plan"
@@ -1114,11 +1165,11 @@ def build_connection_plan(
             "separate validation."
         )
 
-    physical_zone = (
-        resolve_physical_zone(elastic_san_subscription, resource_group_name, elastic_san_name)
-        if enable_zonal_affinity
-        else None
-    )
+    physical_zone = None
+    if enable_zonal_affinity:
+        physical_zone, elastic_san_subscription = resolve_physical_zone(
+            elastic_san_subscription, resource_group_name, elastic_san_name
+        )
 
     plans = []
     nickname_owners = {}
@@ -1134,10 +1185,7 @@ def build_connection_plan(
             target_iqn = decorate_target_iqn(target_iqn, physical_zone)
 
         target_name = validate_config_scalar(target_iqn, "Target IQN for '{}'".format(volume_name))
-        target_address = validate_config_scalar(
-            "{}:{}".format(target_hostname, target_port),
-            "Target address for '{}'".format(volume_name),
-        )
+        target_address = format_target_address(target_hostname, target_port, volume_name)
         nicknames = [
             build_nickname(volume_group_name, volume_name, target_name, session_index)
             for session_index in range(1, number_of_sessions + 1)
