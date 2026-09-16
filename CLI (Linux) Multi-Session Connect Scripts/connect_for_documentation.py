@@ -2,10 +2,11 @@ import argparse
 import json
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
-import threading
+import tempfile
 import time
 
 try:
@@ -27,7 +28,8 @@ IMDS_COMPUTE_URL = "http://169.254.169.254/metadata/instance/compute?api-version
 IMDS_TIMEOUT_SECONDS = 5
 AZ_CLI_TIMEOUT_SECONDS = 30
 MAX_IQN_UTF8_BYTES = 223
-PHYSICAL_ZONE_PATTERN = re.compile(r"^[a-z0-9.-]+$")
+PHYSICAL_ZONE_PATTERN = re.compile(r"^[a-z0-9.-]+\Z")
+IQN_PATTERN = re.compile(r"^[a-z0-9.:-]+\Z")
 SUBSCRIPTION_ID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
@@ -148,42 +150,57 @@ def _decode_output(value):
 
 
 def _run_az_command(command, description):
-    try:
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except OSError as error:
-        raise ZonalAffinityError("{} failed to start: {}".format(description, error))
-
-    result = []
-    communication_errors = []
-
-    def communicate():
+    # File-backed output cannot deadlock on a full pipe or a descendant retaining
+    # a pipe handle. No background reader survives a timeout.
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         try:
-            result.append(process.communicate())
-        except (OSError, ValueError) as error:
-            communication_errors.append(error)
-
-    communication_thread = threading.Thread(target=communicate)
-    communication_thread.daemon = True
-    communication_thread.start()
-    communication_thread.join(AZ_CLI_TIMEOUT_SECONDS)
-    if communication_thread.is_alive():
-        process.kill()
-        communication_thread.join()
-        raise ZonalAffinityError(
-            "{} timed out after {} seconds".format(
-                description, AZ_CLI_TIMEOUT_SECONDS
+            process = subprocess.Popen(
+                command, stdout=stdout, stderr=stderr, start_new_session=(os.name == "posix")
             )
-        )
-    if communication_errors:
-        raise ZonalAffinityError(
-            "{} failed while collecting output: {}".format(
-                description, communication_errors[0]
+        except OSError as error:
+            raise ZonalAffinityError("{} failed to start: {}".format(description, error))
+        try:
+            process.wait(timeout=AZ_CLI_TIMEOUT_SECONDS)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+            try:
+                if os.name == "posix":
+                    # az may be a shell wrapper; terminate its own group, not
+                    # just the wrapper, without affecting the caller's group.
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass  # The process exited between the deadline and termination.
+            except OSError as cleanup_error:
+                raise ZonalAffinityError(
+                    "{} interrupted; Azure CLI termination failed: {}".format(
+                        description, cleanup_error
+                    )
+                )
+            try:
+                process.wait(timeout=AZ_CLI_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                raise ZonalAffinityError(
+                    "{} timed out; Azure CLI did not exit after termination".format(description)
+                )
+            if isinstance(error, KeyboardInterrupt):
+                raise
+            raise ZonalAffinityError(
+                "{} timed out after {} seconds".format(description, AZ_CLI_TIMEOUT_SECONDS)
             )
-        )
-
-    out, err = result[0]
-    out = _decode_output(out)
-    err = _decode_output(err).strip()
+        try:
+            # Snapshot each length so a surviving descendant cannot extend a read
+            # indefinitely by continuing to append output after the CLI exits.
+            stdout.seek(0)
+            stderr.seek(0)
+            out = _decode_output(stdout.read(os.fstat(stdout.fileno()).st_size))
+            err = _decode_output(stderr.read(os.fstat(stderr.fileno()).st_size)).strip()
+        except (OSError, UnicodeError) as error:
+            raise ZonalAffinityError(
+                "{} failed while collecting output: {}".format(
+                    description, error
+                )
+            )
     if process.returncode != 0:
         detail = err if err else "exit code {}".format(process.returncode)
         raise ZonalAffinityError("{} failed: {}".format(description, detail))
@@ -289,6 +306,8 @@ def get_azure_locations(elastic_san_subscription_id):
         "get",
         "--url",
         url,
+        "--output",
+        "json",
     ]
     payload = _run_az_command(command, "Azure location REST query")
     try:
@@ -312,12 +331,16 @@ def map_logical_to_physical_zone(locations, location_name, logical_zone):
         if not isinstance(candidate, dict):
             raise ZonalAffinityError("Azure location REST response contains a malformed region entry")
         candidate_name = candidate.get("name")
-        if (
-            isinstance(candidate_name, string_types)
-            and candidate_name.strip().lower() == normalized_location
-        ):
+        if not isinstance(candidate_name, string_types) or not candidate_name.strip():
+            raise ZonalAffinityError("Azure location REST response contains a malformed region entry")
+        if candidate_name.strip().lower() == normalized_location:
+            if region is not None:
+                raise ZonalAffinityError(
+                    "Azure location REST response contains duplicate region '{}'".format(
+                        normalized_location
+                    )
+                )
             region = candidate
-            break
 
     if region is None:
         raise ZonalAffinityError(
@@ -352,7 +375,7 @@ def map_logical_to_physical_zone(locations, location_name, logical_zone):
         ):
             raise ZonalAffinityError("availabilityZoneMappings contains a malformed entry")
         mapped_logical_zone = mapped_logical_zone.strip()
-        mapped_physical_zone = mapped_physical_zone.strip()
+        mapped_physical_zone = normalize_physical_zone(mapped_physical_zone)
         if mapped_logical_zone in zone_map:
             raise ZonalAffinityError(
                 "availabilityZoneMappings contains duplicate logical zone '{}'".format(
@@ -370,7 +393,7 @@ def map_logical_to_physical_zone(locations, location_name, logical_zone):
     return zone_map[normalized_logical_zone]
 
 
-def resolve_physical_zone(
+def resolve_zonal_affinity_context(
     elastic_san_subscription, resource_group_name, elastic_san_name
 ):
     compute = get_vm_compute_metadata()
@@ -404,12 +427,23 @@ def resolve_physical_zone(
         )
 
     locations = get_azure_locations(elastic_san_subscription_id)
-    return map_logical_to_physical_zone(
+    physical_zone = map_logical_to_physical_zone(
         locations, elastic_san_location, logical_zone
     )
+    return elastic_san_subscription_id, physical_zone
 
 
-def decorate_target_iqn(target_iqn, physical_zone):
+def resolve_physical_zone(
+    elastic_san_subscription, resource_group_name, elastic_san_name
+):
+    return resolve_zonal_affinity_context(
+        elastic_san_subscription, resource_group_name, elastic_san_name
+    )[1]
+
+
+def normalize_physical_zone(physical_zone):
+    if not isinstance(physical_zone, string_types):
+        raise ZonalAffinityError("Physical zone must be a nonempty string")
     normalized_physical_zone = physical_zone.strip().lower()
     if (
         not normalized_physical_zone
@@ -420,17 +454,90 @@ def decorate_target_iqn(target_iqn, physical_zone):
                 physical_zone
             )
         )
+    return normalized_physical_zone
 
+
+def decorate_target_iqn(target_iqn, physical_zone):
+    normalized_physical_zone = normalize_physical_zone(physical_zone)
+    if not isinstance(target_iqn, string_types) or not target_iqn:
+        raise ZonalAffinityError("Target IQN must be a nonempty string")
     # Provisional contract: the Elastic SAN front end must parse and strip this suffix
     # before zonal-affinity routing can be used in production.
     decorated_iqn = "{}:az-{}".format(target_iqn, normalized_physical_zone)
-    if len(decorated_iqn.encode("utf-8")) > MAX_IQN_UTF8_BYTES:
+    try:
+        iqn_byte_length = len(decorated_iqn.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise ZonalAffinityError("Decorated target IQN is not valid UTF-8")
+    if iqn_byte_length > MAX_IQN_UTF8_BYTES:
         raise ZonalAffinityError(
             "Decorated target IQN exceeds the {}-byte UTF-8 limit".format(
                 MAX_IQN_UTF8_BYTES
             )
         )
+    if IQN_PATTERN.match(decorated_iqn) is None:
+        raise ZonalAffinityError(
+            "Decorated target IQN contains unsafe or non-lowercase characters; "
+            "the service IQN must not be rewritten"
+        )
     return decorated_iqn
+
+
+def get_mapped_volume_target(
+    elastic_san_subscription_id, resource_group_name, elastic_san_name,
+    volume_group_name, volume_name,
+):
+    command = [
+        "az", "elastic-san", "volume", "show",
+        "-g", resource_group_name, "-e", elastic_san_name,
+        "-v", volume_group_name, "-n", volume_name,
+        "--subscription", elastic_san_subscription_id,
+        "--query", "storageTarget", "--output", "json",
+    ]
+    payload = _run_az_command(command, "Volume '{}' target lookup".format(volume_name))
+    try:
+        target = json.loads(payload)
+    except ValueError as error:
+        raise ZonalAffinityError(
+            "Volume '{}' target lookup returned invalid JSON: {}".format(volume_name, error)
+        )
+    if not isinstance(target, dict):
+        raise ZonalAffinityError("Volume '{}' storageTarget must be a JSON object".format(volume_name))
+    for field in ("targetIqn", "targetPortalHostname"):
+        if not isinstance(target.get(field), string_types) or not target[field]:
+            raise ZonalAffinityError(
+                "Volume '{}' storageTarget is missing a valid '{}'".format(volume_name, field)
+            )
+    hostname = target["targetPortalHostname"]
+    # The legacy connector constructs argv by splitting on spaces.
+    if re.match(r"^[a-zA-Z0-9][a-zA-Z0-9.-]*\Z", hostname) is None:
+        raise ZonalAffinityError("Volume '{}' has an unsafe target portal hostname".format(volume_name))
+    port = target.get("targetPortalPort")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ZonalAffinityError("Volume '{}' has an invalid target portal port".format(volume_name))
+    return target["targetIqn"], hostname, port
+
+
+def preflight_zonal_affinity(
+    elastic_san_subscription, resource_group_name, elastic_san_name,
+    volume_group_name, volume_names,
+):
+    if sys.version_info < (3, 5):
+        raise ZonalAffinityError("Zonal affinity requires Python 3.5 or later")
+    selected_volumes = tuple(volume_names)
+    subscription_id, physical_zone = resolve_zonal_affinity_context(
+        elastic_san_subscription, resource_group_name, elastic_san_name
+    )
+    targets = []
+    for volume_name in selected_volumes:
+        target_iqn, hostname, port = get_mapped_volume_target(
+            subscription_id, resource_group_name, elastic_san_name,
+            volume_group_name, volume_name,
+        )
+        targets.append((
+            volume_name,
+            (decorate_target_iqn(target_iqn, physical_zone), hostname, port),
+        ))
+    return targets
 
 # check if there are existing connections, if so exit and not connect again
 def check_connection(target_iqn, target_portal_hostname, target_portal_port):
@@ -508,24 +615,24 @@ def connect_volumes(
     number_of_sessions,
     enable_zonal_affinity=False,
 ):
-    physical_zone = (
-        resolve_physical_zone(
-            elastic_san_subscription, resource_group_name, elastic_san_name
+    if enable_zonal_affinity:
+        # Complete discovery and IQN validation for the entire selection before
+        # even calling the legacy native inventory/connection helpers.
+        targets = preflight_zonal_affinity(
+            elastic_san_subscription, resource_group_name, elastic_san_name,
+            volume_group_name, volume_names,
         )
-        if enable_zonal_affinity
-        else None
-    )
-    for volume_name in volume_names:
-        target_iqn, target_hostname, target_port = get_iqns(
-            elastic_san_subscription,
-            resource_group_name,
-            elastic_san_name,
-            volume_group_name,
-            volume_name,
+    else:
+        # Keep opt-out discovery interleaved with connection, as before.
+        targets = (
+            (volume_name, get_iqns(
+                elastic_san_subscription, resource_group_name, elastic_san_name,
+                volume_group_name, volume_name,
+            ))
+            for volume_name in volume_names
         )
-        if enable_zonal_affinity:
-            target_iqn = decorate_target_iqn(target_iqn, physical_zone)
 
+    for volume_name, (target_iqn, target_hostname, target_port) in targets:
         connected = check_connection(target_iqn, target_hostname, target_port)
         if connected:
             print('{} [{}]: Skipped as this volume is already connected'.format(volume_name, target_iqn))
