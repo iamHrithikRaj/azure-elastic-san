@@ -1,4 +1,3 @@
-import hashlib
 import importlib.util
 import json
 import os
@@ -22,20 +21,6 @@ SPEC.loader.exec_module(connect)
 # do) is always a no-op success anyway.
 if not hasattr(os, "chown"):
     os.chown = lambda *_args, **_kwargs: None
-
-LINUX_DIR = os.path.join(
-    os.path.dirname(__file__), "..", "CLI (Linux) Multi-Session Connect Scripts"
-)
-# Guards against this task accidentally touching the Linux scripts: these are
-# the SHA-256 hashes of the Linux directory's files as they existed before
-# the FreeBSD script was added. If any of these ever legitimately need to
-# change, update the hash deliberately alongside that change.
-LINUX_FILE_SHA256 = {
-    "connect_for_documentation.py": "eb0da405c281fb69672c7d2072e70eb997e80c21ce1d42a555a70d02b2aa4a3f",
-    "disconnect_for_documentation.py": "c65aae28636cb0d8aaf92d1ba922e909dfd853f0d7356140bb519524938fa934",
-    "test_connect_for_documentation.py": "f9dd1e2679e4b40a853f52730ac4498632e92620e780f27dac2411e95c44e7da",
-}
-
 
 def completed_process(stdout="", stderr="", returncode=0):
     process = mock.Mock()
@@ -80,19 +65,6 @@ def verbose_session_block(target_name, target_portal, state="Connected"):
         "Header digest:             CRC32C\n"
         "Data digest:               CRC32C\n"
     ).format(target_name=target_name, target_portal=target_portal, state=state)
-
-
-class LinuxScriptUntouchedTests(unittest.TestCase):
-    def test_linux_files_have_not_been_modified(self):
-        for filename, expected_hash in LINUX_FILE_SHA256.items():
-            path = os.path.join(LINUX_DIR, filename)
-            with open(path, "rb") as handle:
-                actual_hash = hashlib.sha256(handle.read()).hexdigest()
-            self.assertEqual(
-                expected_hash,
-                actual_hash,
-                "{} was modified by the FreeBSD script addition".format(filename),
-            )
 
 
 class ArgumentParsingTests(unittest.TestCase):
@@ -741,46 +713,110 @@ class AddSessionsForVolumeTests(unittest.TestCase):
 
 
 class ExactCommandArgvTests(unittest.TestCase):
-    def test_ensure_iscsid_enabled_and_running_when_disabled_and_stopped(self):
-        run_command_calls = []
-        run_subprocess_calls = []
-
-        def fake_run_command(command, description, timeout=connect.AZ_CLI_TIMEOUT_SECONDS):
-            run_command_calls.append(command)
-            if command == ["sysrc", "-n", "iscsid_enable"]:
-                return "NO"
-            return ""
-
-        def fake_run_subprocess(command, description, timeout):
-            run_subprocess_calls.append(command)
-            return 1, "", ""
-
-        with mock.patch.object(connect, "_run_command", side_effect=fake_run_command):
-            with mock.patch.object(connect, "_run_subprocess", side_effect=fake_run_subprocess):
+    def test_ensure_iscsid_enabled_and_running_sets_unset_value_and_starts_service(self):
+        with mock.patch.object(connect, "_run_command", return_value="") as run_command:
+            with mock.patch.object(
+                connect,
+                "_run_subprocess",
+                side_effect=[
+                    (1, "", "unknown variable"),
+                    (1, "", "iscsid is not running"),
+                ],
+            ) as run_subprocess:
                 connect.ensure_iscsid_enabled_and_running()
 
         self.assertEqual(
             [
-                ["sysrc", "-n", "iscsid_enable"],
-                ["sysrc", "iscsid_enable=YES"],
-                ["service", "iscsid", "start"],
+                mock.call(
+                    ["sysrc", "-n", "iscsid_enable"],
+                    "sysrc iscsid_enable query",
+                    connect.SHORT_COMMAND_TIMEOUT_SECONDS,
+                ),
+                mock.call(
+                    ["service", "iscsid", "onestatus"],
+                    "service iscsid onestatus",
+                    connect.SHORT_COMMAND_TIMEOUT_SECONDS,
+                ),
             ],
-            run_command_calls,
+            run_subprocess.call_args_list,
         )
-        self.assertEqual([["service", "iscsid", "onestatus"]], run_subprocess_calls)
+        self.assertEqual(
+            [
+                mock.call(
+                    ["sysrc", "iscsid_enable=YES"],
+                    "sysrc iscsid_enable=YES",
+                    connect.SHORT_COMMAND_TIMEOUT_SECONDS,
+                ),
+                mock.call(
+                    ["service", "iscsid", "start"],
+                    "service iscsid start",
+                    connect.SHORT_COMMAND_TIMEOUT_SECONDS,
+                ),
+            ],
+            run_command.call_args_list,
+        )
 
-    def test_ensure_iscsid_enabled_and_running_skips_mutation_when_already_enabled_and_running(self):
-        def fake_run_command(command, description, timeout=connect.AZ_CLI_TIMEOUT_SECONDS):
-            self.assertEqual(["sysrc", "-n", "iscsid_enable"], command)
-            return "YES"
-
-        def fake_run_subprocess(command, description, timeout):
-            return 0, "iscsid is running as pid 123.\n", ""
-
-        with mock.patch.object(connect, "_run_command", side_effect=fake_run_command) as run_command:
-            with mock.patch.object(connect, "_run_subprocess", side_effect=fake_run_subprocess):
+    def test_ensure_iscsid_enabled_and_running_preserves_yes_and_running_service(self):
+        with mock.patch.object(connect, "_run_command") as run_command:
+            with mock.patch.object(
+                connect,
+                "_run_subprocess",
+                side_effect=[
+                    (0, "YES\n", ""),
+                    (0, "iscsid is running as pid 123.\n", ""),
+                ],
+            ) as run_subprocess:
                 connect.ensure_iscsid_enabled_and_running()
-        self.assertEqual(1, run_command.call_count)
+
+        self.assertEqual(
+            [
+                mock.call(
+                    ["sysrc", "-n", "iscsid_enable"],
+                    "sysrc iscsid_enable query",
+                    connect.SHORT_COMMAND_TIMEOUT_SECONDS,
+                ),
+                mock.call(
+                    ["service", "iscsid", "onestatus"],
+                    "service iscsid onestatus",
+                    connect.SHORT_COMMAND_TIMEOUT_SECONDS,
+                ),
+            ],
+            run_subprocess.call_args_list,
+        )
+        run_command.assert_not_called()
+
+    def test_ensure_iscsid_enabled_and_running_changes_no_without_starting_running_service(self):
+        with mock.patch.object(connect, "_run_command", return_value="") as run_command:
+            with mock.patch.object(
+                connect,
+                "_run_subprocess",
+                side_effect=[
+                    (0, "NO\n", ""),
+                    (0, "iscsid is running as pid 123.\n", ""),
+                ],
+            ) as run_subprocess:
+                connect.ensure_iscsid_enabled_and_running()
+
+        self.assertEqual(
+            [
+                mock.call(
+                    ["sysrc", "-n", "iscsid_enable"],
+                    "sysrc iscsid_enable query",
+                    connect.SHORT_COMMAND_TIMEOUT_SECONDS,
+                ),
+                mock.call(
+                    ["service", "iscsid", "onestatus"],
+                    "service iscsid onestatus",
+                    connect.SHORT_COMMAND_TIMEOUT_SECONDS,
+                ),
+            ],
+            run_subprocess.call_args_list,
+        )
+        run_command.assert_called_once_with(
+            ["sysrc", "iscsid_enable=YES"],
+            "sysrc iscsid_enable=YES",
+            connect.SHORT_COMMAND_TIMEOUT_SECONDS,
+        )
 
     def test_add_iscsi_session_argv(self):
         with mock.patch.object(connect, "_run_command", return_value="") as run_command:

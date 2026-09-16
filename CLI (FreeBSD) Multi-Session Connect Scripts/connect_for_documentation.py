@@ -731,9 +731,11 @@ def restore_config_from_backup(path, backup_path, existed, original_stat):
 # ---------------------------------------------------------------------------
 
 def ensure_iscsid_enabled_and_running():
-    current = _run_command(
+    returncode, current, _ = _run_subprocess(
         ["sysrc", "-n", "iscsid_enable"], "sysrc iscsid_enable query", SHORT_COMMAND_TIMEOUT_SECONDS
     )
+    if returncode != 0:
+        current = ""
     if current.strip().upper() != "YES":
         _run_command(
             ["sysrc", "iscsid_enable=YES"], "sysrc iscsid_enable=YES", SHORT_COMMAND_TIMEOUT_SECONDS

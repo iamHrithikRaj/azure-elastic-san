@@ -205,9 +205,10 @@ silently reporting success.
 
 The script enables `iscsid` persistently with `sysrc iscsid_enable=YES`, but
 only writes that value if `sysrc -n iscsid_enable` doesn't already report
-`YES` (idempotent, avoids noisy reruns). It checks whether `iscsid` is
-already running with `service iscsid onestatus` and only runs
-`service iscsid start` if it isn't. It never restarts `iscsid` and never
+`YES`; an unset variable (reported by `sysrc` as a non-zero exit) is treated
+as disabled and set to `YES` (idempotent, avoids noisy reruns). It checks
+whether `iscsid` is already running with `service iscsid onestatus` and only
+runs `service iscsid start` if it isn't. It never restarts `iscsid` and never
 touches sessions/targets it did not create itself.
 
 ## Session count
