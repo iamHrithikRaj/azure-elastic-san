@@ -1,104 +1,162 @@
-# Linux standalone zonal-affinity mapping
+# Linux standalone zonal VIP distribution
 
-ADO **39557586** adds opt-in logical-to-physical zone mapping to the standalone
-Linux connect script. This layer still connects through the volume's **FQDN**
-and retains the existing configurable session count (default 32, capped at 32).
-Connect does not resolve or allocate VIPs, require exactly 32 sessions, or modify
-portal-generated scripts. The Linux disconnect script also cleans up zonal
-targets and node records across FQDN or IP portals.
+ADO **39689656** extends the Linux mapping layer (**39557586**) through the
+existing `--enable-zonal-affinity` opt-in. Enabled connections require **32
+sessions** through exactly **three numeric VIPs**, allocated **11/11/10** to the
+decorated IQN. There is no second flag and no FQDN fallback. Omitting the opt-in
+preserves the original discovery order, undecorated IQN, FQDN, configurable
+session count (default and maximum 32), skip behavior, and legacy helper bodies.
+No other OS, Portal generator, shared runtime module, or disconnect script is
+changed by this layer.
 
-**This is a mapping proof of concept, not a production-ready native connector.**
-The Elastic SAN front end must understand and strip the provisional IQN suffix
-before canonical IQN parsing and implement same-zone routing. The script cannot
-enable or verify that service capability.
+**This is a provisional connector, not production qualification.** The Elastic
+SAN front end must understand and strip the `:az-<physicalZone>` suffix before
+canonical IQN parsing and implement same-zone routing. The script cannot enable
+or verify that service capability.
 
-## Use
+## Use and supported scope
 
-Use an explicitly authorized Linux test VM in the **same subscription and
-region** as the SAN. The VM must be availability-zone pinned. The script uses
-the existing iSCSI initiator and multipath prerequisites and Azure CLI with the
-`elastic-san` extension. Authenticate Azure CLI with access to the SAN, its
-volumes, and the subscription Locations API before running. No extra Python
-packages or shared runtime module are needed; use Python 3.5 or later.
+Use Python **3.5 or later** on an explicitly authorized Linux test VM, with the
+existing iSCSI initiator/multipath prerequisites and Azure CLI `elastic-san`
+extension. Authenticate Azure CLI before running. The VM must be zonal and in
+the **same subscription and region** as the SAN.
 
 ```sh
 python3 connect_for_documentation.py \
     --elastic-san-subscription '<SAN-subscription-name-or-ID>' \
-    -g rg -e san -v vg -n volume1 volume2 -s 4 \
+    -g rg -e san -v vg -n volume1 volume2 -s 32 \
     --enable-zonal-affinity
 ```
 
+This is **not a dry run**: connection changes follow preflight. Omitting `-s`
+uses 32. Enabled values other than 32 fail before the legacy count clamp.
 `--subscription` remains an alias for `--elastic-san-subscription`. If omitted,
-the enabled path resolves the active Azure CLI subscription once and pins all
-subsequent discovery to that canonical subscription ID. Cross-subscription
-connections are not supported. Omitting `--enable-zonal-affinity` preserves the
-original discovery order, undecorated IQN, FQDN, skip behavior, and count
-handling. The command above is not a dry run: native mutation follows preflight.
+the enabled path resolves the active CLI subscription once and pins subsequent
+discovery to its canonical GUID. Cross-subscription connections are unsupported.
 
-## Enabled discovery and preflight
+The source-audited native command paths are **upstream open-iscsi 2.1.11**.
+The supported selected-session topology is software TCP (`iscsi_tcp`), explicit
+`default` interface, and one connection `:0` per SID. Required sysfs evidence was
+checked against Linux v6.12, with principal attributes also present in v5.15.
+Missing evidence or unsupported topology refuses, rather than inferring defaults.
+These source checks and mocks do **not** qualify arbitrary distribution patches,
+sudo policies, kernels, or installed binaries. Native validation on each intended
+platform remains necessary before rollout. No package, service, MPIO, global
+configuration, credential, or database-root setup is added.
 
-1. Read VM subscription, region, and logical zone from IMDS, with `Metadata: true`,
-   no HTTP proxy, and a five-second HTTP timeout.
-2. Resolve the SAN subscription to a GUID and get its region using
-   `az elastic-san show --elastic-san-name`. Reject VM/SAN subscription or region
-   mismatches.
-3. Fetch `availabilityZoneMappings` with `az rest` against the explicit
-   `/subscriptions/<ID>/locations?api-version=2022-12-01` URL and `--output json`
-   so the user's CLI output preference cannot change the parsed format. Do not use
-   `az account list-locations --subscription`, which is unsupported.
-4. Reject missing or malformed mappings, duplicate normalized region entries,
-   duplicate trimmed logical zones, or an
-   unmatched logical zone. Trim/lowercase the physical zone and require
-   `[a-z0-9.-]+`.
-5. Discover and snapshot **every selected volume's** IQN, FQDN, and port through
-   the bounded Azure CLI path. Append the exact `:az-<physicalZone>` suffix:
-   `iqn.example:volume` becomes `iqn.example:volume:az-eastus-az3`.
-6. Validate the **complete** decorated IQN: only lowercase ASCII letters,
-   digits, dots, colons, and hyphens, and at most **223 UTF-8 bytes**. Invalid or
-   uppercase service identities fail; they are never silently rewritten.
-   Require a nonempty safe hostname and an integer port from 1 through 65535.
-7. Only after the complete selection passes, hand the snapshotted targets to
-   the unchanged native connection helpers. A later discovery or IQN error
-   causes zero calls to native inventory or connection helpers.
+## Whole-selection preflight
 
-Every enabled Azure CLI invocation has a 30-second process wait. Output uses
-private temporary files rather than pipes, so inherited output handles cannot
-strand a background reader or delay collection until a descendant exits. On
-timeout or interruption the Linux CLI process group is killed and reaping gets
-at most another 30 seconds. A termination or cleanup failure is reported
-explicitly, with no undecorated-IQN or alternate-subscription fallback.
-These bounds do not change the legacy opt-out or native helper timeouts.
-The read-only package-manager prerequisite checks keep their original
-entrypoint ordering and run before mapping preflight.
+1. Read VM subscription, region, and logical zone from IMDS with `Metadata: true`,
+   proxy bypass, and a five-second HTTP timeout.
+2. Resolve the SAN subscription to a GUID and its location with
+   `az elastic-san show --elastic-san-name`. Reject subscription/region mismatch.
+   Obtain `availabilityZoneMappings` with explicit-subscription
+   `az rest .../subscriptions/<ID>/locations?api-version=2022-12-01`.
+   Do not use the unsupported `az account list-locations --subscription`.
+3. Snapshot every selected volume's IQN, hostname, and port. Reject missing or
+   malformed mappings, duplicate normalized region entries or logical zones,
+   unsafe hostnames/ports, conflicting aliases, already-decorated service IQNs,
+   and invalid complete decorated IQNs. The IQN permits only lowercase ASCII
+   letters, digits, dots, colons, and hyphens and at most **223 UTF-8 bytes**.
+   Never rewrite an invalid service identity to make it pass.
+4. Finish every input/mapping/IQN check before DNS. Resolve each hostname locally
+   with at most **three independent five-second attempts**, with 1/2-second
+   retry delays. A successful answer may be cached only within this invocation.
+   Never union partial answers across attempts or discard invalid extra answers.
+   Require exactly three distinct usable addresses after normalization:
+   IPv4 dotted decimal, IPv6 compressed lowercase, mapped IPv6 normalized to IPv4.
+   Reject scoped, unspecified, loopback, multicast, link-local, broadcast, malformed,
+   nondecimal, or whitespace-padded answers. Private and public unicast are allowed.
+   Sort IPv4 before IPv6, then unsigned network-order bytes; allocate 11/11/10.
+5. Only after **all pure plans** pass, inspect session sysfs and the native node
+   inventory. The narrowly allowed effects of node inspection are **local DB
+   locking/lock artifacts and creation of missing database/lock directories**.
+   No selected node-record edits, configuration edits, service/daemon startup,
+   logins, or session changes are allowed before **every volume** passes its
+   existing-state checks.
+6. Re-read the full selected session proof and node configuration at the global
+   barrier, then recheck the specific volume immediately before its first change.
+   Visible identity/configuration changes refuse. These observations are not an
+   atomic transaction or a guarantee against concurrent tools; do not configure
+   the same targets concurrently.
 
-## Native limitations and recovery
+Azure CLI discovery retains the mapping parent's file-backed output and bounded
+30-second process waits. Its existing CLI-group termination and bounded reaping
+behavior remain unchanged. Read-only package prerequisite checks retain their
+original entrypoint ordering.
 
-The legacy helper bodies and signatures are deliberately preserved in this
-mapping-only layer. Their existing-state check is a simple textual match, not
-proof of complete, healthy, persistent sessions. They do not establish original
-portal identity across redirects or safely adopt/migrate an existing target.
-Do not use this opt-in to migrate an already connected volume.
+## Existing-state proof
 
-Known inherited connector defects also remain: the digest command construction
-uses an empty string separator and can fail after login, the persisted session
-count uses the decremented value, and some native command failures are not
-checked. This layer does **not** claim to fix CRC32C setup, persistent session
-counts, or native readiness. Those require separately scoped connector work
-and authorized Linux qualification before rollout.
+Native observation uses **unfiltered `iscsiadm -m node`** and target/portal-scoped
+node `--op show` **without an interface filter**, so extra interface records
+cannot be hidden. It uses the installed command's compiled database location,
+never guesses `/etc/iscsi` versus `/var/lib/iscsi`, and does not need a new root
+flag. Exit code 21 means empty only with the exact expected diagnostic.
+Unexpected stderr invalidates even exit-zero inventory: enumeration can warn
+and skip unreadable entries. Malformed, duplicate, incomplete, or conflicting
+selected records refuse.
 
-Preflight is not a transaction across volumes. A native failure can leave
-earlier volumes connected and the failing volume partially configured. There
-is no automatic rollback, disconnect, repair, or rebalance. Inspect the exact
-target's live and persistent state using read-only, target-scoped procedures
-before retrying; never bulk logout or delete on a shared host. Avoid concurrent
-connection/configuration tools for the same target.
+Flat output supports flexible whitespace. Only the flat-node representation
+`4294967295` is normalized to unknown TPGT `-1`; the full record must independently
+confirm signed `node.tpgt = -1`. Live session tags never use that conversion.
+Known node/session tags must agree. Structurally valid unrelated node records,
+including loopback/link-local portals, remain visible without being adopted.
+Native scoped IPv6 identity is preserved, and flat inventory accepts upstream's
+unbracketed dotted-tail IPv6 format. Neither case relaxes DNS suitability or lets
+a scoped address match a selected unscoped VIP.
 
-The dependent Linux VIP layer (ADO **39689656**) will own DNS normalization,
-three-endpoint allocation, exact-32 sessions, and supported native inventory.
-None of that behavior is included here. FE suffix support, real Linux
-multi-session behavior, persistent reconnection after reboot, redirects,
-dual-stack/backend compatibility, zone failure, and recovery-time qualification
-remain rollout gates. Mocked unit tests cannot establish those properties.
+Sessions are inspected **directly through per-SID sysfs**, never native flat
+session listing or `-P 3` during preflight. Required evidence includes:
+
+| Evidence | Required proof |
+|---|---|
+| Target and interface | Exact decorated IQN, explicit `default`, signed session TPGT |
+| Original portal | Independent connection `persistent_address` and `persistent_port` matching its allocated VIP |
+| Current portal | Separately read `address` and `port`; redirect convergence is allowed, never an original-portal fallback |
+| Topology | Connection -> session -> host ancestry, class device links, one `:0` connection, actual session-descendant target/LUN/block associations |
+| Kernel readiness | `LOGGED_IN`, connection `up`, `iscsi_tcp` host `running`, at least one attached block disk and all disk states `running` |
+| Digests | Negotiated `header_digest = 1` and `data_digest = 1` (CRC32C) |
+| Persistence | Exactly three default-TCP nodes, full 11/11/10 counts, `node.startup = automatic`, `node.conn[0].startup = manual`, both requested digests CRC32C |
+
+Membership, identity, and repeated snapshots must agree. Pending new-session
+health/disk scans can settle within the bounded readiness poll, but a changing
+sample cannot report ready. Kernel readiness does **not** establish daemon
+health, internal recovery state, or successful end-to-end I/O.
+
+Skip only a complete matching **32-session / three-node / 11/11/10** layout.
+Undecorated targets, other zones, FQDN records, partial connections, wrong
+counts/ports/interfaces, unhealthy sessions, or ambiguous persistence refuse.
+There is no automatic adoption, repair, disconnect, migration, or rebalance.
+
+## Apply and recovery
+
+After the global barrier, create one numeric-portal node per VIP, using brackets
+only for IPv6 host:port syntax. Set **both startup fields to manual**, seed count
+to one, and both digest requests to CRC32C. Re-read these settings before login.
+Establish exactly one seed per VIP, wait for repeated kernel-ready proof, then
+clone that VIP's **specific SID**, never an arbitrary existing session.
+
+After all 32 sessions are ready, persist the **full** 11/11/10 allocations, not
+allocation-minus-one, and enable node automatic startup. Verify the complete live
+and persistent layout before reporting success.
+
+Native commands use noninteractive sudo, a fixed locale, a 30-second client wait,
+file-backed output, and a 1 MiB supported output limit per stream. Timeout or
+interruption terminates **only the direct native client**, with a one-second
+cleanup wait; it never kills the client's process group. A daemon-side operation
+may continue after the client exits. Such a timeout is a failure, not proof of
+cancellation or rollback.
+
+A later failure can leave earlier volumes connected and the current volume
+partially configured. Errors identify the failing volume and earlier verified
+volumes. Inspect and reconcile only the selected target under an approved
+maintenance procedure before retrying; never bulk logout or delete on a shared
+host. The script performs no automatic cleanup.
+
+Legacy helpers are deliberately unchanged, including their known digest-command,
+decremented-persistence-count, and native-error-handling defects. The enabled VIP
+path does not use those helpers. Turning off the opt-in is not cleanup; use the
+explicit disconnect procedure below.
 
 ## Disconnect
 
@@ -115,35 +173,47 @@ before retrying, and do not run concurrent connection tools. Turning off the
 connect opt-in alone still does not clean up anything. Native disconnect and
 reboot behavior require authorized Linux qualification.
 
-## Offline tests
+## Offline validation and limits
 
-Run only this OS suite from the repository root:
+From the repository root:
 
 ```powershell
-python -B -W error::ResourceWarning -m unittest discover -s '.\CLI (Linux) Multi-Session Connect Scripts' -p 'test_*connect_for_documentation.py' -v
+python -B -W error::ResourceWarning -m unittest discover -s '.\CLI (Linux) Multi-Session Connect Scripts' -p 'test*.py'
 ```
 
-The suite keeps the 23 historical mapping cases and adds focused full-IQN,
-whole-selection preflight, subscription snapshot, malformed-input, timeout,
-and opt-out ordering/count regressions. Azure discovery and all native mutation
-boundaries are mocked; subprocess lifecycle cases use harmless local Python
-processes as well as mocks. No live Azure resources, root privileges, DNS/VIP
-fixtures, or another OS suite are required.
-Disconnect cases mock subprocesses to cover plain/zonal target matching,
-multiple portals, inactive persistent records, unrelated targets, and failures.
+The suite exercises the actual standalone entrypoints and helpers with mocked
+IMDS/CLI/DNS/native boundaries, an argv-level initiator model, file-backed sysfs
+attributes with portable class-link emulation, the local address corpus, and
+harmless child-process lifecycle probes. It covers exact allocation, original
+versus redirected portals, full persistence, TPGT/whitespace, all-volume
+preflight, races, pending readiness, partial failures, and opt-out behavior.
+It never runs a real initiator or connects a cloud resource.
+
+FE suffix support, real initiator/daemon behavior, recovery after reboot,
+redirects, backend dual stack, zone failure, RTO, and end-to-end I/O remain
+unqualified. Mocked results are not native or production qualification.
 
 ## Provenance
 
-The four coherent Linux mapping commits were carried with `cherry-pick -x`:
+This Linux-only adaptation reuses selected planning, allocation, state-proof,
+connection, and fixture behavior from the preserved combined source:
 
-- `fd1f513f05a4c1995fcda8db4c32d15dac076ccb`
-- `ea36a31901238618ba3b9e6ad57d1e53c0f3417a`
-- `5e265679beaa8b2864cd297400485a77f5405f59`
-- `3430ed96bc1ae8d401fe29e574acfe379f58d1dc`
+- `fd03a7e2610f6e020ef57d81418f26a872f793f0` - inline VIP planning and address cases.
+- `b084085baf18e8cb7b7b9acbd9fcacfa2574ed7a` - Linux VIP/node/SID allocation intent.
+- `39e593bbbaab2d59eac9fda117709ed132a1a4ee` - flat-only unsigned node TPGT handling.
+- Combined reference `d6e8d4822a3d0aa7dac8b7794ebb9c74862ac108` on
+  [`iamHrithikRaj/azure-elastic-san`](https://github.com/iamHrithikRaj/azure-elastic-san/tree/feature/hrithikraj/esan-zrs-vip-distribution-39679867).
 
-The subsequent adaptation adds full-selection preflight, pinned and bounded
-volume discovery, full-IQN validation, duplicate-map checks, and focused
-regressions; it is not an unchanged cherry-pick. Applicable mapping, recovery,
-and qualification guidance was adapted from `docs/standalone-zonal-affinity.md`
-in combined source `d6e8d4822a3d0aa7dac8b7794ebb9c74862ac108`, without bringing
-its VIP implementation or cross-OS dependencies into this directory.
+These are selective adaptations, not unchanged cherry-picks. Native session
+probes were replaced by sysfs, unsafe inventory assumptions corrected, and
+parent mapping/authentication/CLI/IQN behavior preserved. The small fixture is
+owned by this Linux directory; no other OS's runtime or tests are imported.
+The mapping parent retains its four original Linux mapping cherry-picks and
+subsequent pinned-discovery/full-selection validation fixes.
+
+Source anchors for the native observation contract:
+[node list/show dispatch](https://github.com/open-iscsi/open-iscsi/blob/2.1.11/usr/iscsiadm.c#L750-L841),
+[DB enumeration and partial-stat warnings](https://github.com/open-iscsi/open-iscsi/blob/2.1.11/libopeniscsiusr/node.c#L78-L210),
+[DB initialization](https://github.com/open-iscsi/open-iscsi/blob/2.1.11/usr/idbm.c#L3136),
+[persistent portal publication](https://github.com/open-iscsi/open-iscsi/blob/2.1.11/usr/initiator_common.c#L490-L506),
+and [kernel iSCSI attributes](https://github.com/torvalds/linux/blob/v6.12/drivers/scsi/scsi_transport_iscsi.c#L4150-L4400).
