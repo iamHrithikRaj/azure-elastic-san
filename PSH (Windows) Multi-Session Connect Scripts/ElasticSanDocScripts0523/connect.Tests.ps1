@@ -13,9 +13,26 @@ function Get-AzElasticSanVolumeGroup { [CmdletBinding()]param($ResourceGroupName
 function Get-AzElasticSanVolume { [CmdletBinding()]param($ResourceGroupName, $ElasticSanName, $VolumeGroupName, $Name) }
 function Get-WindowsFeature { [CmdletBinding()]param($Name) }
 function Get-IscsiSession { [CmdletBinding()]param() }
+function Get-IscsiConnection { [CmdletBinding()]param($IscsiSession) }
+function Get-IscsiTarget { [CmdletBinding()]param() }
 function iscsicli {
-    $script:nativeCalls.Add(@($args))
+    $argv = @($args)
+    $script:nativeCalls.Add($argv)
     $global:LASTEXITCODE = $script:nativeExit
+    if ($script:simulateLogin -and $script:nativeExit -eq 0 -and $script:nativeOutput -eq 'The operation completed successfully.' -and $argv[0] -eq 'PersistentLoginTarget') {
+        $session = [pscustomobject]@{
+            SessionIdentifier = ('0000000000000001-{0:x16}' -f ($script:existing.Count + 1))
+            TargetNodeAddress = $argv[1]; IsConnected = $true; IsPersistent = $true
+            IsHeaderDigest = $true; IsDataDigest = $true; NumberOfConnections = 1
+        }
+        $script:existing += $session
+        $script:persistent += [pscustomobject]@{
+            TargetName = $argv[1]; Address = $argv[3]; Port = [int]$argv[4]; SessionIdentifier = $null
+            InitiatorInstance = 'Root\ISCSIPRT\0000_0'; IsInformationalSession = $false
+            InitiatorPortNumber = [uint32]::MaxValue; Version = 0; SecurityFlags = 0; AuthType = 0
+            InformationSpecified = 3; LoginFlags = 2; HeaderDigest = 1; DataDigest = 1
+        }
+    }
     $script:nativeOutput
 }
 
@@ -124,7 +141,7 @@ Describe 'Bounded metadata and provider requests' {
     }
 }
 
-Describe 'Mapping-only orchestration' {
+Describe 'Whole-batch mapping and VIP orchestration' {
     BeforeEach {
         $script:nativeCalls = New-Object 'System.Collections.Generic.List[object]'
         $script:nativeExit = 0
@@ -139,9 +156,17 @@ Describe 'Mapping-only orchestration' {
         $script:duplicateIqn = $false
         $script:requests = New-Object 'System.Collections.Generic.List[object]'
         $script:existing = @()
+        $script:persistent = @()
+        $script:simulateLogin = $true
         Mock Get-Service { [pscustomobject]@{ Status = 'Running' } }
         Mock Get-WindowsFeature { [pscustomobject]@{ InstallState = 'Installed' } }
         Mock Get-IscsiSession { $script:existing }
+        Mock Get-IscsiConnection { [pscustomobject]@{ ConnectionIdentifier = 'connection'; TargetAddress = '10.20.30.40'; TargetPortNumber = 3260 } }
+        Mock Get-IscsiTarget {}
+        Mock Get-ZonalPersistentLogins { $script:persistent }
+        Mock Start-ZonalDnsLookup { [pscustomobject]@{ HostName = $HostName } }
+        Mock Wait-ZonalDnsLookup { 'fd00::1'; '10.0.0.2'; '10.0.0.1' }
+        Mock Start-Sleep {}
         Mock Write-Host {}
         Mock Get-AzContext { $script:context }
         Mock Get-ZonalComputeMetadata { $script:compute }
@@ -157,7 +182,7 @@ Describe 'Mapping-only orchestration' {
                         if ($name -eq 'two' -and $script:badSecond -eq 'provider') { throw 'second volume provider deadline' }
                         [pscustomobject]@{
                             StorageTargetIqn = $(if ($script:duplicateIqn) { 'iqn.test:shared' } elseif ($name -eq 'two' -and $script:badSecond -eq 'iqn') { 'iqn.test:UPPER' } else { "iqn.test:$name" })
-                            StorageTargetPortalHostname = $(if ($name -eq 'two' -and $script:badSecond -eq 'host') { 'bad host' } else { 'PORTAL.EXAMPLE' })
+                            StorageTargetPortalHostname = $(if ($name -eq 'two' -and $script:badSecond -eq 'host') { 'bad host' } else { "$name.example" })
                             StorageTargetPortalPort = $(if ($name -eq 'two' -and $script:badSecond -eq 'port') { 65536 } else { 3260 })
                         }
                     }
@@ -166,7 +191,7 @@ Describe 'Mapping-only orchestration' {
         }
     }
     It 'uses explicit subscription and DefaultProfile for every provider read' {
-        Connect-ZonalVolumes 'rg' 'san' 'vg' @('one', 'two') 2
+        Connect-ZonalVolumes 'rg' 'san' 'vg' @('one', 'two') 32
         $script:requests.Count | Should Be 5
         foreach ($request in $script:requests) {
             [object]::ReferenceEquals($request.Parameters.DefaultProfile, $script:context) | Should Be $true
@@ -175,23 +200,23 @@ Describe 'Mapping-only orchestration' {
                 $request.Parameters.Path | Should Be "/subscriptions/$script:subscription/locations?api-version=2022-12-01"
             } else { $request.Parameters.SubscriptionId | Should Be $script:subscription }
         }
-        $script:nativeCalls.Count | Should Be 6
-        ($script:nativeCalls[0] -join '|') | Should Be 'AddTarget|iqn.test:one:az-eastus-az3|*|PORTAL.EXAMPLE|3260|*|0|*|*|*|*|*|*|*|*|*|0'
-        ($script:nativeCalls[1] -join '|') | Should Be 'PersistentLoginTarget|iqn.test:one:az-eastus-az3|t|portal.example|3260|Root\ISCSIPRT\0000_0|-1|*|0x00000002|1|1|*|*|*|*|*|*|*|0'
-        $script:nativeCalls[4][1] | Should Be 'iqn.test:two:az-eastus-az3'
+        $script:nativeCalls.Count | Should Be 66
+        ($script:nativeCalls[0] -join '|') | Should Be 'AddTarget|iqn.test:one:az-eastus-az3|*|10.0.0.1|3260|*|0|*|*|*|*|*|*|*|*|*|0'
+        $vips = @('10.0.0.1', '10.0.0.2', 'fd00::1')
+        for ($i = 0; $i -lt 32; $i++) {
+            ($script:nativeCalls[$i + 1] -join '|') | Should Be "PersistentLoginTarget|iqn.test:one:az-eastus-az3|t|$($vips[$i % 3])|3260|Root\ISCSIPRT\0000_0|-1|*|0x00000002|1|1|*|*|*|*|*|*|*|0"
+        }
+        $script:nativeCalls[34][1] | Should Be 'iqn.test:two:az-eastus-az3'
     }
-    It 'preserves enabled configurable counts including one, 31 and 32' {
-        Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 1
-        $script:nativeCalls.Count | Should Be 2
-        $script:nativeCalls.Clear()
-        Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32
-        $script:nativeCalls.Count | Should Be 33
-        $script:nativeCalls.Clear()
-        Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 31
-        $script:nativeCalls.Count | Should Be 32
+    It 'rejects every non-32 enabled count before any discovery or mutation' {
+        foreach ($count in @(0,1,2,31,33)) {
+            { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') $count } | Should Throw 'exactly 32'
+        }
+        $script:requests.Count | Should Be 0
+        $script:nativeCalls.Count | Should Be 0
     }
     It 'rejects invalid parameter counts before discovery or mutation' {
-        foreach ($count in @(0, 33)) {
+        foreach ($count in @(0, 1, 31, 33)) {
             { . $connectPath 'rg' 'san' 'vg' @('one') $count -EnableZonalAffinity } | Should Throw
         }
         $script:requests.Count | Should Be 0
@@ -237,43 +262,161 @@ Describe 'Mapping-only orchestration' {
         { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one', 'two') 32 } | Should Throw 'same raw IQN'
         $script:nativeCalls.Count | Should Be 0
     }
-    It 'skips the exact decorated target but refuses automatic migration for any selected volume' {
-        $script:existing = @([pscustomobject]@{ TargetNodeAddress = 'iqn.test:one:az-eastus-az3' })
-        Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32
-        $script:nativeCalls.Count | Should Be 0
-        foreach ($iqn in @('iqn.test:two', 'iqn.test:two:az-eastus-az1')) {
-            $script:existing = @([pscustomobject]@{ TargetNodeAddress = $iqn })
-            { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one', 'two') 32 } | Should Throw 'existing target'
+    It 'refuses partial, undecorated and differently decorated state on any selected volume' {
+        foreach ($iqn in @('iqn.test:two:az-eastus-az3', 'iqn.test:two', 'iqn.test:two:az-eastus-az1')) {
+            $script:existing = @([pscustomobject]@{ TargetNodeAddress = $iqn; SessionIdentifier = '1-1' })
+            { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one', 'two') 32 } | Should Throw
             $script:nativeCalls.Count | Should Be 0
         }
     }
     It 'stops native failures and reports partial-progress recovery guidance' {
         $script:nativeExit = 5
-        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 2 } | Should Throw 'exit 5'
+        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32 } | Should Throw 'exit 5'
         $script:nativeCalls.Count | Should Be 1
         $script:nativeCalls.Clear()
         $script:nativeExit = 0
         $script:nativeOutput = 'The operation failed.'
-        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 2 } | Should Throw 'may remain'
+        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32 } | Should Throw 'may remain'
         $script:nativeCalls.Count | Should Be 1
     }
-
+    It 'finishes all DNS preflight before reading existing state or mutating' {
+        Mock Wait-ZonalDnsLookup {
+            if ($Lookup.HostName -eq 'two.example') { throw 'second volume DNS failed' }
+            '10.0.0.1'; '10.0.0.2'; 'fd00::1'
+        }
+        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one', 'two') 32 } | Should Throw 'second volume DNS failed'
+        $script:nativeCalls.Count | Should Be 0
+        Assert-MockCalled Get-IscsiSession -Scope It -Times 0 -Exactly
+    }
+    It 'fails closed on unavailable or malformed read-only inventory' {
+        Mock Get-ZonalPersistentLogins { throw 'native inventory unavailable' }
+        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32 } | Should Throw 'native inventory unavailable'
+        Mock Get-ZonalPersistentLogins { [pscustomobject]@{ Address = '10.0.0.1' } }
+        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32 } | Should Throw 'ambiguous target identity'
+        $script:nativeCalls.Count | Should Be 0
+    }
+    It 'waits for the first session and its persistence before submitting another login' {
+        $script:reads = 0
+        Mock Get-IscsiSession {
+            $script:reads++
+            if ($script:existing.Count) { $script:existing[-1].IsConnected = $script:reads -gt 2 }
+            $script:existing
+        }
+        Mock Get-ZonalPersistentLogins { if ($script:reads -ne 3) { $script:persistent } }
+        Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32
+        $script:nativeCalls.Count | Should Be 33
+        Assert-MockCalled Start-Sleep -Scope It -Times 2 -Exactly
+    }
+    It 'stops after five observations if a native-success login never appears' {
+        $script:simulateLogin = $false
+        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32 } | Should Throw 'not established'
+        $script:nativeCalls.Count | Should Be 2
+        Assert-MockCalled Get-IscsiSession -Scope It -Times 6 -Exactly
+        Assert-MockCalled Start-Sleep -Scope It -Times 4 -Exactly
+    }
+    It 'stops after five observations if the first session never becomes connected' {
+        Mock Get-IscsiSession {
+            foreach ($session in $script:existing) { $session.IsConnected = $false }
+            $script:existing
+        }
+        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32 } | Should Throw 'not established'
+        $script:nativeCalls.Count | Should Be 2
+        Assert-MockCalled Start-Sleep -Scope It -Times 4 -Exactly
+    }
+    It 'reports partial apply without rollback claims when later inventory fails' {
+        Mock Get-ZonalPersistentLogins {
+            if ($script:existing.Count -gt 1) { throw 'inventory read failed after login' }
+            $script:persistent
+        }
+        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32 } | Should Throw 'may remain'
+        $script:nativeCalls.Count | Should Be 3
+        @($script:nativeCalls | Where-Object { $_[0] -match 'Disconnect|Remove|Logout' }).Count | Should Be 0
+    }
+    It 'rejects terminal API failures even if a prior line reported success' {
+        $script:nativeOutput = "The operation completed successfully.`nThe operation failed."
+        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32 } | Should Throw 'unrecognized status'
+        $script:nativeCalls.Count | Should Be 1
+    }
+    It 'refuses an uncorrelated later run and skips only after complete native correlation' {
+        Mock Wait-ZonalDnsLookup { '10.0.0.3'; '10.0.0.2'; '10.0.0.1' }
+        Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32
+        $script:nativeCalls.Clear()
+        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32 } | Should Throw 'correlation'
+        $script:nativeCalls.Count | Should Be 0
+        for ($i = 0; $i -lt 32; $i++) { $script:persistent[$i].SessionIdentifier = $script:existing[$i].SessionIdentifier }
+        Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32
+        $script:nativeCalls.Count | Should Be 0
+    }
+    It 'never installs prerequisites or submits login when the initiator or MPIO is unavailable' {
+        Mock Get-Service { [pscustomobject]@{ Status = 'Stopped' } }
+        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32 } | Should Throw 'running iSCSI'
+        Mock Get-Service { [pscustomobject]@{ Status = 'Running' } }
+        Mock Get-WindowsFeature { [pscustomobject]@{ InstallState = 'Available' } }
+        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32 } | Should Throw 'already be installed'
+        $script:nativeCalls.Count | Should Be 0
+    }
+    It 'fails immediately on visible incompatible persistence even while a session is pending' {
+        Mock Get-IscsiSession {
+            foreach ($session in $script:existing) { $session.IsConnected = $false }
+            $script:existing
+        }
+        Mock Get-ZonalPersistentLogins {
+            foreach ($record in $script:persistent) { $record.Port = 3261 }
+            $script:persistent
+        }
+        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32 } | Should Throw 'incompatible'
+        $script:nativeCalls.Count | Should Be 2
+        Assert-MockCalled Start-Sleep -Scope It -Times 0 -Exactly
+    }
+    It 'refuses concurrent newly observed sessions without submitting another login' {
+        Mock Get-IscsiSession {
+            $script:existing
+            if ($script:existing.Count) {
+                [pscustomobject]@{ TargetNodeAddress = $script:existing[0].TargetNodeAddress; SessionIdentifier = '1-ff' }
+            }
+        }
+        { Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32 } | Should Throw 'Concurrent or ambiguous'
+        $script:nativeCalls.Count | Should Be 2
+    }
+    It 'preserves the service-provided non-default port for static and every persistent portal' {
+        Mock Invoke-ZonalProviderRequest {
+            switch ($Command) {
+                'Get-AzElasticSan' { [pscustomobject]@{ Location = $script:sanLocation } }
+                'Invoke-AzRestMethod' { [pscustomobject]@{ StatusCode = $script:armStatus; Content = $script:armContent } }
+                'Get-AzElasticSanVolumeGroup' { [pscustomobject]@{} }
+                'Get-AzElasticSanVolume' { [pscustomobject]@{
+                    StorageTargetIqn = 'iqn.test:one'; StorageTargetPortalHostname = 'one.example'; StorageTargetPortalPort = 3261
+                } }
+                default { throw "Unexpected provider request $Command" }
+            }
+        }
+        Connect-ZonalVolumes 'rg' 'san' 'vg' @('one') 32
+        $script:nativeCalls.Count | Should Be 33
+        foreach ($call in $script:nativeCalls) { $call[4] | Should Be '3261' }
+    }
 }
 
     foreach ($countCase in @(@{ Label = 'omitted default'; Count = $null; Expected = 32 },
-        @{ Label = 'explicit configurable'; Count = 2; Expected = 2 })) {
+        @{ Label = 'explicit 32'; Count = 32; Expected = 32 })) {
         Describe "Actual enabled entrypoint: $($countCase.Label) count" {
-            It 'maps both selected volumes before sending decorated IQNs through the FQDN' {
+            It 'maps both selected volumes before verifying 32 numeric-VIP logins per volume' {
                 $script:nativeCalls = New-Object 'System.Collections.Generic.List[object]'
                 $script:nativeExit = 0
                 $script:nativeOutput = 'The operation completed successfully.'
-                Mock Get-IscsiSession {}
+                $script:simulateLogin = $true
+                $script:existing = @(); $script:persistent = @()
+                Mock Get-IscsiSession { $script:existing }
+                Mock Get-IscsiConnection { [pscustomobject]@{ ConnectionIdentifier = 'connection'; TargetAddress = '10.20.30.40'; TargetPortNumber = 3260 } }
+                Mock Get-IscsiTarget {}
                 Mock Get-Service { [pscustomobject]@{ Status = 'Running' } }
                 Mock Get-WindowsFeature { [pscustomobject]@{ InstallState = 'Installed' } }
                 Mock Write-Host {}
                 Mock Get-AzContext {
                     # Install these after the file has defined the helpers. Each
                     # Describe owns one entrypoint invocation (Pester 3 mock scope).
+                    Mock Start-ZonalDnsLookup { [pscustomobject]@{} }
+                    Mock Wait-ZonalDnsLookup { 'fd00::1'; '10.0.0.2'; '10.0.0.1' }
+                    Mock Get-ZonalPersistentLogins { $script:persistent }
                     Mock Get-ZonalComputeMetadata {
                         [pscustomobject]@{ zone = '2'; subscriptionId = 'abcdef01-2345-6789-abcd-0123456789ab'; location = 'eastus' }
                     }
@@ -299,7 +442,8 @@ Describe 'Mapping-only orchestration' {
                 $script:nativeCalls.Count | Should Be (2 * ($countCase.Expected + 1))
                 $script:nativeCalls[1][1] | Should Be 'iqn.test:one:az-eastus-az3'
                 $script:nativeCalls[-1][1] | Should Be 'iqn.test:two:az-eastus-az3'
-                $script:nativeCalls[-1][3] | Should Be 'portal.example'
+                $script:nativeCalls[-1][3] | Should Be '10.0.0.2'
+                Assert-MockCalled Start-ZonalDnsLookup -Scope It -Times 1 -Exactly
             }
         }
     }
@@ -309,6 +453,7 @@ Describe 'Unchanged legacy block and golden commands' {
         $script:nativeCalls = New-Object 'System.Collections.Generic.List[object]'
         $script:nativeExit = 0
         $script:nativeOutput = 'The operation completed successfully.'
+        $script:simulateLogin = $false
         Mock Get-Service { [pscustomobject]@{ Status = 'Running' } }
         Mock Get-WindowsFeature { [pscustomobject]@{ InstallState = 'Installed' } }
         Mock Get-AzElasticSanVolumeGroup { [pscustomobject]@{} }

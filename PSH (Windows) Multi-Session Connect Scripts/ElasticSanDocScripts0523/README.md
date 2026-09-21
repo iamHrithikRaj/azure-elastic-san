@@ -1,10 +1,10 @@
-# Windows standalone zonal mapping
+# Windows standalone zonal mapping and VIP distribution
 
 `connect.ps1` remains an independently downloadable Azure PowerShell script.
 Without `-EnableZonalAffinity`, its original execution block, FQDN behavior,
 session-count handling and commands are unchanged.
 
-## Opt-in mapping
+## Opt-in mapping and distribution
 
 Use an existing authenticated Azure PowerShell context for the Elastic SAN
 subscription. The script does not log in, change the active subscription,
@@ -12,12 +12,13 @@ install modules, or introduce an Azure CLI dependency.
 
 ```powershell
 .\connect.ps1 -ResourceGroupName rg -ElasticSanName san -VolumeGroupName vg `
-    -VolumeName volume1,volume2 -NumSession 2 -EnableZonalAffinity
+    -VolumeName volume1,volume2 -EnableZonalAffinity
 ```
 
-Both modes support 1-32 sessions per volume; omitting the count selects 32.
-Mapping-only mode retains the target FQDN and port. It does not resolve VIPs,
-require exactly 32 sessions, or implement 11/11/10 distribution.
+The existing opt-in now requires **exactly 32 sessions per volume**; omitting
+`-NumSession` selects 32. Any other explicit enabled count fails before discovery
+or mutation. There is no second VIP switch. Disabled mode still supports 1-32
+sessions and retains its FQDN commands.
 
 Enabled mode reads the VM subscription, region and logical availability zone
 from IMDS with `Metadata: true`, proxy bypass, no redirects and a five-second
@@ -48,30 +49,67 @@ The opaque service identity is never silently lowercased, trimmed or rewritten.
 If the service returns a mixed-case/otherwise incompatible identity, the
 front-end identity contract must be resolved before enabling this mode.
 
-Every selected volume's mapping, IQN, FQDN and port is validated before any
-native mutation. Duplicate names or shared raw IQNs fail. A later volume's
-lookup or validation failure therefore cannot connect an earlier volume.
+Every selected volume's mapping, IQN, FQDN, port, DNS answer and session plan is
+validated before any native mutation. Duplicate names or shared raw IQNs fail.
+A later volume's lookup or validation failure cannot connect an earlier volume.
 The iSCSI initiator must already be running; multi-session use requires
 installed Multipath I/O. No service, feature or registry setup is performed.
 
+## DNS and allocation
+
+The host-local asynchronous .NET resolver gets at most three independent
+attempts, each with a five-second result-wait deadline, separated by one- and
+two-second delays. A late resolver task can finish in the background; its
+answer is discarded. Answers are never unioned across attempts, and there
+is no FQDN fallback. A successful answer is reused only within this invocation
+for volumes sharing the same hostname.
+
+Each answer must contain exactly three unique usable endpoints after IPv4-mapped
+IPv6 normalization and deduplication. IPv4 is dotted decimal; IPv6 is compressed
+lowercase hexadecimal. Invalid extras, scoped addresses, unspecified, loopback,
+multicast, link-local and broadcast addresses reject the entire answer. Private
+and public unicast addresses are allowed. IPv4 sorts before IPv6, then by
+unsigned packed network-order bytes, not address text.
+
+The sorted endpoints receive deterministic round-robin **11/11/10** session
+counts. The numeric original portal is supplied to every persistent login.
+IPv6 is unbracketed because the Windows command passes host and port separately.
+The service-provided port is preserved. DNS validation does not prove endpoint
+ownership, reachability, or backend support for the decorated IQN.
+
 ## Existing state and failures
 
-Mapping-only mode retains an existing-target skip, not VIP inventory or
-session-layout validation. An exact decorated live IQN is skipped, with an
-explicit warning that session count and persistence were not verified.
-An undecorated or differently decorated live target for any selected volume
-is refused before mutation; no migration, rebalance or disconnect is attempted.
-This layer cannot prove the absence of stale persistent-only entries.
-Operators must inspect and reconcile the selected targets' live and persistent
-state before enabling mapping or retrying. Do not run concurrent connection
-tools against the same targets.
+The whole batch's read-only existing-state preflight also finishes before
+`AddTarget` or the first login. The inline Windows
+[`ReportIScsiPersistentLoginsW`](https://learn.microsoft.com/windows/win32/api/iscsidsc/nf-iscsidsc-reportiscsipersistentloginsw)
+inventory reads original persistent portals and optional native session mappings.
+The script skips only a complete healthy 32-session layout with matching
+decorated IQN, persistent port, initiator, multipath/digest options, 11/11/10
+allocation and unique persistent-to-live session correlation. Empty state may
+be connected. Partial, stale, extra, incompatible, undecorated, differently
+decorated or ambiguous state refuses explicitly. There is no automatic repair,
+migration, disconnect or rebalance.
+
+A redirected **current endpoint is not proof of the original portal**. If the
+optional native SessionId mapping is absent or cannot be correlated uniquely,
+a later invocation refuses even when current endpoint counts appear correct.
+During a new connection only, each accepted request can instead be associated
+with the one newly observed live session. These original-portal observations
+exist only for that invocation; they are not persisted in another state file.
+Do not run concurrent connection tools against the same targets.
 
 New commands use the decorated IQN for both `AddTarget` and
-`PersistentLoginTarget`, retaining the existing initiator selection, multipath
+`PersistentLoginTarget`, retaining `Root\ISCSIPRT\0000_0`, the multipath
 login flag and digest arguments. Native process failures, API failures and
 unrecognized/localized terminal output stop execution. Successful English
-`iscsicli` status means the request was accepted, not that session readiness
-or persistence after reboot was independently established.
+`iscsicli` status means the request was accepted, not that a session is ready.
+Each login is followed by at most five readiness observations with four
+one-second sleeps; the next login is not submitted until the new live session,
+persistent state and all previously observed sessions satisfy the plan.
+Visible conflicting state fails instead of being treated as ordinary delay.
+This bounds polling, **not the duration of an individual Windows inventory or
+native CLI call**, which can block in the platform. Reboot persistence is not
+established by this check.
 
 Whole-batch preflight is **not a transaction**. After mutation begins, a failure
 can leave earlier sessions or persistent entries. Inspect `Get-IscsiSession`,
@@ -101,13 +139,16 @@ failure can leave some sessions or saved logins in place.
 From the repository root:
 
 ```powershell
-powershell.exe -NoProfile -NonInteractive -Command "Invoke-Pester -Script '.\PSH (Windows) Multi-Session Connect Scripts\ElasticSanDocScripts0523\connect.Tests.ps1','.\PSH (Windows) Multi-Session Connect Scripts\ElasticSanDocScripts0523\disconnect.Tests.ps1' -EnableExit"
+powershell.exe -NoProfile -NonInteractive -Command "Invoke-Pester -Script '.\PSH (Windows) Multi-Session Connect Scripts\ElasticSanDocScripts0523' -EnableExit"
 ```
 
-The Pester suite uses inline Windows-owned data, mocks Azure/native boundaries,
-and exercises the actual entrypoint, cooperative and non-cooperative local
-provider-timeout pipelines, and deferred cleanup. It needs no Azure access or
-native iSCSI mutation. The original
+The Pester suites use inline Windows-owned data and mock IMDS, DNS, Azure and
+native boundaries. They exercise the actual entrypoint, canonicalization and
+retry/deadline behavior, batch refusal, 11/11/10 commands, persistent/session
+proof, pending readiness, native errors, cooperative and non-cooperative local
+provider-timeout pipelines, and deferred cleanup. The inline C# ABI is compiled
+and decoded from synthetic memory without invoking the DLL. Tests need no
+Azure access or native iSCSI mutation. The original
 execution block is pinned by an LF-normalized SHA-256 fingerprint from upstream
 `c0e39eedc46456e0f68b92d9f52f5177b5e42a60`, with literal golden native argv cases.
 
@@ -126,5 +167,12 @@ source commit `d6e8d4822a3d0aa7dac8b7794ebb9c74862ac108`
 The source `connect.ps1`, `connect.Tests.ps1` and Windows-relevant documentation
 were split by concern, not cherry-picked unchanged. Complete-IQN validation,
 duplicate-region/physical-zone rejection and bounded provider execution are
-strengthened here. VIP DNS/allocation, persistent-login interop and exact-layout
-orchestration are deliberately deferred to Windows VIP layer 39689652.
+strengthened in that parent layer.
+
+Windows VIP layer **ADO 39689652** reconstructs the same source's Windows-only
+`ConvertTo-ZonalAddress` through `Test-ZonalLayout` helpers, numeric-portal
+orchestration and corresponding tests/documentation. It preserves mapping
+parent `a17ed6779163396298b87851edbaa202682c6697` and its provider bounds.
+The mixed-OS source history is not imported; this is a concern-specific
+adaptation, not an unchanged cherry-pick. Whole-batch input checks and the
+legacy execution block remain intact.
