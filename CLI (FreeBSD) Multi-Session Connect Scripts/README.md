@@ -299,9 +299,13 @@ managed block of `/etc/iscsi.conf`.
 A skipped volume's state is reported by validation as `[WARN]`, because this
 script never disconnects or rewrites existing sessions. Stanzas outside the
 managed block are not inspected: a hand-written stanza for the same IQN
-elsewhere in `/etc/iscsi.conf` is not detected. Selecting the same volume
-twice in one run (for example `-n vol1 VOL1`, which resolve to the same IQN)
-is rejected during planning, before any change.
+elsewhere in `/etc/iscsi.conf` is not detected.
+
+A volume selected more than once in one run (for example `-n vol1 VOL1`,
+which resolve to the same IQN in any case) is planned and connected once: the
+first occurrence is kept, and each later one prints
+`<volume> [<iqn>]: Ignored duplicate selection; the same target is already planned as '<first>'`.
+This also applies to `--dry-run`.
 
 For a volume being connected, the script submits exactly
 `iscsictl -A -n <nickname> -c /etc/iscsi.conf` (without `-w`), then polls

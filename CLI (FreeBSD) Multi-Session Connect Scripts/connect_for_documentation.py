@@ -1349,14 +1349,15 @@ def build_connection_plan(
 
         target_name = validate_config_scalar(target_iqn, "Target IQN for '{}'".format(volume_name))
         target_address = format_target_address(target_hostname, target_port, volume_name)
-        # Resource names are case-insensitive, so one volume selected twice with
-        # different casing would otherwise get two nicknames and two stanzas.
+        # Resource names are case-insensitive, so one volume selected twice (in any
+        # case) is planned once; a second plan would add a second stanza and session.
         previous_volume = iqn_owners.get(target_name.lower())
         if previous_volume is not None:
-            raise ElasticSanConnectError(
-                "Volumes '{}' and '{}' resolve to the same target IQN '{}'; select each volume "
-                "only once".format(previous_volume, volume_name, target_name)
+            print(
+                "{} [{}]: Ignored duplicate selection; the same target is already planned as "
+                "'{}'".format(volume_name, target_name, previous_volume)
             )
+            continue
         iqn_owners[target_name.lower()] = volume_name
         nicknames = [
             build_nickname(volume_group_name, volume_name, target_name, session_index)
@@ -1426,7 +1427,7 @@ def plan_volume_action(plan, managed_entries, sessions, config_path):
     single configured session). This keeps reruns from ever creating a second
     stanza or session for an IQN, even when a later run selects the same volume
     with differently cased names (which hash to a different nickname).
-    Selecting one volume twice in the same run is rejected by
+    A volume selected more than once in the same run is planned once by
     build_connection_plan.
     """
     live_sessions = sessions_for_target(sessions, plan.target_name)

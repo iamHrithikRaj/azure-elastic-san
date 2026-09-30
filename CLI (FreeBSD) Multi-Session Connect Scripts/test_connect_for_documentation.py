@@ -1560,17 +1560,31 @@ class BuildConnectionPlanTests(unittest.TestCase):
                         None, "rg", "san", "vg", ["volume1", "volume2"], 1
                     )
 
-    def test_same_volume_selected_twice_with_different_case_is_rejected(self):
+    def test_volume_selected_more_than_once_in_any_case_is_planned_once(self):
         with mock.patch.object(
             connect,
             "get_volume_storage_target",
-            return_value=("iqn.example:vol1", "portal.example", 3260),
+            side_effect=[
+                ("iqn.example:vol1", "portal.example", 3260),
+                ("iqn.example:vol2", "portal.example", 3260),
+                ("IQN.EXAMPLE:VOL1", "portal.example", 3260),
+                ("iqn.example:vol1", "portal.example", 3260),
+            ],
         ):
-            with self.assertRaisesRegex(
-                connect.ElasticSanConnectError,
-                "Volumes 'vol1' and 'VOL1' resolve to the same target IQN",
-            ):
-                connect.build_connection_plan(None, "rg", "san", "vg", ["vol1", "VOL1"], 1)
+            with mock.patch("builtins.print") as print_mock:
+                plans = connect.build_connection_plan(
+                    None, "rg", "san", "vg", ["vol1", "vol2", "VOL1", "vol1"], 1
+                )
+        self.assertEqual(["vol1", "vol2"], [plan.volume_name for plan in plans])
+        self.assertEqual(
+            [
+                "VOL1 [IQN.EXAMPLE:VOL1]: Ignored duplicate selection; the same target is "
+                "already planned as 'vol1'",
+                "vol1 [iqn.example:vol1]: Ignored duplicate selection; the same target is "
+                "already planned as 'vol1'",
+            ],
+            [call.args[0] for call in print_mock.call_args_list],
+        )
 
 
 class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
