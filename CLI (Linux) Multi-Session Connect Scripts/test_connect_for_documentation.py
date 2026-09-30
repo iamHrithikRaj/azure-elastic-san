@@ -466,7 +466,7 @@ class ZonalAffinityTests(unittest.TestCase):
         resolve_physical_zone.assert_not_called()
         check.assert_called_once_with("iqn.original", "portal.example", 3260)
         connect_volume.assert_called_once_with(
-            "volume1", "iqn.original", "portal.example", 3260, 4
+            "volume1", "iqn.original", [("portal.example", 4)], 3260
         )
 
     def test_opt_in_uses_decorated_iqn_for_connection_commands(self):
@@ -478,20 +478,19 @@ class ZonalAffinityTests(unittest.TestCase):
                 "get_mapped_volume_target",
                 return_value=("iqn.original", "portal.example", 3260),
             ) as get_target:
-                with mock.patch.object(connect, "_lookup_target_addresses", return_value=["10.0.0.1", "10.0.0.2", "10.0.0.3"]):
-                    with mock.patch.object(connect, "_preflight_zonal_state", return_value=[False]) as check:
-                        with mock.patch.object(connect, "connect_zonal_volume") as connect_volume:
-                            connect.connect_volumes(
-                                "sub", "rg", "san", "vg", ["volume1"], 32, True
-                            )
+                with mock.patch.object(connect, "check_connection", return_value=False) as check:
+                    with mock.patch.object(connect, "connect_volume") as connect_volume:
+                        connect.connect_volumes(
+                            "sub", "rg", "san", "vg", ["volume1"], 4, True
+                        )
 
         decorated_iqn = "iqn.original:az-eastus-az3"
         resolve_context.assert_called_once_with("sub", "rg", "san")
         get_target.assert_called_once_with("sub-id", "rg", "san", "vg", "volume1")
-        self.assertEqual(2, check.call_count)
-        connect_volume.assert_called_once()
-        self.assertEqual(decorated_iqn, connect_volume.call_args.args[0]["iqn"])
-        self.assertEqual(32, len(connect_volume.call_args.args[0]["slots"]))
+        check.assert_called_once_with(decorated_iqn, "portal.example", 3260)
+        connect_volume.assert_called_once_with(
+            "volume1", decorated_iqn, [("portal.example", 4)], 3260
+        )
 
     def test_full_iqn_rejects_unsafe_identity_without_rewriting(self):
         for iqn in (
@@ -675,29 +674,29 @@ class ZonalAffinityTests(unittest.TestCase):
 
         def check(*args):
             events.append(("check", args))
-            return [False] * len(args[0])
+            return False
 
         def mutate(*args):
             events.append(("connect", args))
 
         with mock.patch.object(connect, "get_vm_compute_metadata", return_value=compute):
             with mock.patch.object(connect.subprocess, "Popen", side_effect=popen):
-                with mock.patch.object(connect, "_preflight_zonal_state", side_effect=check):
-                    with mock.patch.object(connect, "connect_zonal_volume", side_effect=mutate):
+                with mock.patch.object(connect, "check_connection", side_effect=check):
+                    with mock.patch.object(connect, "connect_volume", side_effect=mutate):
                         with mock.patch.object(connect, "get_iqns") as legacy_lookup:
-                            with mock.patch.object(connect, "_lookup_target_addresses", return_value=["10.0.0.1", "10.0.0.2", "10.0.0.3"]):
-                                connect.connect_volumes(None, "rg", "san", "vg", ["first", "second"], 32, True)
+                            connect.connect_volumes(None, "rg", "san", "vg", ["first", "second"], 4, True)
 
         legacy_lookup.assert_not_called()
         self.assertEqual(
-            ["az", "az", "az", "az", "az", "check", "check", "connect", "check", "connect"],
+            ["az", "az", "az", "az", "az", "check", "connect", "check", "connect"],
             [event[0] for event in events],
         )
         for command in (events[3][1], events[4][1]):
             self.assertEqual(subscription_id, command[command.index("--subscription") + 1])
-        plan = events[-1][1][0]
-        self.assertEqual(("second", "iqn.second:az-eastus-az3", "second.example", 3261),
-                         (plan["volume"], plan["iqn"], plan["hostname"], plan["port"]))
+        self.assertEqual(
+            ("second", "iqn.second:az-eastus-az3", [("second.example", 4)], 3261),
+            events[-1][1],
+        )
 
     def test_later_volume_failure_prevents_all_native_calls(self):
         failures = [
@@ -715,11 +714,11 @@ class ZonalAffinityTests(unittest.TestCase):
                         connect, "get_mapped_volume_target",
                         side_effect=[("iqn.first", "first.example", 3260), failure],
                     ) as lookup:
-                        with mock.patch.object(connect, "_preflight_zonal_state") as check:
-                            with mock.patch.object(connect, "connect_zonal_volume") as mutate:
+                        with mock.patch.object(connect, "check_connection") as check:
+                            with mock.patch.object(connect, "connect_volume") as mutate:
                                 with self.assertRaises(connect.ZonalAffinityError):
                                     connect.connect_volumes(
-                                        None, "rg", "san", "vg", ["first", "second"], 32, True
+                                        None, "rg", "san", "vg", ["first", "second"], 4, True
                                     )
                 self.assertEqual(2, lookup.call_count)
                 check.assert_not_called()
@@ -731,10 +730,10 @@ class ZonalAffinityTests(unittest.TestCase):
             side_effect=connect.ZonalAffinityError("mapping failed"),
         ):
             with mock.patch.object(connect, "get_mapped_volume_target") as lookup:
-                with mock.patch.object(connect, "_preflight_zonal_state") as check:
-                    with mock.patch.object(connect, "connect_zonal_volume") as mutate:
+                with mock.patch.object(connect, "check_connection") as check:
+                    with mock.patch.object(connect, "connect_volume") as mutate:
                         with self.assertRaisesRegex(connect.ZonalAffinityError, "mapping failed"):
-                            connect.connect_volumes(None, "rg", "san", "vg", ["first"], 32, True)
+                            connect.connect_volumes(None, "rg", "san", "vg", ["first"], 4, True)
         lookup.assert_not_called()
         check.assert_not_called()
         mutate.assert_not_called()
@@ -803,12 +802,13 @@ class ZonalAffinityTests(unittest.TestCase):
             events,
         )
         self.assertEqual(
-            "first [IQN.first]: Skipped as this volume is already connected\n", output.getvalue()
+            "first [IQN.first]: already configured; run disconnect_for_documentation.py first to change the layout\n",
+            output.getvalue(),
         )
 
     def test_entrypoint_preserves_configurable_count_and_opt_out_defaults(self):
         for enabled in (False, True):
-            cases = ((None, 32), ("32", 32)) if enabled else ((None, 32), ("4", 4), ("64", 32))
+            cases = ((None, 32), ("4", 4), ("64", 32))
             for count, expected in cases:
                 with self.subTest(enabled=enabled, count=count):
                     events = []
@@ -822,7 +822,7 @@ class ZonalAffinityTests(unittest.TestCase):
                             with mock.patch.object(connect, "connect_volumes") as run:
                                 connect.main(args)
                     self.assertEqual(["iscsi", "mpio"], events)
-                    run.assert_called_once_with("sub", "rg", "san", "vg", ["volume"], expected, enabled)
+                    run.assert_called_once_with("sub", "rg", "san", "vg", ["volume"], expected, enabled, False)
 
     def test_enabled_entrypoint_rejects_later_iqn_before_native_inventory_or_connect(self):
         args = [
@@ -839,8 +839,8 @@ class ZonalAffinityTests(unittest.TestCase):
                         ("iqn.first", "first.example", 3260),
                         ("IQN.second", "second.example", 3260),
                     ]) as lookup:
-                        with mock.patch.object(connect, "_preflight_zonal_state") as inventory:
-                            with mock.patch.object(connect, "connect_zonal_volume") as mutate:
+                        with mock.patch.object(connect, "check_connection") as inventory:
+                            with mock.patch.object(connect, "connect_volume") as mutate:
                                 with self.assertRaises(connect.ZonalAffinityError):
                                     connect.main(args)
         # Existing package-manager prerequisites are read-only and stay in place.
@@ -860,13 +860,14 @@ class ConnectorRegressionTests(unittest.TestCase):
                 def launch(command, **kwargs):
                     commands.append(command)
                     process = mock.Mock(returncode=0)
-                    output = b"tcp: [17] portal.example:3260,-1 iqn.original\n"
+                    output = (b"tcp: [17] 192.0.2.50:3260,7 iqn.original\n"
+                              if any("--login" in c for c in commands) else b"")
                     process.communicate.return_value = (output, b"")
                     return process
 
                 with mock.patch.object(connect.subprocess, "Popen", side_effect=launch):
                     with mock.patch("builtins.print"):
-                        connect.connect_volume("volume", "iqn.original", "portal.example", 3260, count)
+                        connect.connect_volume("volume", "iqn.original", [("portal.example", count)], 3260)
                 clones = [c for c in commands if c[2:4] == ["-m", "session"] and "-r" in c]
                 self.assertEqual(count - 1, len(clones))
                 for digest in ("HeaderDigest", "DataDigest"):
@@ -876,7 +877,8 @@ class ConnectorRegressionTests(unittest.TestCase):
                         "-n", "node.conn[0].iscsi." + digest, "-v", "CRC32C",
                     ], commands)
                 persisted = [c for c in commands if "node.session.nr_sessions" in c]
-                self.assertEqual([str(count)], [c[-1] for c in persisted])
+                self.assertEqual("1", persisted[0][-1])
+                self.assertEqual(str(count), persisted[-1][-1])
 
 
 if __name__ == "__main__":
