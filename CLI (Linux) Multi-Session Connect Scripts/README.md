@@ -3,8 +3,9 @@
 ADO **39557586** adds opt-in logical-to-physical zone mapping to the standalone
 Linux connect script. This layer still connects through the volume's **FQDN**
 and retains the existing configurable session count (default 32, capped at 32).
-It does not resolve or allocate VIPs, require exactly 32 sessions, change
-disconnect scripts, or modify portal-generated scripts.
+Connect does not resolve or allocate VIPs, require exactly 32 sessions, or modify
+portal-generated scripts. The Linux disconnect script also cleans up zonal
+targets and node records across FQDN or IP portals.
 
 **This is a mapping proof of concept, not a production-ready native connector.**
 The Elastic SAN front end must understand and strip the provisional IQN suffix
@@ -92,10 +93,6 @@ target's live and persistent state using read-only, target-scoped procedures
 before retrying; never bulk logout or delete on a shared host. Avoid concurrent
 connection/configuration tools for the same target.
 
-Existing disconnect scripts do not reliably handle decorated IQNs. Turning
-off the opt-in does not clean up sessions. Cleanup and migration need a
-separately approved operator procedure or follow-up implementation.
-
 The dependent Linux VIP layer (ADO **39689656**) will own DNS normalization,
 three-endpoint allocation, exact-32 sessions, and supported native inventory.
 None of that behavior is included here. FE suffix support, real Linux
@@ -103,12 +100,27 @@ multi-session behavior, persistent reconnection after reboot, redirects,
 dual-stack/backend compatibility, zone failure, and recovery-time qualification
 remain rollout gates. Mocked unit tests cannot establish those properties.
 
+## Disconnect
+
+Quiesce I/O and unmount the selected volumes before explicitly running
+`disconnect_for_documentation.py` with its existing subscription/resource/volume
+arguments. No zonal parameter is needed: it discovers both persistent node
+records and live sessions, selecting the exact volume IQN and every target
+starting with `<volume-IQN>:az-`. Each matching name is logged out and its node
+records deleted **across all portals**, including FQDNs, VIP IPs, and old zones.
+This removes automatic-startup records even when no sessions are active; other
+target names are left alone. An empty inventory is harmless, while native
+errors stop cleanup and can leave partial state. Inspect the selected targets
+before retrying, and do not run concurrent connection tools. Turning off the
+connect opt-in alone still does not clean up anything. Native disconnect and
+reboot behavior require authorized Linux qualification.
+
 ## Offline tests
 
 Run only this OS suite from the repository root:
 
 ```powershell
-python -B -W error::ResourceWarning -m unittest discover -s '.\CLI (Linux) Multi-Session Connect Scripts' -p test_connect_for_documentation.py -v
+python -B -W error::ResourceWarning -m unittest discover -s '.\CLI (Linux) Multi-Session Connect Scripts' -p 'test_*connect_for_documentation.py' -v
 ```
 
 The suite keeps the 23 historical mapping cases and adds focused full-IQN,
@@ -117,6 +129,8 @@ and opt-out ordering/count regressions. Azure discovery and all native mutation
 boundaries are mocked; subprocess lifecycle cases use harmless local Python
 processes as well as mocks. No live Azure resources, root privileges, DNS/VIP
 fixtures, or another OS suite are required.
+Disconnect cases mock subprocesses to cover plain/zonal target matching,
+multiple portals, inactive persistent records, unrelated targets, and failures.
 
 ## Provenance
 
