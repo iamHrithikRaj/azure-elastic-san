@@ -492,14 +492,15 @@ function Get-EsanIscsiRegistryRecommendation {
 }
 
 function Find-EsanIscsiInitiatorKey {
-    # The instance number (0000, 0004, ...) differs between machines, so find it by driver description
-    # instead of hard-coding it.
+    # The instance number (0000, 0004, ...) differs between machines, so find the key by device instead
+    # of hard-coding it. MatchingDeviceId is locale-independent; DriverDesc can be translated.
     $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e97b-e325-11ce-bfc1-08002be10318}'
-    foreach ($key in @(Get-ChildItem -LiteralPath $classKey -ErrorAction SilentlyContinue)) {
+    $keys = foreach ($key in @(Get-ChildItem -LiteralPath $classKey -ErrorAction SilentlyContinue)) {
         # Some subkeys, such as Properties, deny reads even to administrators.
-        $description = (Get-ItemProperty -LiteralPath $key.PSPath -Name DriverDesc -ErrorAction SilentlyContinue).DriverDesc
-        if ($description -eq 'Microsoft iSCSI Initiator') { $key.PSPath }
+        $values = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+        if ($values.MatchingDeviceId -eq 'root\iscsiprt' -or $values.DriverDesc -eq 'Microsoft iSCSI Initiator') { $key.PSPath }
     }
+    @($keys) | Sort-Object -Unique
 }
 
 function Set-EsanRecommendedSettings([bool]$MpioActive) {
@@ -517,7 +518,7 @@ function Set-EsanRecommendedSettings([bool]$MpioActive) {
     }
     $keys = @(Find-EsanIscsiInitiatorKey)
     if ($keys.Count -ne 1) {
-        Write-Host "Warning: found $($keys.Count) 'Microsoft iSCSI Initiator' registry instances instead of 1. Skipped the recommended iSCSI initiator registry values." -ForegroundColor Yellow
+        Write-Host "Warning: found $($keys.Count) iSCSI initiator registry instances instead of 1. Skipped the recommended iSCSI initiator registry values." -ForegroundColor Yellow
         return
     }
     $parameters = Join-Path $keys[0] 'Parameters'
@@ -661,7 +662,7 @@ function Test-EsanConnection($Plan, [string]$Edition, [int]$SessionCount, [bool]
             }
             $keys = @(Find-EsanIscsiInitiatorKey)
             if ($keys.Count -ne 1) {
-                New-EsanCheck 'WARN' 'iSCSI initiator registry' "found $($keys.Count) 'Microsoft iSCSI Initiator' instances instead of 1; values not checked"
+                New-EsanCheck 'WARN' 'iSCSI initiator registry' "found $($keys.Count) iSCSI initiator instances instead of 1; values not checked"
             } else {
                 $current = Get-ItemProperty -LiteralPath (Join-Path $keys[0] 'Parameters') -ErrorAction Stop
                 $recommended = Get-EsanIscsiRegistryRecommendation

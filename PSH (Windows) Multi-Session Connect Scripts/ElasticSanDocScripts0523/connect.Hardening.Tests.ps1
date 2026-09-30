@@ -122,18 +122,55 @@ Describe 'connect.ps1 contract' {
 }
 
 Describe 'Find-EsanIscsiInitiatorKey' {
-    It 'finds the instance by DriverDesc instead of assuming 0004, ignoring unreadable subkeys' {
-        Mock Get-ChildItem {
-            foreach ($name in 'Properties', '0000', '0003', '0007') { [pscustomobject]@{ PSPath = "Registry::HKLM\Class\$name" } }
-        }
+    # Fake class subkeys: name -> registry values. A name without an entry is unreadable, like Properties.
+    BeforeEach {
+        $script:hostLines = New-Object 'System.Collections.Generic.List[string]'
+        $script:classKeyNames = @()
+        $script:classKeys = @{}
+        Mock Write-Host { $script:hostLines.Add("$Object") }
+        Mock Get-ChildItem { foreach ($name in $script:classKeyNames) { [pscustomobject]@{ PSPath = "Registry::HKLM\Class\$name" } } }
         Mock Get-ItemProperty {
-            switch -Wildcard ($LiteralPath) {
-                '*\Properties' { }
-                '*\0003' { [pscustomobject]@{ DriverDesc = 'Microsoft iSCSI Initiator' } }
-                default { [pscustomobject]@{ DriverDesc = 'Storage Spaces Controller' } }
-            }
+            if ($LiteralPath -like '*\Parameters') { return New-Object psobject -Property @{ MaxTransferLength = 65536 } }
+            $values = $script:classKeys[($LiteralPath -split '\\')[-1]]
+            if ($values) { New-Object psobject -Property $values }
+        }
+        Mock New-ItemProperty {}
+    }
+
+    It 'selects the initiator by MatchingDeviceId when DriverDesc is localized, ignoring unreadable subkeys' {
+        $script:classKeyNames = @('Properties', '0000', '0003')
+        $script:classKeys = @{
+            '0000' = @{ DriverDesc = 'Storage Spaces Controller'; MatchingDeviceId = 'root\spaceport' }
+            '0003' = @{ DriverDesc = 'Initiateur iSCSI Microsoft'; MatchingDeviceId = 'ROOT\ISCSIPRT' }
         }
         @(Find-EsanIscsiInitiatorKey) -join ',' | Should Be 'Registry::HKLM\Class\0003'
+    }
+
+    It 'selects the initiator by DriverDesc when MatchingDeviceId is missing' {
+        $script:classKeyNames = @('0000', '0007')
+        $script:classKeys = @{
+            '0000' = @{ DriverDesc = 'Storage Spaces Controller' }
+            '0007' = @{ DriverDesc = 'Microsoft iSCSI Initiator' }
+        }
+        @(Find-EsanIscsiInitiatorKey) -join ',' | Should Be 'Registry::HKLM\Class\0007'
+    }
+
+    It 'collapses duplicate matches of one key and applies the registry values to it' {
+        $script:classKeyNames = @('0004', '0004')
+        $script:classKeys = @{ '0004' = @{ DriverDesc = 'Microsoft iSCSI Initiator'; MatchingDeviceId = 'root\iscsiprt' } }
+        @(Set-EsanRecommendedSettings -MpioActive $false).Count | Should Be 8
+        Assert-MockCalled New-ItemProperty -Times 8 -Exactly -Scope It -ParameterFilter { $LiteralPath -eq 'Registry::HKLM\Class\0004\Parameters' }
+    }
+
+    It 'warns and skips the registry values when two different keys match' {
+        $script:classKeyNames = @('0002', '0004')
+        $script:classKeys = @{
+            '0002' = @{ DriverDesc = 'Initiateur iSCSI Microsoft'; MatchingDeviceId = 'ROOT\ISCSIPRT' }
+            '0004' = @{ DriverDesc = 'Microsoft iSCSI Initiator' }
+        }
+        @(Set-EsanRecommendedSettings -MpioActive $false).Count | Should Be 0
+        $script:hostLines -join "`n" | Should Match 'Warning: found 2 iSCSI initiator registry instances instead of 1\. Skipped'
+        Assert-MockCalled New-ItemProperty -Times 0 -Exactly -Scope It
     }
 }
 
@@ -320,7 +357,7 @@ Describe 'Hardened default flow' {
                 $script:initiatorKeys = $keys
                 $script:registry.MaxTransferLength = 65536
                 Invoke-TestConnect
-                Get-TestOutput | Should Match "Warning: found $($keys.Count) 'Microsoft iSCSI Initiator' registry instances instead of 1"
+                Get-TestOutput | Should Match "Warning: found $($keys.Count) iSCSI initiator registry instances instead of 1"
                 Get-TestOutput | Should Match '\[WARN\] iSCSI initiator registry'
             }
             Assert-MockCalled New-ItemProperty -Times 0 -Exactly -Scope It
