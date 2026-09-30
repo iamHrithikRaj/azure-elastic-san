@@ -1,7 +1,8 @@
-# Behavior tests for the hardened default flow of connect.ps1 (ADO Task 39929094).
+# Behavior tests for the hardened connect.ps1 flow (ADO Task 39929094): the shared host preparation,
+# existing-state policy, validation and reboot notice for every connect mode.
 # Written for Pester 3.4, the version that ships with Windows:
 #   Invoke-Pester -Path .\connect.Hardening.Tests.ps1
-# The script itself never runs. Only its *-Esan* functions are loaded, and every host command they use is
+# The script itself never runs. Only its functions are loaded, and every host command they use is
 # replaced by a stub that throws unless a test mocks it, so nothing on the test machine is read or changed.
 
 $connectPath = Join-Path $PSScriptRoot 'connect.ps1'
@@ -9,11 +10,12 @@ $tokens = $null
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($connectPath, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($definition in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -like '*-Esan*' }, $false)) {
+foreach ($definition in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -match '-' }, $false)) {
     . ([scriptblock]::Create($definition.Extent.Text))
 }
 
 function Stop-UnmockedCall([string]$Name) { throw "Unmocked host command '$Name' was called." }
+function Get-AzContext { [CmdletBinding()] param() Stop-UnmockedCall $MyInvocation.MyCommand.Name }
 function Get-AzElasticSanVolumeGroup { [CmdletBinding()] param($ResourceGroupName, $ElasticSanName, $Name) Stop-UnmockedCall $MyInvocation.MyCommand.Name }
 function Get-AzElasticSanVolume { [CmdletBinding()] param($ResourceGroupName, $ElasticSanName, $VolumeGroupName, $Name) Stop-UnmockedCall $MyInvocation.MyCommand.Name }
 function Get-CimInstance { [CmdletBinding()] param($Namespace, $ClassName) Stop-UnmockedCall $MyInvocation.MyCommand.Name }
@@ -34,13 +36,13 @@ function Get-IscsiSession { [CmdletBinding()] param() Stop-UnmockedCall $MyInvoc
 function Get-ItemProperty { [CmdletBinding()] param($LiteralPath, $Name) Stop-UnmockedCall $MyInvocation.MyCommand.Name }
 function New-ItemProperty { [CmdletBinding()] param($LiteralPath, $Name, $Value, $PropertyType, [switch]$Force) Stop-UnmockedCall $MyInvocation.MyCommand.Name }
 
-# Records every iscsicli call. A PersistentLoginTarget creates one live, persistent session, as the real
-# command does, so validation sees the result of the connect step.
+# Records every iscsicli call. A PersistentLoginTarget saves one persistent login and, unless a test turns
+# it off, also creates one live session, so validation sees the result of the connect step.
 function iscsicli {
     $script:nativeCalls.Add(@($args))
     if ($args[0] -eq 'PersistentLoginTarget' -and $script:createdSessions -lt $script:maxNewSessions) {
         $script:createdSessions++
-        $script:sessions += New-TestSession ([string]$args[1]) -Digest $script:newSessionDigest
+        if ($script:createLiveSessions) { $script:sessions += New-TestSession ([string]$args[1]) -Digest $script:newSessionDigest }
         $script:persistent += [pscustomobject]@{ TargetName = [string]$args[1] }
     }
 }
@@ -86,6 +88,7 @@ function Reset-TestHost {
     $script:persistentError = $false
     $script:maxNewSessions = [int]::MaxValue
     $script:createdSessions = 0
+    $script:createLiveSessions = $true
     $script:newSessionDigest = $true
 }
 
@@ -112,6 +115,14 @@ Describe 'connect.ps1 contract' {
         $range = $numSession.Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateRangeAttribute] }
         "$($range.MinRange)-$($range.MaxRange)" | Should Be '1-32'
         $parameters['SkipRecommendedSettings'].SwitchParameter | Should Be $true
+    }
+
+    It 'passes every script parameter to the single entry call' {
+        $entry = @($ast.EndBlock.Statements)[-1].PipelineElements[0]
+        $entry.GetCommandName() | Should Be 'Invoke-EsanConnect'
+        $passed = @($entry.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] } | ForEach-Object { $_.ParameterName }) | Sort-Object
+        $declared = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath }) | Sort-Object
+        $passed -join ',' | Should Be ($declared -join ',')
     }
 
     It 'documents -SkipRecommendedSettings in comment-based help' {
@@ -327,7 +338,7 @@ Describe 'Hardened default flow' {
             Assert-MockCalled New-ItemProperty -Times 1 -Exactly -Scope It -ParameterFilter {
                 $Name -eq 'MaxTransferLength' -and $Value -eq 262144 -and $PropertyType -eq 'DWord' -and $LiteralPath -like '*\0004\Parameters'
             }
-            $script:hostLines[-1] | Should Match '^Reboot required: changed MPIO disk timeout, MaxTransferLength, LinkDownTime\.'
+            $script:hostLines[-1] | Should Match '^Reboot required: changed MPIO disk timeout, MaxTransferLength, LinkDownTime, which take effect only after the VM restarts\.$'
         }
 
         It 'changes nothing and prints no reboot notice when every value already matches' {
@@ -438,15 +449,26 @@ Describe 'Hardened default flow' {
             $script:hostLines[-1] | Should Be 'Validation: 9 passed, 0 warnings, 0 failed'
         }
 
-        It 'fails when a volume connected in this run is short of sessions or digests' {
+        It 'fails when a volume connected in this run is short of persistent logins or digests' {
             $script:maxNewSessions = 30
-            { Invoke-TestConnect } | Should Throw 'Validation failed: 2 check(s) failed'
-            Get-TestOutput | Should Match '\[FAIL\] vol1 \[\S+\] live sessions: 30 of 32 requested'
+            { Invoke-TestConnect } | Should Throw 'Validation failed: 1 check(s) failed'
+            Get-TestOutput | Should Match '\[FAIL\] vol1 \[\S+\] persistent logins: 30 of 32 requested'
+            Get-TestOutput | Should Match '\[WARN\] vol1 \[\S+\] live sessions: 30 of 32 requested; the saved persistent logins establish the rest at boot'
 
             Reset-TestHost
             $script:newSessionDigest = $false
             { Invoke-TestConnect } | Should Throw 'Validation failed: 1 check(s) failed'
             Get-TestOutput | Should Match '\[FAIL\] vol1 \[\S+\] session state: 32 of 32 sessions'
+        }
+
+        It 'treats saved persistent logins without live sessions as pending until the reboot' {
+            $script:createLiveSessions = $false
+            Invoke-TestConnect
+            $output = Get-TestOutput
+            $output | Should Match '\[WARN\] vol1 \[\S+\] live sessions: 0 of 32 requested; the saved persistent logins establish the rest at boot'
+            $output | Should Match '\[PASS\] vol1 \[\S+\] persistent logins: 32 of 32 requested'
+            $output | Should Not Match 'session state'
+            $script:hostLines[-1] | Should Be 'Reboot required: the saved persistent logins for vol1 establish their sessions at boot.'
         }
 
         It 'reports pre-existing mismatches and extra sessions on skipped volumes as warnings only' {
@@ -459,6 +481,72 @@ Describe 'Hardened default flow' {
             $output | Should Match '\[WARN\] v-old \[\S+\] live sessions: 8 of 32 requested'
             $output | Should Match '\[WARN\] v-extra \[\S+\] persistent logins: 40 of 32 requested'
             $script:hostLines[-1] | Should Match 'Validation: \d+ passed, 4 warnings, 0 failed'
+        }
+    }
+
+    Context 'Zonal and VIP modes: entry routing' {
+        It 'routes both switches through the shared steps and validates the IQN each mode connected' {
+            $script:modeCalls = New-Object 'System.Collections.Generic.List[object]'
+            Mock Connect-ElasticSanVolumes {
+                $script:modeCalls.Add([pscustomobject]@{ Count = $SessionCount; Zonal = [bool]$ZonalAffinity; Vip = [bool]$VipDistribution; Edition = $Edition; Skip = [bool]$SkipRecommendedSettings })
+                $iqn = if ($ZonalAffinity) { 'iqn.test:one:az-eastus-az3' } else { 'iqn.test:one' }
+                Add-TestState $iqn 0 $SessionCount
+                [pscustomobject]@{ Plans = @([pscustomobject]@{ Name = 'one'; Iqn = $iqn; Skip = $false }); RebootChanges = @(if (!$SkipRecommendedSettings) { 'MaxTransferLength' }) }
+            }
+            Invoke-EsanConnect -ResourceGroupName 'rg' -ElasticSanName 'san' -VolumeGroupName 'vg' -VolumeName 'one' -EnableZonalAffinity -EnableVipDistribution -SkipRecommendedSettings
+            Invoke-EsanConnect -ResourceGroupName 'rg' -ElasticSanName 'san' -VolumeGroupName 'vg' -VolumeName 'one' -EnableVipDistribution -NumSession 4
+            Assert-MockCalled Get-EsanVolumeData -Times 0 -Exactly -Scope It
+            ($script:modeCalls | ForEach-Object { '{0}/{1}/{2}/{3}/{4}' -f $_.Count, $_.Zonal, $_.Vip, $_.Edition, $_.Skip }) -join ' ' |
+                Should Be '32/True/True/Server/True 4/False/True/Server/False'
+            $output = Get-TestOutput
+            $output | Should Match '\[PASS\] one \[iqn\.test:one:az-eastus-az3\] persistent logins: 32 of 32 requested'
+            $output | Should Match '\[WARN\] one \[iqn\.test:one:az-eastus-az3\] live sessions: 0 of 32 requested'
+            $output | Should Match '\[PASS\] one \[iqn\.test:one\] persistent logins: 4 of 4 requested'
+            $output | Should Match 'Reboot required: the saved persistent logins for one establish their sessions at boot\.'
+            $script:hostLines[-1] | Should Be 'Reboot required: changed MaxTransferLength, which take effect only after the VM restarts; the saved persistent logins for one establish their sessions at boot.'
+        }
+    }
+
+    # Mocks created inside an It last until the end of its Context in Pester 3.4, so the real
+    # Connect-ElasticSanVolumes is exercised in a separate Context.
+    Context 'Zonal and VIP modes: host preparation' {
+        BeforeEach {
+            $script:order = New-Object 'System.Collections.Generic.List[string]'
+            Mock Get-ZonalComputeMetadata { throw 'IMDS must be mocked.' }
+            Mock Get-VipHostAddresses { throw 'DNS must be mocked.' }
+            Mock Get-AzContext { [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = 'abcdef01-2345-6789-abcd-0123456789ab' } } }
+            Mock Resolve-ZonalPhysicalZone { $script:order.Add('lookup'); 'eastus-az3' }
+            Mock Resolve-VipPortals { @('10.0.0.1', '10.0.0.2') }
+            Mock Invoke-ZonalProviderRequest {
+                $script:order.Add('lookup')
+                if ($Command -eq 'Get-AzElasticSanVolume') {
+                    [pscustomobject]@{ StorageTargetIqn = 'iqn.test:one'; StorageTargetPortalHostname = 'one.example.net'; StorageTargetPortalPort = 3260 }
+                }
+            }
+            Mock Get-ZonalPersistentTargets { $script:order.Add('inventory') }
+            Mock Invoke-ZonalIscsiCli { $script:order.Add($Arguments[0]) }
+        }
+
+        It 'prepares the host after the read-only lookup and before reading existing state or changing anything' {
+            Mock Initialize-EsanHost { $script:order.Add('prepare'); 'MaxTransferLength' }
+            Mock Get-IscsiSession { $script:order.Add('inventory') }
+            $result = Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') 2 -ZonalAffinity -Edition 'Client' -SkipRecommendedSettings | Select-Object -Last 1
+            @($script:order | Select-Object -Unique) -join ',' | Should Be 'lookup,prepare,inventory,AddTarget,PersistentLoginTarget'
+            Assert-MockCalled Initialize-EsanHost -Times 1 -Exactly -Scope It -ParameterFilter { $Edition -eq 'Client' -and $SessionCount -eq 2 -and $SkipRecommendedSettings }
+            $result.Plans[0].Iqn | Should Be 'iqn.test:one:az-eastus-az3'
+            @($result.RebootChanges) -join ',' | Should Be 'MaxTransferLength'
+
+            $script:order.Clear()
+            Mock Initialize-EsanHost { $script:order.Add('prepare'); throw 'Reboot the VM, then re-run this script' }
+            { Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') 2 -VipDistribution } | Should Throw 'Reboot the VM'
+            @($script:order | Select-Object -Unique) -join ',' | Should Be 'lookup,prepare'
+        }
+
+        It 'enforces the 256-login limit before any change' {
+            Mock Initialize-EsanHost {}
+            Mock Get-ZonalPersistentTargets { foreach ($i in 1..225) { 'iqn.test:other' } }
+            { Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') 32 -VipDistribution } | Should Throw '(225 existing + 32 new), above the Windows limit of 256'
+            Assert-MockCalled Invoke-ZonalIscsiCli -Times 0 -Exactly -Scope It
         }
     }
 }

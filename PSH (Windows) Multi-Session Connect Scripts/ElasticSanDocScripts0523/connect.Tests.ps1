@@ -3,7 +3,9 @@ $tokens = $null
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($connectPath, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($definition in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -like '*-Zonal*' }, $false)) {
+foreach ($definition in $ast.FindAll({ param($node)
+    ($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($node.Name -like '*-Zonal*' -or $node.Name -like '*-Esan*')) -or
+    $node -is [System.Management.Automation.Language.TypeDefinitionAst] }, $false)) {
     . ([scriptblock]::Create($definition.Extent.Text))
 }
 
@@ -167,41 +169,48 @@ Describe 'Subscription-scoped mapping discovery' {
     }
 }
 
-Describe 'Unchanged legacy block and golden commands' {
+Describe 'Default mode through the hardened entry point and golden commands' {
     BeforeEach {
         $script:nativeCalls = New-Object 'System.Collections.Generic.List[object]'
-        Mock Get-Service { [pscustomobject]@{ Status = 'Running' } }
-        Mock Get-WindowsFeature { [pscustomobject]@{ InstallState = 'Installed' } }
+        # Elevation, edition, host preparation and validation are covered by connect.Hardening.Tests.ps1.
+        # A whole-script run can't mock the elevation check, so these tests call the entry function.
+        Mock Test-EsanAdministrator { $true }
+        Mock Get-EsanWindowsEdition { 'Server' }
+        Mock Initialize-EsanHost {}
+        Mock Complete-EsanConnection {}
+        Mock Get-CimInstance {}
         Mock Get-AzElasticSanVolumeGroup { [pscustomobject]@{} }
         Mock Get-AzElasticSanVolume { [pscustomobject]@{ StorageTargetIqn = 'iqn.test:ONE'; StorageTargetPortalHostname = 'PORTAL.EXAMPLE'; StorageTargetPortalPort = 3260 } }
         Mock Get-IscsiSession {}
-        Mock Get-AzContext { throw 'Legacy execution must not request mapping.' }
+        Mock Get-AzContext { throw 'Default mode must not request mapping.' }
         Mock Write-Host {}
     }
-    It 'matches the entire upstream execution block golden fingerprint' {
+    It 'matches the hardened default execution block golden fingerprint' {
+        # ADO 39929094 replaced the upstream legacy block with the hardened flow. The fingerprint now pins
+        # that block, so zonal/VIP changes can't silently alter it; intentional hardening edits update it.
         $text = [IO.File]::ReadAllText($connectPath).Replace("`r`n", "`n")
         $marker = '##################### CHECK DEPENDENCY #################################'
         $legacy = $text.Substring($text.IndexOf($marker)).TrimEnd("`r", "`n")
         $sha = [Security.Cryptography.SHA256]::Create()
         try {
             [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($legacy))).Replace('-', '').ToLowerInvariant() |
-                Should Be 'b5798ac33e3ae96cc0c77bf163582d2cb1780b8dc2fa618763029168042806d9'
+                Should Be 'df267f554d76dbd1db629b0e62d413d7baa261dbe7147cc5153c447b799ba2e6'
         } finally { $sha.Dispose() }
     }
     It 'retains the default count, FQDN casing and literal native argv with neither switch' {
-        . $connectPath 'rg' 'san' 'vg' @('one')
+        Invoke-EsanConnect -ResourceGroupName 'rg' -ElasticSanName 'san' -VolumeGroupName 'vg' -VolumeName @('one')
         $script:nativeCalls.Count | Should Be 33
         ($script:nativeCalls[0] -join '|') | Should Be 'AddTarget|iqn.test:ONE|*|PORTAL.EXAMPLE|3260|*|0|*|*|*|*|*|*|*|*|*|0'
         ($script:nativeCalls[1] -join '|') | Should Be 'PersistentLoginTarget|iqn.test:one|t|portal.example|3260|Root\ISCSIPRT\0000_0|-1|*|0x00000002|1|1|*|*|*|*|*|*|*|0'
         Assert-MockCalled Get-AzContext -Scope It -Times 0 -Exactly
     }
-    It 'retains positional count and both explicitly disabled switches' {
-        . $connectPath 'rg' 'san' 'vg' @('one') 2 -EnableZonalAffinity:$false -EnableVipDistribution:$false
+    It 'retains the requested count with both switches explicitly disabled' {
+        Invoke-EsanConnect -ResourceGroupName 'rg' -ElasticSanName 'san' -VolumeGroupName 'vg' -VolumeName @('one') -NumSession 2 -EnableZonalAffinity:$false -EnableVipDistribution:$false
         $script:nativeCalls.Count | Should Be 3
     }
     It 'retains case-insensitive existing-target skip behavior' {
         Mock Get-IscsiSession { [pscustomobject]@{ TargetNodeAddress = 'iqn.test:one' } }
-        . $connectPath 'rg' 'san' 'vg' @('one') 1
+        Invoke-EsanConnect -ResourceGroupName 'rg' -ElasticSanName 'san' -VolumeGroupName 'vg' -VolumeName @('one') -NumSession 1
         $script:nativeCalls.Count | Should Be 0
     }
 }

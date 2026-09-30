@@ -6,7 +6,7 @@ not log in, change subscriptions, install modules or require Azure CLI.
 
 | Switches | Target IQN | Original login portal |
 | --- | --- | --- |
-| Neither | Plain | FQDN; unchanged legacy behavior |
+| Neither | Plain | FQDN |
 | `-EnableZonalAffinity` | `:az-<physicalZone>` suffix | FQDN |
 | `-EnableVipDistribution` | Plain; no IMDS or zone mapping | IPv4 VIPs, or FQDN for one address |
 | Both | `:az-<physicalZone>` suffix | IPv4 VIPs, or FQDN for one address |
@@ -19,6 +19,26 @@ not log in, change subscriptions, install modules or require Azure CLI.
 Add `-EnableZonalAffinity` independently when zonal IQN routing is wanted and
 supported by the front end. Mapping retains subscription/region checks, bounded
 IMDS/provider reads and whole-batch decorated-IQN validation from ADO 39689651.
+
+## Host preparation, validation and reboot (every mode)
+
+Every mode first requires an elevated session and detects the Windows edition.
+After the read-only volume lookup, it prepares the host: MSiSCSI starts
+automatically and is running, Multipath I/O is enabled (`Enable-WindowsOptionalFeature`
+on Windows 10/11, `Install-WindowsFeature` on Windows Server) and MSDSM claims
+iSCSI disks. Unless `-SkipRecommendedSettings` is set, it also applies the
+[recommended client settings](https://learn.microsoft.com/azure/storage/elastic-san/elastic-san-best-practices)
+(round robin, 30-second MPIO disk timeout, iSCSI initiator registry values),
+changing only values that differ. If enabling MPIO needs a restart, the script
+stops before any iSCSI change; reboot and re-run it.
+
+After connecting, a read-only validation prints `[PASS]`, `[WARN]` or `[FAIL]`
+per check, then `Validation: N passed, N warnings, N failed`. It checks the
+target each mode connected (the decorated IQN in zonal mode). Missing persistent
+logins on a volume connected in this run fail; sessions that aren't live yet
+only warn, and the final `Reboot required:` line names them. Every stop and any
+FAIL ends the script with an error (non-zero exit code with `powershell.exe
+-File`). `Get-Help .\connect.ps1 -Full` describes each step.
 
 ## VIP distribution and reboot
 
@@ -47,8 +67,8 @@ IQN or `<plain IQN>:az-*` causes a skip:
 `already configured; run disconnect.ps1 first to change the layout`.
 No layout proof, automatic repair, rebalance or disconnect is attempted.
 All selected-volume discovery and DNS checks finish before configuration
-changes. The initiator must already be running and multi-session use requires
-MPIO; the script does not install or tune them.
+changes. The script also stops before any change if the new logins would take
+the initiator past the Windows limit of 256 persistent logins.
 
 Preflight is not a transaction. A native failure can leave saved entries for
 this or earlier volumes. Inspect the selected targets before retrying, and do
@@ -76,7 +96,7 @@ failure can leave some sessions or saved logins in place.
 Run from this directory:
 
 ```powershell
-Invoke-Pester -Script .\connect.Tests.ps1, .\connect.Vip.Tests.ps1, .\disconnect.Tests.ps1 -EnableExit
+Invoke-Pester -Script .\connect.Tests.ps1, .\connect.Vip.Tests.ps1, .\connect.Hardening.Tests.ps1, .\disconnect.Tests.ps1 -EnableExit
 ```
 
 Tests mock Azure, IMDS, DNS and native commands, including a

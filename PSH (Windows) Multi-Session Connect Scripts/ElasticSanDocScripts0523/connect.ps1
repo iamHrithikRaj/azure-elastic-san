@@ -5,11 +5,13 @@ Connects Azure Elastic SAN volumes to this Windows machine with multiple persist
 .DESCRIPTION
 Run from an elevated PowerShell session with the Az.ElasticSan module signed in (Connect-AzAccount).
 
-The script runs these steps in order. It stops (throws) before adding any session when a step fails, so a
-partial or misleading connection is never reported as success.
+The script runs these steps in order in every mode (default, -EnableZonalAffinity, -EnableVipDistribution).
+It stops (throws) before adding any session when a step fails, so a partial or misleading connection is
+never reported as success.
 
  1. Checks that the session is elevated and detects Windows 10/11 (client) or Windows Server.
- 2. Looks up each volume's target IQN, portal and port with the Az.ElasticSan module.
+ 2. Looks up each volume's target IQN, portal and port with the Az.ElasticSan module (plus the zone
+    mapping in zonal mode).
  3. Makes sure the iSCSI initiator service (MSiSCSI) starts automatically and is running, enables
     Multipath I/O (an optional feature on client, a server feature on Windows Server) and makes MSDSM
     claim iSCSI disks.
@@ -22,8 +24,9 @@ partial or misleading connection is never reported as success.
  6. Reads the live sessions and persistent logins of every volume before changing anything. A volume
     that already has either is skipped; this script never adds to, or removes, existing sessions. Also
     stops if the new sessions would exceed the Windows limit of 256 persistent iSCSI logins.
- 7. Connects each remaining volume, prints a validation report ([PASS], [WARN] and [FAIL] lines and a
-    summary), and says when a reboot is needed for changed settings to take effect.
+ 7. Saves the persistent logins of each remaining volume, prints a validation report ([PASS], [WARN] and
+    [FAIL] lines and a summary), and says when a reboot is needed: for changed settings, or for saved
+    persistent logins whose sessions aren't live yet.
 
 The script throws, which gives a non-zero exit code with powershell.exe -File, when it stops early or
 when any validation check fails.
@@ -48,6 +51,12 @@ MSDSM iSCSI claiming are still configured, because multiple sessions don't work 
 .PARAMETER NumSession
 Sessions per volume, 1-32. Default 32. Windows allows at most 256 iSCSI sessions in total, so use fewer
 sessions per volume when connecting more than eight volumes. Use 1 on Windows editions without Multipath I/O.
+
+.PARAMETER EnableZonalAffinity
+Connect to the zonal target IQN (:az-<physicalZone> suffix). See README.md in this folder.
+
+.PARAMETER EnableVipDistribution
+Spread the saved persistent logins across the portal's resolved IPv4 VIPs. See README.md in this folder.
 
 .EXAMPLE
 .\connect.ps1 -ResourceGroupName myRG -ElasticSanName mySan -VolumeGroupName myVG -VolumeName vol1,vol2
@@ -304,7 +313,8 @@ function Get-ZonalPersistentTargets {
 }
 
 function Connect-ElasticSanVolumes([string]$ResourceGroup, [string]$SanName, [string]$GroupName, [string[]]$Names,
-    [ValidateRange(1,32)][int]$SessionCount = 32, [switch]$ZonalAffinity, [switch]$VipDistribution) {
+    [ValidateRange(1,32)][int]$SessionCount = 32, [switch]$ZonalAffinity, [switch]$VipDistribution,
+    [string]$Edition = 'Server', [switch]$SkipRecommendedSettings) {
     $context = Get-AzContext -ErrorAction Stop
     $subscription = ConvertTo-ZonalSubscriptionId $context.Subscription.Id
     if ($ZonalAffinity) { $physicalZone = Resolve-ZonalPhysicalZone $context $subscription $ResourceGroup $SanName }
@@ -343,19 +353,18 @@ function Connect-ElasticSanVolumes([string]$ResourceGroup, [string]$SanName, [st
     )
     if ($plans.Count -eq 0) { throw 'No volumes selected.' }
 
-    # Mapping/IQN/input preflight for the whole batch is complete. These are
-    # read-only prerequisite checks, never service/MPIO installation or tuning.
-    if ((Get-Service -Name MSiSCSI -ErrorAction Stop).Status -ne 'Running') { throw 'A running iSCSI initiator is required.' }
-    if ($SessionCount -gt 1 -and (Get-WindowsFeature -Name 'Multipath-IO' -ErrorAction Stop).InstallState -ne 'Installed') {
-        throw 'Multipath I/O must already be installed for multiple sessions.'
-    }
-    $targets = @((Get-IscsiSession -ErrorAction Stop).TargetNodeAddress) + @(Get-ZonalPersistentTargets)
+    # Mapping/IQN/input preflight for the whole batch is complete. The shared hardening steps
+    # (prerequisites, recommended settings, reboot gate) run before any existing-state read or change.
+    $rebootChanges = @(Initialize-EsanHost -Edition $Edition -SessionCount $SessionCount -SkipRecommendedSettings:$SkipRecommendedSettings)
+    $persistentTargets = @(Get-ZonalPersistentTargets)
+    $targets = @((Get-IscsiSession -ErrorAction Stop).TargetNodeAddress) + $persistentTargets
     foreach ($plan in $plans) {
         $plan.Skip = @($targets | Where-Object {
             $_ -ieq $plan.RawIqn -or ($_ -is [string] -and $_.StartsWith("$($plan.RawIqn):az-", [StringComparison]::OrdinalIgnoreCase))
         }).Count -gt 0
         if (!$plan.Skip -and $VipDistribution) { $plan.Portals = @(Resolve-VipPortals $plan.HostName) }
     }
+    Assert-EsanSessionLimit -Existing $persistentTargets.Count -New ($SessionCount * @($plans | Where-Object { !$_.Skip }).Count)
 
     if ($ZonalAffinity) { Write-Host 'Zonal IQN routing requires front-end suffix support.' -ForegroundColor Yellow }
     foreach ($plan in $plans) {
@@ -377,16 +386,11 @@ function Connect-ElasticSanVolumes([string]$ResourceGroup, [string]$SanName, [st
         Write-Host "$($plan.Name) [$($plan.Iqn)]: Saved $SessionCount persistent login requests." -ForegroundColor Cyan
     }
     Write-Host 'Reboot is required to establish the saved persistent logins. The front end may redirect sessions after login; original portals do not determine final placement.' -ForegroundColor Yellow
-}
-
-if ($EnableZonalAffinity -or $EnableVipDistribution) {
-    $sessionCount = if ($PSBoundParameters.ContainsKey('NumSession')) { $NumSession } else { 32 }
-    Connect-ElasticSanVolumes $ResourceGroupName $ElasticSanName $VolumeGroupName $VolumeName $sessionCount -ZonalAffinity:$EnableZonalAffinity -VipDistribution:$EnableVipDistribution
-    return
+    [pscustomobject]@{ Plans = $plans; RebootChanges = $rebootChanges }
 }
 
 ##################### CHECK DEPENDENCY #################################
-# The functions below harden the default flow. Invoke-EsanConnect, called at the end of this file, runs
+# The functions below harden every connect mode. Invoke-EsanConnect, called at the end of this file, runs
 # them in order. Every stop is a throw from inside a function, never exit, so it can't close the console.
 
 function Test-EsanAdministrator {
@@ -602,17 +606,20 @@ function Get-EsanConnectionPlan($Volumes) {
     foreach ($item in $plan) {
         if ($item.Action -eq 'Connect') { $newSessions += $item.Volume.NumSession }
     }
-    $existing = $inventory.PersistentLogins.Count
-    if ($existing + $newSessions -gt 256) {
-        throw "Connecting would bring this machine to $($existing + $newSessions) persistent iSCSI logins ($existing existing + $newSessions new), above the Windows limit of 256. Re-run with a lower -NumSession or fewer volumes. No sessions were added."
-    }
+    Assert-EsanSessionLimit -Existing $inventory.PersistentLogins.Count -New $newSessions
     $plan
+}
+
+function Assert-EsanSessionLimit([int]$Existing, [int]$New) {
+    if ($Existing + $New -gt 256) {
+        throw "Connecting would bring this machine to $($Existing + $New) persistent iSCSI logins ($Existing existing + $New new), above the Windows limit of 256. Re-run with a lower -NumSession or fewer volumes. No sessions were added."
+    }
 }
 
 function Connect-EsanVolume($Volume) {
     iscsicli AddTarget $Volume.TargetIQN * $Volume.TargetHostName $Volume.TargetPort * 0 * * * * * * * * * 0
-    # Each PersistentLoginTarget both creates a live session and persists it. A separate LoginTarget
-    # would double the sessions.
+    # Keep the existing command lines: one PersistentLoginTarget per session and no separate LoginTarget,
+    # which could double the sessions.
     $LoginOptions = '0x00000002'
     for ($i = 0; $i -lt $Volume.NumSession; $i++) {
         iscsicli PersistentLoginTarget $Volume.TargetIQN.ToLower() t $Volume.TargetHostname.ToLower() $Volume.TargetPort Root\ISCSIPRT\0000_0 -1 * $LoginOptions 1 1 * * * * * * * 0
@@ -632,6 +639,7 @@ function Get-EsanCountStatus([int]$Actual, [int]$Requested, [string]$Shortfall) 
 
 function Test-EsanConnection($Plan, [string]$Edition, [int]$SessionCount, [bool]$CheckRecommendedSettings) {
     # Read-only. Re-reads the machine state instead of trusting what earlier steps reported.
+    $pending = New-Object System.Collections.Generic.List[string]
     $results = @(
         $service = Get-Service -Name MSiSCSI -ErrorAction Stop
         $status = if ("$($service.Status)" -eq 'Running' -and "$($service.StartType)" -eq 'Automatic') { 'PASS' } else { 'FAIL' }
@@ -686,7 +694,15 @@ function Test-EsanConnection($Plan, [string]$Edition, [int]$SessionCount, [bool]
             $shortfall = if ($item.Action -eq 'Connect') { 'FAIL' } else { 'WARN' }
             $sessions = @($inventory.Sessions | Where-Object { $_.TargetNodeAddress -ieq $volume.TargetIQN })
             $persistent = @($inventory.PersistentLogins | Where-Object { $_.TargetName -ieq $volume.TargetIQN }).Count
-            New-EsanCheck (Get-EsanCountStatus $sessions.Count $volume.NumSession $shortfall) "$label live sessions" "$($sessions.Count) of $($volume.NumSession) requested"
+            if ($item.Action -eq 'Connect' -and $sessions.Count -lt $volume.NumSession) {
+                # Windows may establish saved persistent logins only at boot, so missing live sessions on a
+                # volume connected in this run are expected until the reboot. Its persistent logins are
+                # the result this run is accountable for.
+                $pending.Add($volume.VolumeName)
+                New-EsanCheck 'WARN' "$label live sessions" "$($sessions.Count) of $($volume.NumSession) requested; the saved persistent logins establish the rest at boot"
+            } else {
+                New-EsanCheck (Get-EsanCountStatus $sessions.Count $volume.NumSession $shortfall) "$label live sessions" "$($sessions.Count) of $($volume.NumSession) requested"
+            }
             New-EsanCheck (Get-EsanCountStatus $persistent $volume.NumSession $shortfall) "$label persistent logins" "$persistent of $($volume.NumSession) requested"
             if ($sessions.Count -gt 0) {
                 $unhealthy = @($sessions | Where-Object { -not ($_.IsConnected -and $_.IsPersistent -and $_.IsHeaderDigest -and $_.IsDataDigest) }).Count
@@ -705,32 +721,20 @@ function Test-EsanConnection($Plan, [string]$Edition, [int]$SessionCount, [bool]
         Write-Host "[$($result.Status)] $($result.Check): $($result.Detail)" -ForegroundColor $colors[$result.Status]
     }
     $summary = [pscustomobject]@{
-        Passed   = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
-        Warnings = @($results | Where-Object { $_.Status -eq 'WARN' }).Count
-        Failed   = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
+        Passed         = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
+        Warnings       = @($results | Where-Object { $_.Status -eq 'WARN' }).Count
+        Failed         = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
+        PendingVolumes = @($pending)
     }
     Write-Host "Validation: $($summary.Passed) passed, $($summary.Warnings) warnings, $($summary.Failed) failed" -ForegroundColor $(if ($summary.Failed -gt 0) { 'Red' } else { 'Green' })
     $summary
 }
 
-function Invoke-EsanConnect {
-    param(
-        [string]$ResourceGroupName,
-        [string]$ElasticSanName,
-        [string]$VolumeGroupName,
-        [string[]]$VolumeName,
-        [int]$NumSession,
-        [switch]$SkipRecommendedSettings
-    )
-    if (-not (Test-EsanAdministrator)) {
-        throw 'Run this script from an elevated PowerShell session (Run as administrator). Without elevation, iscsicli output can look successful while no sessions are added.'
-    }
-    $edition = Get-EsanWindowsEdition
-    $volumes = @(Get-EsanVolumeData -ResourceGroupName $ResourceGroupName -ElasticSanName $ElasticSanName -VolumeGroupName $VolumeGroupName -VolumeName $VolumeName -NumSession $NumSession)
-    $sessionCount = [int]($volumes | Measure-Object -Property NumSession -Maximum).Maximum
-
+function Initialize-EsanHost([string]$Edition, [int]$SessionCount, [switch]$SkipRecommendedSettings) {
+    # Prerequisites, recommended settings and the reboot gate, shared by every connect mode. Outputs the
+    # setting changes that take effect only after a restart.
     Install-EsanIscsiService
-    $mpio = Install-EsanMultipathIO -Edition $edition -SessionCount $sessionCount
+    $mpio = Install-EsanMultipathIO -Edition $Edition -SessionCount $SessionCount
     $mpioActive = $mpio.Available -and -not $mpio.RestartNeeded
     if ($mpioActive) { Enable-EsanMsdsmIscsiClaim }
 
@@ -742,6 +746,63 @@ function Invoke-EsanConnect {
         # The feature cmdlet's RestartNeeded is the only signal that blocks connecting.
         throw 'Windows needs a restart to finish enabling Multipath I/O. No sessions were added, because sessions added before MPIO is active show up as duplicate disks. Reboot the VM, then re-run this script to finish MSDSM claiming, the MPIO settings and the connections.'
     }
+    $rebootChanges
+}
+
+function Complete-EsanConnection($Plan, [string]$Edition, [int]$SessionCount, [switch]$SkipRecommendedSettings, [string[]]$RebootChanges) {
+    # Validation, reboot notice and the final error, shared by every connect mode.
+    $validation = Test-EsanConnection -Plan $Plan -Edition $Edition -SessionCount $SessionCount -CheckRecommendedSettings (-not $SkipRecommendedSettings)
+    $reasons = @()
+    if ($RebootChanges.Count -gt 0) {
+        $reasons += "changed $($RebootChanges -join ', '), which take effect only after the VM restarts"
+    }
+    if ($validation.PendingVolumes.Count -gt 0) {
+        $reasons += "the saved persistent logins for $($validation.PendingVolumes -join ', ') establish their sessions at boot"
+    }
+    if ($reasons.Count -gt 0) {
+        Write-Host "Reboot required: $($reasons -join '; ')." -ForegroundColor Yellow
+    }
+    if ($validation.Failed -gt 0) {
+        throw "Validation failed: $($validation.Failed) check(s) failed. Review the [FAIL] lines above."
+    }
+}
+
+function Invoke-EsanConnect {
+    param(
+        [string]$ResourceGroupName,
+        [string]$ElasticSanName,
+        [string]$VolumeGroupName,
+        [string[]]$VolumeName,
+        [int]$NumSession,
+        [switch]$SkipRecommendedSettings,
+        [switch]$EnableZonalAffinity,
+        [switch]$EnableVipDistribution
+    )
+    if (-not (Test-EsanAdministrator)) {
+        throw 'Run this script from an elevated PowerShell session (Run as administrator). Without elevation, iscsicli output can look successful while no sessions are added.'
+    }
+    $edition = Get-EsanWindowsEdition
+
+    if ($EnableZonalAffinity -or $EnableVipDistribution) {
+        # Zonal mapping and VIP distribution keep their own lookup, existing-state checks and connect
+        # commands. Connect-ElasticSanVolumes runs Initialize-EsanHost right after its read-only lookup.
+        $sessionCount = if ($NumSession -ge 1) { $NumSession } else { 32 }
+        $result = Connect-ElasticSanVolumes $ResourceGroupName $ElasticSanName $VolumeGroupName $VolumeName $sessionCount -ZonalAffinity:$EnableZonalAffinity -VipDistribution:$EnableVipDistribution -Edition $edition -SkipRecommendedSettings:$SkipRecommendedSettings |
+            Select-Object -Last 1
+        # Validate the target each mode actually connected: the decorated IQN when zonal.
+        $plan = @(foreach ($item in $result.Plans) {
+            [pscustomobject]@{
+                Volume = [pscustomobject]@{ VolumeName = $item.Name; TargetIQN = $item.Iqn; NumSession = $sessionCount }
+                Action = if ($item.Skip) { 'Skip' } else { 'Connect' }
+            }
+        })
+        Complete-EsanConnection -Plan $plan -Edition $edition -SessionCount $sessionCount -SkipRecommendedSettings:$SkipRecommendedSettings -RebootChanges $result.RebootChanges
+        return
+    }
+
+    $volumes = @(Get-EsanVolumeData -ResourceGroupName $ResourceGroupName -ElasticSanName $ElasticSanName -VolumeGroupName $VolumeGroupName -VolumeName $VolumeName -NumSession $NumSession)
+    $sessionCount = [int]($volumes | Measure-Object -Property NumSession -Maximum).Maximum
+    $rebootChanges = @(Initialize-EsanHost -Edition $edition -SessionCount $sessionCount -SkipRecommendedSettings:$SkipRecommendedSettings)
 
     $plan = @(Get-EsanConnectionPlan -Volumes $volumes)
     foreach ($item in $plan) {
@@ -754,14 +815,7 @@ function Invoke-EsanConnect {
             if ($item.Warning) { Write-Host "${label}: Warning: $($item.Warning)" -ForegroundColor Yellow }
         }
     }
-
-    $validation = Test-EsanConnection -Plan $plan -Edition $edition -SessionCount $sessionCount -CheckRecommendedSettings (-not $SkipRecommendedSettings)
-    if ($rebootChanges.Count -gt 0) {
-        Write-Host "Reboot required: changed $($rebootChanges -join ', '). These settings take effect only after the VM restarts; until then all sessions use the previous values." -ForegroundColor Yellow
-    }
-    if ($validation.Failed -gt 0) {
-        throw "Validation failed: $($validation.Failed) check(s) failed. Review the [FAIL] lines above."
-    }
+    Complete-EsanConnection -Plan $plan -Edition $edition -SessionCount $sessionCount -SkipRecommendedSettings:$SkipRecommendedSettings -RebootChanges $rebootChanges
 }
 
-Invoke-EsanConnect -ResourceGroupName $ResourceGroupName -ElasticSanName $ElasticSanName -VolumeGroupName $VolumeGroupName -VolumeName $VolumeName -NumSession $NumSession -SkipRecommendedSettings:$SkipRecommendedSettings
+Invoke-EsanConnect -ResourceGroupName $ResourceGroupName -ElasticSanName $ElasticSanName -VolumeGroupName $VolumeGroupName -VolumeName $VolumeName -NumSession $NumSession -SkipRecommendedSettings:$SkipRecommendedSettings -EnableZonalAffinity:$EnableZonalAffinity -EnableVipDistribution:$EnableVipDistribution

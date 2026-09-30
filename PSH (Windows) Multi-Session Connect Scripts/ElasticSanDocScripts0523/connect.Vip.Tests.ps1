@@ -103,8 +103,9 @@ Describe 'Persistent-login configuration without live-session polling' {
         $script:existing = @(); $script:badSecond = ''; $script:duplicateIqn = $false
         $script:dnsAnswers = @('10.0.0.10', '10.0.0.9', '10.0.0.8')
         $script:dnsFailureHost = ''; $script:port = 3260
-        Mock Get-Service { [pscustomobject]@{ Status = 'Running' } }
-        Mock Get-WindowsFeature { [pscustomobject]@{ InstallState = 'Installed' } }
+        # The shared host preparation (prerequisites, settings, reboot gate) is covered by
+        # connect.Hardening.Tests.ps1; here it is a boundary.
+        Mock Initialize-EsanHost {}
         Mock Get-IscsiSession { $script:existing }
         Mock Write-Host {}
         Mock Start-Sleep { throw 'Persistent logins must not wait for live sessions.' }
@@ -238,7 +239,9 @@ foreach ($mode in @(
     @{ Label='VIP only'; Zonal=$false; Vip=$true; Iqn='iqn.test:one'; Portal='10.0.0.8'; Count=31 },
     @{ Label='both'; Zonal=$true; Vip=$true; Iqn='iqn.test:one:az-eastus-az3'; Portal='10.0.0.8'; Count=$null }
 )) {
-    Describe "Actual script independent switches: $($mode.Label)" {
+    # The mode tests call the script's entry function rather than dot-sourcing the whole script: the
+    # hardened entry checks for an elevated session first, which a whole-script run can't mock.
+    Describe "Entry point independent switches: $($mode.Label)" {
         It 'uses only the requested mechanisms and succeeds with no live session created' {
             $script:nativeCalls = New-Object 'System.Collections.Generic.List[object]'
             $script:requests = New-Object 'System.Collections.Generic.List[object]'
@@ -246,8 +249,10 @@ foreach ($mode in @(
             $script:persistentOutput = @('Total of 0 persistent targets','The operation completed successfully.')
             $script:dnsAnswers = @('10.0.0.10','10.0.0.9','10.0.0.8')
             $script:dnsFailureHost = ''; $script:port = 3260; $script:badSecond = ''; $script:duplicateIqn = $false
-            Mock Get-Service { [pscustomobject]@{ Status = 'Running' } }
-            Mock Get-WindowsFeature { [pscustomobject]@{ InstallState = 'Installed' } }
+            Mock Test-EsanAdministrator { $true }
+            Mock Get-EsanWindowsEdition { 'Server' }
+            Mock Initialize-EsanHost {}
+            Mock Complete-EsanConnection { $script:validatedPlan = $Plan }
             Mock Get-IscsiSession {}
             Mock Write-Host {}
             Mock Get-AzContext {
@@ -259,11 +264,15 @@ foreach ($mode in @(
                 EnableZonalAffinity=$mode.Zonal; EnableVipDistribution=$mode.Vip
             }
             if ($null -ne $mode.Count) { $parameters.NumSession = $mode.Count }
-            . $connectPath @parameters
+            Invoke-EsanConnect @parameters
+            $expectedCount = if ($null -eq $mode.Count) { 32 } else { $mode.Count }
             $logins = @($script:nativeCalls | Where-Object { $_[0] -eq 'PersistentLoginTarget' })
-            $logins.Count | Should Be $(if ($null -eq $mode.Count) { 32 } else { $mode.Count })
+            $logins.Count | Should Be $expectedCount
             $logins[0][1] | Should Be $mode.Iqn
             $logins[0][3] | Should Be $mode.Portal
+            # Shared validation checks the target this mode actually connected.
+            "$($script:validatedPlan[0].Volume.TargetIQN)/$($script:validatedPlan[0].Volume.NumSession)/$($script:validatedPlan[0].Action)" |
+                Should Be "$($mode.Iqn)/$expectedCount/Connect"
             Assert-MockCalled Get-ZonalComputeMetadata -Scope It -Times ([int]$mode.Zonal) -Exactly
             Assert-MockCalled Get-VipHostAddresses -Scope It -Times ([int]$mode.Vip) -Exactly
             @($script:requests | Where-Object { $_.Command -in @('Get-AzElasticSan','Invoke-AzRestMethod') }).Count | Should Be (2 * [int]$mode.Zonal)
