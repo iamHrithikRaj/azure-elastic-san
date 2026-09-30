@@ -2,6 +2,8 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -105,7 +107,13 @@ class ArgumentParsingTests(unittest.TestCase):
         args = parser.parse_args(["-g", "rg", "-e", "san", "-v", "vg", "-n", "vol1"])
         self.assertFalse(args.dry_run)
         self.assertFalse(args.enable_zonal_affinity)
+        self.assertFalse(args.skip_recommended_settings)
         self.assertEqual("1", args.num_of_sessions)
+
+    def test_skip_recommended_settings_is_accepted_for_cli_parity(self):
+        parser = connect.create_argument_parser()
+        args = parser.parse_args(["--skip-recommended-settings"])
+        self.assertTrue(args.skip_recommended_settings)
 
     def test_missing_required_arguments_raise_before_any_azure_or_freebsd_call(self):
         with mock.patch.object(connect, "check_az_cli_available") as check_az:
@@ -416,29 +424,151 @@ class BoundedSubprocessTests(unittest.TestCase):
 
 
 class FreeBsdMutationPreflightTests(unittest.TestCase):
-    def test_requires_root(self):
+    def _host(self, sysname="FreeBSD", euid=0, which="/usr/sbin/tool", version="14.1-RELEASE-p5\n"):
+        uname = mock.Mock(return_value=mock.Mock(sysname=sysname))
+        return [
+            mock.patch.object(connect.os, "geteuid", return_value=euid, create=True),
+            mock.patch.object(connect.os, "uname", uname, create=True),
+            mock.patch.object(connect.shutil, "which", return_value=which),
+            mock.patch.object(connect, "_run_command", return_value=version),
+        ]
+
+    def _check(self, **host):
+        patches = self._host(**host)
+        for patch in patches:
+            patch.start()
+        try:
+            connect.check_freebsd_mutation_prerequisites()
+            return connect._run_command
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
+
+    def test_requires_root_before_any_platform_probe(self):
         with mock.patch.object(connect.os, "geteuid", return_value=1000, create=True):
-            with self.assertRaisesRegex(connect.ElasticSanConnectError, "must be run as root"):
+            with mock.patch.object(connect.os, "uname", create=True) as uname:
+                with self.assertRaisesRegex(connect.ElasticSanConnectError, "must be run as root"):
+                    connect.check_freebsd_mutation_prerequisites()
+        uname.assert_not_called()
+
+    def test_rejects_non_freebsd_host_before_tool_or_version_checks(self):
+        patches = self._host(sysname="Linux", which=None)
+        for patch in patches:
+            patch.start()
+        try:
+            with self.assertRaisesRegex(connect.ElasticSanConnectError, "reports 'Linux'"):
                 connect.check_freebsd_mutation_prerequisites()
+            connect._run_command.assert_not_called()
+            connect.shutil.which.assert_not_called()
+        finally:
+            for patch in reversed(patches):
+                patch.stop()
 
     def test_requires_freebsd_tools_on_path(self):
-        with mock.patch.object(connect.os, "geteuid", return_value=0, create=True):
-            with mock.patch.object(connect.shutil, "which", return_value=None):
-                with self.assertRaisesRegex(connect.ElasticSanConnectError, "iscsictl, service, sysrc"):
-                    connect.check_freebsd_mutation_prerequisites()
+        with self.assertRaisesRegex(
+            connect.ElasticSanConnectError, "iscsictl, service, sysrc, kldstat, kldload, freebsd-version"
+        ):
+            self._check(which=None)
 
-    def test_requires_iscsi_device_node(self):
-        with mock.patch.object(connect.os, "geteuid", return_value=0, create=True):
-            with mock.patch.object(connect.shutil, "which", return_value="/usr/sbin/tool"):
-                with mock.patch.object(connect.os.path, "exists", return_value=False):
-                    with self.assertRaisesRegex(connect.ElasticSanConnectError, "/dev/iscsi"):
-                        connect.check_freebsd_mutation_prerequisites()
+    def test_rejects_freebsd_older_than_13_and_unparseable_versions(self):
+        for version, message in (("12.4-RELEASE-p9\n", "requires FreeBSD 13"), ("garbage\n", "Could not determine")):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(connect.ElasticSanConnectError, message):
+                    self._check(version=version)
 
-    def test_passes_when_root_tools_and_device_are_present(self):
-        with mock.patch.object(connect.os, "geteuid", return_value=0, create=True):
-            with mock.patch.object(connect.shutil, "which", return_value="/usr/sbin/tool"):
-                with mock.patch.object(connect.os.path, "exists", return_value=True):
-                    connect.check_freebsd_mutation_prerequisites()  # should not raise
+    def test_accepts_supported_versions_using_userland_version(self):
+        for version in ("13.0-RELEASE\n", "14.1-RELEASE-p5\n", "15.0-CURRENT\n"):
+            with self.subTest(version=version):
+                run_command = self._check(version=version)
+                run_command.assert_called_once_with(
+                    ["freebsd-version", "-u"], "freebsd-version -u", connect.SHORT_COMMAND_TIMEOUT_SECONDS
+                )
+
+
+class KernelDriverTests(unittest.TestCase):
+    def _ensure(self, kldstat_returncode, device_exists, iscsi_load, kldload_error=None):
+        """Run ensure_iscsi_kernel_driver against mocked host state.
+
+        Returns (mutating argv list, raised error or None) so failure cases can
+        still assert what was, and was not, run before the stop.
+        """
+        exists_results = list(device_exists)
+
+        def run_subprocess(command, description, timeout):
+            if command[0] == "kldstat":
+                return kldstat_returncode, "", ""
+            if command == ["sysrc", "-f", "/boot/loader.conf", "-n", "iscsi_load"]:
+                return (0, iscsi_load + "\n", "") if iscsi_load else (1, "", "unknown variable")
+            raise AssertionError("unexpected read {}".format(command))
+
+        run_command = mock.Mock(side_effect=kldload_error)
+        error = None
+        with mock.patch.object(connect, "_run_subprocess", side_effect=run_subprocess):
+            with mock.patch.object(connect, "_run_command", run_command):
+                with mock.patch.object(connect.os.path, "exists", side_effect=lambda _: exists_results.pop(0)):
+                    try:
+                        connect.ensure_iscsi_kernel_driver()
+                    except connect.ElasticSanConnectError as caught:
+                        error = caught
+        return [call.args[0] for call in run_command.call_args_list], error
+
+    def test_loaded_module_is_persisted_in_loader_conf(self):
+        self.assertEqual(
+            ([["sysrc", "-f", "/boot/loader.conf", "iscsi_load=YES"]], None),
+            self._ensure(0, [], ""),
+        )
+
+    def test_loaded_module_already_persisted_changes_nothing(self):
+        self.assertEqual(([], None), self._ensure(0, [], "YES"))
+
+    def test_compiled_in_driver_is_accepted_without_kldload_or_loader_change(self):
+        self.assertEqual(([], None), self._ensure(1, [True], ""))
+
+    def test_missing_driver_is_loaded_then_persisted(self):
+        self.assertEqual(
+            ([["kldload", "iscsi"], ["sysrc", "-f", "/boot/loader.conf", "iscsi_load=YES"]], None),
+            self._ensure(1, [False, True], ""),
+        )
+
+    def test_kldload_failure_stops_without_persisting(self):
+        calls, error = self._ensure(
+            1, [False], "", connect.ElasticSanConnectError("kldload iscsi failed: denied")
+        )
+        self.assertEqual([["kldload", "iscsi"]], calls)
+        self.assertRegex(str(error), "could not be loaded: kldload iscsi failed")
+
+    def test_missing_device_after_kldload_stops_without_persisting(self):
+        calls, error = self._ensure(1, [False, False], "")
+        self.assertEqual([["kldload", "iscsi"]], calls)
+        self.assertRegex(str(error), "/dev/iscsi does not exist")
+
+
+class BootPersistenceTests(unittest.TestCase):
+    def _ensure(self, iscsictl_flags, iscsictl_enable):
+        values = {"iscsictl_flags": iscsictl_flags, "iscsictl_enable": iscsictl_enable}
+
+        def run_subprocess(command, description, timeout):
+            value = values[command[-1]]
+            return (0, value + "\n", "") if value is not None else (1, "", "unknown variable")
+
+        with mock.patch.object(connect, "_run_subprocess", side_effect=run_subprocess):
+            with mock.patch.object(connect, "_run_command") as run_command:
+                connect.ensure_iscsictl_boot_persistence()
+        return [call.args[0] for call in run_command.call_args_list]
+
+    def test_stock_or_undefined_flags_enable_boot_relogin(self):
+        for flags in ("-Aa", None):
+            with self.subTest(flags=flags):
+                self.assertEqual([["sysrc", "iscsictl_enable=YES"]], self._ensure(flags, "NO"))
+
+    def test_already_enabled_changes_nothing(self):
+        self.assertEqual([], self._ensure("-Aa", "YES"))
+
+    def test_customized_or_explicitly_empty_flags_are_left_untouched(self):
+        # An empty value makes rc.d/iscsictl run a bare 'iscsictl', which only lists sessions.
+        for flags in ("-A -n mytarget", ""):
+            with self.subTest(flags=flags):
+                self.assertEqual([], self._ensure(flags, "NO"))
 
 
 class ConfigValueValidationTests(unittest.TestCase):
@@ -990,6 +1120,16 @@ class SessionParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(connect.ElasticSanConnectError, "missing Session state"):
             connect._parse_iscsictl_verbose_sessions(malformed)
 
+    def test_target_matching_is_exact_and_case_insensitive(self):
+        sessions = [
+            {"Target name": "IQN.Example:Vol1"},
+            {"Target name": "iqn.example:vol10"},
+            {"Target name": "iqn.example:vol"},
+        ]
+        self.assertEqual(
+            [sessions[0]], connect.sessions_for_target(sessions, "iqn.example:vol1")
+        )
+
 
 class AddSessionsForVolumeTests(unittest.TestCase):
     def _plan(self):
@@ -1358,14 +1498,19 @@ class BuildConnectionPlanTests(unittest.TestCase):
             with mock.patch.object(
                 connect,
                 "get_volume_storage_target",
-                return_value=("iqn.original", "portal.example", 3260),
+                side_effect=[
+                    ("iqn.original.volume1", "portal.example", 3260),
+                    ("iqn.original.volume2", "portal.example", 3260),
+                ],
             ):
                 plans = connect.build_connection_plan(
                     "sub", "rg", "san", "vg", ["volume1", "volume2"], 1, enable_zonal_affinity=True
                 )
         resolve_zone.assert_called_once_with("sub", "rg", "san")
         for plan in plans:
-            self.assertEqual("iqn.original:az-eastus-az3", plan.target_name)
+            self.assertEqual(
+                "iqn.original.{}:az-eastus-az3".format(plan.volume_name), plan.target_name
+            )
 
     def test_empty_volume_selection_is_rejected_before_discovery(self):
         with mock.patch.object(connect, "resolve_physical_zone") as resolve_zone:
@@ -1415,6 +1560,18 @@ class BuildConnectionPlanTests(unittest.TestCase):
                         None, "rg", "san", "vg", ["volume1", "volume2"], 1
                     )
 
+    def test_same_volume_selected_twice_with_different_case_is_rejected(self):
+        with mock.patch.object(
+            connect,
+            "get_volume_storage_target",
+            return_value=("iqn.example:vol1", "portal.example", 3260),
+        ):
+            with self.assertRaisesRegex(
+                connect.ElasticSanConnectError,
+                "Volumes 'vol1' and 'VOL1' resolve to the same target IQN",
+            ):
+                connect.build_connection_plan(None, "rg", "san", "vg", ["vol1", "VOL1"], 1)
+
 
 class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
     def setUp(self):
@@ -1439,19 +1596,28 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
 
     def test_successful_run_writes_config_and_adds_sessions(self):
         plans = self._plans()
-        with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"):
-            with mock.patch.object(connect, "ensure_iscsid_enabled_and_running"):
-                with mock.patch.object(connect, "list_iscsi_sessions", side_effect=[[], [
-                    {
-                        "Target name": "iqn.example:vol1",
-                        "Target portal": "redirected:3260",
-                        "Session state": "Connected",
-                        "Enable": "Yes",
-                    },
-                ]]):
-                    with mock.patch.object(connect, "add_iscsi_session") as add_mock:
-                        connect.execute_connection_plan(plans, self.config_path, 1)
+        with mock.patch.object(connect, "ensure_freebsd_prerequisites") as prerequisites:
+            # Pre-mutation inventory, add_sessions_for_volume's re-check, then readiness poll.
+            with mock.patch.object(connect, "list_iscsi_sessions", side_effect=[[], [], [
+                {
+                    "Target name": "iqn.example:vol1",
+                    "Target portal": "redirected:3260",
+                    "Session state": "Connected",
+                    "Enable": "Yes",
+                },
+            ]]):
+                with mock.patch.object(connect, "add_iscsi_session") as add_mock:
+                    with mock.patch("builtins.print") as print_mock:
+                        connected = connect.execute_connection_plan(plans, self.config_path, 1)
+        prerequisites.assert_called_once_with()
+        self.assertEqual(["vol1"], connected)
         self.assertEqual(1, add_mock.call_count)
+        self.assertEqual(
+            1,
+            [call.args for call in print_mock.call_args_list].count(
+                (connect.RECOMMENDED_SETTINGS_NOTICE,)
+            ),
+        )
         self.assertEqual(
             [self.fake_fcntl.LOCK_EX, self.fake_fcntl.LOCK_UN],
             [operation for _, operation in self.fake_fcntl.operations],
@@ -1476,19 +1642,18 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
             )
             return original_restore(*args)
 
-        with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"):
-            with mock.patch.object(connect, "ensure_iscsid_enabled_and_running"):
-                with mock.patch.object(connect, "list_iscsi_sessions", return_value=[]):
+        with mock.patch.object(connect, "ensure_freebsd_prerequisites"):
+            with mock.patch.object(connect, "list_iscsi_sessions", return_value=[]):
+                with mock.patch.object(
+                    connect, "add_iscsi_session", side_effect=connect.ElasticSanConnectError("boom")
+                ):
                     with mock.patch.object(
-                        connect, "add_iscsi_session", side_effect=connect.ElasticSanConnectError("boom")
+                        connect,
+                        "restore_config_from_backup",
+                        side_effect=restore_while_locked,
                     ):
-                        with mock.patch.object(
-                            connect,
-                            "restore_config_from_backup",
-                            side_effect=restore_while_locked,
-                        ):
-                            with self.assertRaisesRegex(connect.ElasticSanConnectError, "restored"):
-                                connect.execute_connection_plan(plans, self.config_path, 1)
+                        with self.assertRaisesRegex(connect.ElasticSanConnectError, "restored"):
+                            connect.execute_connection_plan(plans, self.config_path, 1)
 
         with open(self.config_path, "rb") as handle:
             restored_content = handle.read()
@@ -1502,14 +1667,13 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
     def test_failure_when_config_did_not_exist_before_removes_it_on_rollback(self):
         self.assertFalse(os.path.exists(self.config_path))
         plans = self._plans()
-        with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"):
-            with mock.patch.object(connect, "ensure_iscsid_enabled_and_running"):
-                with mock.patch.object(connect, "list_iscsi_sessions", return_value=[]):
-                    with mock.patch.object(
-                        connect, "add_iscsi_session", side_effect=connect.ElasticSanConnectError("boom")
-                    ):
-                        with self.assertRaises(connect.ElasticSanConnectError):
-                            connect.execute_connection_plan(plans, self.config_path, 1)
+        with mock.patch.object(connect, "ensure_freebsd_prerequisites"):
+            with mock.patch.object(connect, "list_iscsi_sessions", return_value=[]):
+                with mock.patch.object(
+                    connect, "add_iscsi_session", side_effect=connect.ElasticSanConnectError("boom")
+                ):
+                    with self.assertRaises(connect.ElasticSanConnectError):
+                        connect.execute_connection_plan(plans, self.config_path, 1)
         self.assertFalse(os.path.exists(self.config_path))
 
     def test_rerun_with_all_sessions_already_connected_does_not_call_add(self):
@@ -1522,26 +1686,28 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
                 "Enable": "Yes",
             },
         ]
-        with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"):
-            with mock.patch.object(connect, "ensure_iscsid_enabled_and_running"):
-                with mock.patch.object(connect, "list_iscsi_sessions", return_value=already_connected):
-                    with mock.patch.object(connect, "add_iscsi_session") as add_mock:
-                        connect.execute_connection_plan(plans, self.config_path, 1)
+        with mock.patch.object(connect, "ensure_freebsd_prerequisites"):
+            with mock.patch.object(connect, "list_iscsi_sessions", return_value=already_connected):
+                with mock.patch.object(connect, "add_iscsi_session") as add_mock:
+                    connected = connect.execute_connection_plan(plans, self.config_path, 1)
         add_mock.assert_not_called()
+        self.assertEqual([], connected)
+        # A live session without a managed entry is skipped, not made persistent (P9).
+        self.assertFalse(os.path.exists(self.config_path))
 
     def test_empty_plan_is_rejected_before_any_mutation(self):
-        with mock.patch.object(connect, "check_freebsd_mutation_prerequisites") as preflight:
+        with mock.patch.object(connect, "acquire_config_transaction_lock") as acquire_lock:
             with self.assertRaisesRegex(connect.ElasticSanConnectError, "empty"):
                 connect.execute_connection_plan([], self.config_path, 1)
-        preflight.assert_not_called()
+        acquire_lock.assert_not_called()
 
     def test_multi_session_plan_is_rejected_before_any_mutation(self):
         plans = self._plans()
         plans[0].nicknames.append("esan-vg-vol1-s2")
-        with mock.patch.object(connect, "check_freebsd_mutation_prerequisites") as preflight:
+        with mock.patch.object(connect, "acquire_config_transaction_lock") as acquire_lock:
             with self.assertRaisesRegex(connect.ElasticSanConnectError, "exactly one"):
                 connect.execute_connection_plan(plans, self.config_path, 2)
-        preflight.assert_not_called()
+        acquire_lock.assert_not_called()
 
     def test_malformed_existing_block_is_rejected_before_service_mutation(self):
         with open(self.config_path, "wb") as handle:
@@ -1551,10 +1717,9 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
                 + connect.MANAGED_BLOCK_END.encode("utf-8")
                 + b"\n"
             )
-        with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"):
-            with mock.patch.object(connect, "ensure_iscsid_enabled_and_running") as ensure:
-                with self.assertRaisesRegex(connect.ElasticSanConnectError, "unknown"):
-                    connect.execute_connection_plan(self._plans(), self.config_path, 1)
+        with mock.patch.object(connect, "ensure_freebsd_prerequisites") as ensure:
+            with self.assertRaisesRegex(connect.ElasticSanConnectError, "unknown"):
+                connect.execute_connection_plan(self._plans(), self.config_path, 1)
         ensure.assert_not_called()
 
     def test_concurrent_transactions_serialize_without_lost_updates(self):
@@ -1590,8 +1755,8 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
                 errors.append(error)
 
         with mock.patch.object(connect, "fcntl", blocking_fcntl):
-            with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"):
-                with mock.patch.object(connect, "ensure_iscsid_enabled_and_running"):
+            with mock.patch.object(connect, "ensure_freebsd_prerequisites"):
+                with mock.patch.object(connect, "list_iscsi_sessions", return_value=[]):
                     with mock.patch.object(
                         connect, "add_sessions_for_volume", side_effect=add_sessions
                     ):
@@ -1615,6 +1780,320 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
         self.assertIn(second_plan.nicknames[0].encode("ascii"), content)
 
 
+def _session(target_name, state="Connected", enable="Yes"):
+    return {
+        "Target name": target_name,
+        "Target portal": "portal.example:3260",
+        "Session state": state,
+        "Enable": enable,
+        "Header digest": "CRC32C",
+        "Data digest": "CRC32C",
+    }
+
+
+def _volume_plan(volume_name, target_name=None, volume_group_name="vg"):
+    target_name = target_name or "iqn.example:" + volume_name
+    return connect.VolumeConnectionPlan(
+        volume_name,
+        target_name,
+        "portal.example:3260",
+        [connect.build_nickname(volume_group_name, volume_name, target_name, 1)],
+    )
+
+
+class ExistingStatePolicyTests(unittest.TestCase):
+    """Section 4 policy: inventory every volume before mutating any of them and
+    never add a second stanza or session for an IQN."""
+
+    def setUp(self):
+        self.tempdir = tempfile.mkdtemp(prefix="esan-freebsd-state-test-")
+        self.config_path = os.path.join(self.tempdir, "iscsi.conf")
+        self.fcntl_patch = mock.patch.object(connect, "fcntl", RecordingFcntl())
+        self.fcntl_patch.start()
+
+    def tearDown(self):
+        self.fcntl_patch.stop()
+        for name in os.listdir(self.tempdir):
+            os.remove(os.path.join(self.tempdir, name))
+        os.rmdir(self.tempdir)
+
+    def _write_config(self, *entries):
+        content = b"# operator content\n" + connect.render_managed_block(list(entries))
+        with open(self.config_path, "wb") as handle:
+            handle.write(content)
+        return content
+
+    def _read_config(self):
+        with open(self.config_path, "rb") as handle:
+            return handle.read()
+
+    def _execute(self, plans, session_listings):
+        with mock.patch.object(connect, "ensure_freebsd_prerequisites"):
+            with mock.patch.object(connect, "list_iscsi_sessions", side_effect=session_listings):
+                with mock.patch.object(connect, "add_iscsi_session") as add_mock:
+                    with mock.patch("builtins.print") as print_mock:
+                        connected = connect.execute_connection_plan(plans, self.config_path, 1)
+        output = "\n".join(str(call.args[0]) for call in print_mock.call_args_list)
+        return connected, add_mock, output
+
+    def _entry(self, plan):
+        return connect.ManagedConfigEntry(plan.nicknames[0], plan.target_name, plan.target_address)
+
+    def test_managed_and_live_volume_is_skipped_without_config_write(self):
+        plan = _volume_plan("vol1")
+        original = self._write_config(self._entry(plan))
+        connected, add_mock, output = self._execute([plan], [[_session(plan.target_name)]])
+        self.assertEqual([], connected)
+        add_mock.assert_not_called()
+        self.assertIn("vol1 [iqn.example:vol1]: Skipped: already connected (1 live / 1 persistent)", output)
+        self.assertEqual(original, self._read_config())
+        self.assertEqual(
+            sorted(["iscsi.conf", connect.CONFIG_LOCK_FILENAME]), sorted(os.listdir(self.tempdir))
+        )
+
+    def test_own_managed_entry_without_live_session_is_reestablished_once(self):
+        plan = _volume_plan("vol1")
+        self._write_config(self._entry(plan))
+        connected, add_mock, _ = self._execute(
+            [plan], [[], [], [_session(plan.target_name)]]
+        )
+        self.assertEqual(["vol1"], connected)
+        add_mock.assert_called_once_with(plan.nicknames[0], self.config_path)
+        self.assertEqual(1, self._read_config().count(b'TargetName    = "iqn.example:vol1"'))
+
+    def test_foreign_entry_for_same_iqn_is_never_duplicated(self):
+        # Differently cased resource names hash to a different nickname for the same IQN.
+        plan = _volume_plan("vol1")
+        foreign = _volume_plan("Vol1", "IQN.EXAMPLE:VOL1", volume_group_name="VG")
+        original = self._write_config(self._entry(foreign))
+        connected, add_mock, output = self._execute([plan], [[]])
+        self.assertEqual([], connected)
+        add_mock.assert_not_called()
+        self.assertIn("persistent configuration exists but no live sessions", output)
+        self.assertIn("iscsictl -A -n {}".format(foreign.nicknames[0]), output)
+        self.assertEqual(original, self._read_config())
+
+    def test_live_session_without_managed_entry_is_not_made_persistent(self):
+        plan = _volume_plan("vol1")
+        connected, add_mock, output = self._execute([plan], [[_session("IQN.example:VOL1")]])
+        self.assertEqual([], connected)
+        add_mock.assert_not_called()
+        self.assertIn("(1 live / 0 persistent); the session is not persistent", output)
+        self.assertFalse(os.path.exists(self.config_path))
+
+    def test_pre_existing_anomaly_is_skipped_while_other_volumes_connect(self):
+        healthy = _volume_plan("vol1")
+        anomalous = _volume_plan("vol2")
+        anomalies = {
+            "not connected": [_session(anomalous.target_name, state="Disconnected")],
+            "disabled": [_session(anomalous.target_name, enable="No")],
+            "duplicate": [_session(anomalous.target_name), _session(anomalous.target_name)],
+        }
+        for label, anomaly_sessions in anomalies.items():
+            with self.subTest(anomaly=label):
+                if os.path.exists(self.config_path):
+                    os.remove(self.config_path)
+                connected, add_mock, output = self._execute(
+                    [healthy, anomalous],
+                    [anomaly_sessions, anomaly_sessions, anomaly_sessions + [_session(healthy.target_name)]],
+                )
+                self.assertEqual(["vol1"], connected)
+                add_mock.assert_called_once_with(healthy.nicknames[0], self.config_path)
+                self.assertIn("vol2 [iqn.example:vol2]: Skipped: pre-existing session anomaly", output)
+                content = self._read_config()
+                self.assertIn(healthy.nicknames[0].encode("ascii"), content)
+                self.assertNotIn(anomalous.nicknames[0].encode("ascii"), content)
+
+    def test_rollback_error_names_earlier_volumes_that_lost_their_entries(self):
+        first = _volume_plan("vol1")
+        second = _volume_plan("vol2")
+        self._write_config()
+        with mock.patch.object(connect, "ensure_freebsd_prerequisites"):
+            with mock.patch.object(
+                connect,
+                "list_iscsi_sessions",
+                side_effect=[[], [], [_session(first.target_name)], [_session(first.target_name)]],
+            ):
+                with mock.patch.object(
+                    connect,
+                    "add_iscsi_session",
+                    side_effect=[None, connect.ElasticSanConnectError("kernel rejected vol2")],
+                ):
+                    with mock.patch("builtins.print"):
+                        with self.assertRaisesRegex(
+                            connect.ElasticSanConnectError,
+                            r"restored .* Volume\(s\) 'vol1' connected earlier in this run .* "
+                            r"Original error: kernel rejected vol2",
+                        ):
+                            connect.execute_connection_plan([first, second], self.config_path, 1)
+        self.assertNotIn(first.nicknames[0].encode("ascii"), self._read_config())
+
+
+class ValidationTests(unittest.TestCase):
+    PLAN = _volume_plan("vol1")
+    HEALTHY_HOST = {
+        "iscsid_enable": "YES",
+        "iscsictl_flags": "-Aa",
+        "iscsictl_enable": "YES",
+        "iscsi_load": "YES",
+    }
+
+    def _validate(self, connected=True, host=None, driver="module", sessions=None, entries=None):
+        values = dict(self.HEALTHY_HOST, **(host or {}))
+        if sessions is None:
+            sessions = [_session(self.PLAN.target_name)]
+        if entries is None:
+            entries = [
+                connect.ManagedConfigEntry(
+                    self.PLAN.nicknames[0], self.PLAN.target_name, self.PLAN.target_address
+                )
+            ]
+        content = connect.render_managed_block(entries) if entries else b""
+        list_sessions = mock.Mock(
+            side_effect=sessions if isinstance(sessions, Exception) else None,
+            return_value=sessions,
+        )
+        with mock.patch.object(
+            connect, "_query_sysrc", side_effect=lambda variable, config_file=None: values[variable]
+        ), mock.patch.object(connect, "get_iscsi_driver_state", return_value=driver), \
+                mock.patch.object(connect, "list_iscsi_sessions", list_sessions), \
+                mock.patch.object(connect, "read_config_file", return_value=(content, True, None)), \
+                mock.patch("builtins.print") as print_mock:
+            failed = connect.validate_connections(
+                [self.PLAN], ["vol1"] if connected else [], "/etc/iscsi.conf"
+            )
+        return failed, [call.args[0] for call in print_mock.call_args_list]
+
+    def test_healthy_host_passes_with_loaded_or_compiled_in_driver(self):
+        for driver, detail in (
+            ("module", 'iscsi.ko loaded; iscsi_load="YES" in /boot/loader.conf'),
+            ("compiled-in", "compiled into the kernel"),
+        ):
+            with self.subTest(driver=driver):
+                failed, lines = self._validate(driver=driver)
+                self.assertEqual(0, failed)
+                self.assertIn("[PASS] iSCSI kernel driver: " + detail, lines)
+                self.assertIn("[PASS] vol1 [iqn.example:vol1] session: 1 Connected", lines)
+                self.assertIn(
+                    "[PASS] vol1 [iqn.example:vol1] digests: header CRC32C, data CRC32C", lines
+                )
+                self.assertEqual("Validation: 6 passed, 0 warnings, 0 failed", lines[-1])
+
+    def test_host_problems_fail_and_customized_iscsictl_flags_warn(self):
+        cases = [
+            ({"iscsid_enable": "NO"}, "module", "[FAIL] iscsid_enable: NO"),
+            ({"iscsictl_enable": "NO"}, "module", "[FAIL] iscsictl_enable: NO"),
+            ({"iscsi_load": ""}, "module", "[FAIL] iSCSI kernel driver: iscsi.ko loaded but"),
+            ({}, "missing", "[FAIL] iSCSI kernel driver: not loaded"),
+            ({"iscsictl_flags": "-A -n other", "iscsictl_enable": "NO"}, "module",
+             "[WARN] iscsictl_enable: NO with customized iscsictl_flags '-A -n other'"),
+            ({"iscsictl_flags": ""}, "module",
+             "[WARN] iscsictl_enable: YES with customized iscsictl_flags ''"),
+        ]
+        for host, driver, expected in cases:
+            with self.subTest(expected=expected):
+                failed, lines = self._validate(host=host, driver=driver)
+                self.assertTrue(any(line.startswith(expected) for line in lines), lines)
+                self.assertEqual(0 if expected.startswith("[WARN]") else 1, failed)
+
+    def test_volume_problems_fail_when_connected_this_run_and_warn_when_skipped(self):
+        weak_session = dict(_session(self.PLAN.target_name), **{"Header digest": "None"})
+        for connected, severity in ((True, "FAIL"), (False, "WARN")):
+            with self.subTest(connected=connected):
+                failed, lines = self._validate(
+                    connected=connected, sessions=[weak_session], entries=[]
+                )
+                self.assertIn(
+                    "[{}] vol1 [iqn.example:vol1] digests: header None, data CRC32C; expected "
+                    "header CRC32C, data CRC32C".format(severity),
+                    lines,
+                )
+                self.assertIn(
+                    "[{}] vol1 [iqn.example:vol1] managed entry: none in /etc/iscsi.conf; the "
+                    "session is not persistent".format(severity),
+                    lines,
+                )
+                self.assertEqual(2 if connected else 0, failed)
+
+    def test_skipped_volume_without_session_warns_and_extra_sessions_always_warn(self):
+        _, lines = self._validate(connected=False, sessions=[])
+        self.assertIn("[WARN] vol1 [iqn.example:vol1] session: no session", lines)
+        self.assertFalse(any("digests" in line for line in lines))
+
+        failed, lines = self._validate(
+            sessions=[_session(self.PLAN.target_name), _session(self.PLAN.target_name)]
+        )
+        self.assertEqual(0, failed)
+        self.assertTrue(
+            any(line.startswith("[WARN] vol1 [iqn.example:vol1] session: 2 sessions") for line in lines)
+        )
+
+    def test_session_inventory_failure_is_a_single_fail(self):
+        failed, lines = self._validate(
+            sessions=connect.ElasticSanConnectError("iscsictl session listing failed: boom")
+        )
+        self.assertEqual(1, failed)
+        self.assertIn(
+            "[FAIL] iSCSI sessions: could not list sessions: iscsictl session listing failed: boom",
+            lines,
+        )
+        self.assertFalse(any(" session: " in line for line in lines))
+
+
+class MainFlowTests(unittest.TestCase):
+    ARGV = ["-g", "rg", "-e", "san", "-v", "vg", "-n", "vol1"]
+
+    def test_non_root_mutating_run_stops_before_any_azure_lookup(self):
+        with mock.patch.object(connect.os, "geteuid", return_value=1000, create=True):
+            with mock.patch.object(connect, "check_az_cli_available") as check_az:
+                with self.assertRaisesRegex(connect.ElasticSanConnectError, "must be run as root"):
+                    connect.main(self.ARGV)
+        check_az.assert_not_called()
+
+    def _main(self, execute, failed_checks=0):
+        with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"), \
+                mock.patch.object(connect, "check_az_cli_available"), \
+                mock.patch.object(connect, "build_connection_plan", return_value=[_volume_plan("vol1")]), \
+                mock.patch.object(connect, "execute_connection_plan", execute), \
+                mock.patch.object(connect, "validate_connections", return_value=failed_checks) as validate:
+            connect.main(self.ARGV)
+        return validate
+
+    def test_validation_failure_ends_the_run_in_error(self):
+        with self.assertRaisesRegex(connect.ElasticSanConnectError, "reported 2 failed check"):
+            self._main(mock.Mock(return_value=["vol1"]), failed_checks=2)
+
+    def test_successful_validation_returns_normally(self):
+        validate = self._main(mock.Mock(return_value=["vol1"]))
+        self.assertEqual(["vol1"], validate.call_args.args[1])
+
+    def test_connect_phase_failure_stops_without_validation(self):
+        execute = mock.Mock(side_effect=connect.ElasticSanConnectError("Failed while establishing"))
+        with mock.patch.object(connect, "validate_connections") as validate:
+            with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"), \
+                    mock.patch.object(connect, "check_az_cli_available"), \
+                    mock.patch.object(connect, "build_connection_plan", return_value=[_volume_plan("vol1")]), \
+                    mock.patch.object(connect, "execute_connection_plan", execute):
+                with self.assertRaisesRegex(connect.ElasticSanConnectError, "Failed while establishing"):
+                    connect.main(self.ARGV)
+        validate.assert_not_called()
+
+    def test_script_reports_stops_as_one_error_line_without_traceback(self):
+        result = subprocess.run(
+            [sys.executable, SCRIPT_PATH, "-g", "rg"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(1, result.returncode)
+        self.assertEqual(
+            "ERROR: Need to provide resource_group_name, elastic_san_name, volume_group_name, "
+            "volume_names to connect to the Elastic SAN volume(s)",
+            result.stderr.strip(),
+        )
+        self.assertNotIn("Traceback", result.stderr)
+
+
 class EnabledInputPreflightTests(unittest.TestCase):
     def test_malformed_later_portal_fails_before_execution(self):
         invalid_portals = [
@@ -1633,7 +2112,8 @@ class EnabledInputPreflightTests(unittest.TestCase):
                             argv.append("--enable-zonal-affinity")
                         if dry_run:
                             argv.append("--dry-run")
-                        with mock.patch.object(connect, "check_az_cli_available"):
+                        with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"), \
+                                mock.patch.object(connect, "check_az_cli_available"):
                             with mock.patch.object(connect, "resolve_physical_zone", return_value=("eastus-az3", "sub")):
                                 with mock.patch.object(connect, "get_volume_storage_target", side_effect=[
                                     ("iqn.example:first", "first.example", 3260),
@@ -1701,7 +2181,8 @@ class EnabledInputPreflightTests(unittest.TestCase):
                     ]
                     if dry_run:
                         argv.append("--dry-run")
-                    with mock.patch.object(connect, "check_az_cli_available"):
+                    with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"), \
+                            mock.patch.object(connect, "check_az_cli_available"):
                         with mock.patch.object(
                             connect, "resolve_physical_zone", return_value=("eastus-az3", "sub")
                         ):
@@ -1737,7 +2218,9 @@ class EnabledInputPreflightTests(unittest.TestCase):
                     connect, "_run_subprocess",
                     side_effect=[(0, output, "") for output in outputs],
                 ) as run:
-                    with mock.patch.object(connect, "execute_connection_plan") as execute:
+                    with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"), \
+                            mock.patch.object(connect, "validate_connections", return_value=0), \
+                            mock.patch.object(connect, "execute_connection_plan") as execute:
                         connect.main([
                             "--elastic-san-subscription", subscription_id,
                             "-g", "rg", "-e", "san", "-v", "vg", "-n", "first", "second",

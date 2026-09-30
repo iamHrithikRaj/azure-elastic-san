@@ -24,11 +24,13 @@ the two scripts.
 
 ## Prerequisites
 
-* **FreeBSD 13 or later** with the native iSCSI initiator available:
-  `/dev/iscsi` must exist (the `iscsi_initiator` kernel driver is built into
-  the `GENERIC` kernel; if you run a custom kernel, add
-  `device iscsi` / `device iscsi_initiator`, or load it at boot with
-  `iscsi_load="YES"` in `/boot/loader.conf`, or `kldload iscsi`).
+* **FreeBSD 13 or later** with the native iSCSI initiator (`iscsi(4)`,
+  `iscsid(8)`, `iscsictl(8)`). A mutating run checks `uname -s` and
+  `freebsd-version -u` and stops on anything else. The stock `GENERIC` kernel
+  does **not** include `device iscsi`; the driver ships as the loadable
+  `iscsi.ko` module, which the script loads and persists for you (see
+  "Host prerequisites" below). A custom kernel with `device iscsi` compiled in
+  is also accepted.
 * **Python 3** (the script uses only the standard library).
 * **Azure CLI (`az`) with the `elastic-san` extension.** On FreeBSD, Azure CLI
   is provided by the FreeBSD Ports Collection / community packages (e.g.
@@ -40,14 +42,16 @@ the two scripts.
   (`az extension add -n elastic-san`), but it cannot verify broader
   Azure-CLI-on-FreeBSD compatibility -- validate that yourself before relying
   on this in production.
-* **Root** for any mutating action (writing `/etc/iscsi.conf`,
-  enabling/starting `iscsid`, adding iSCSI sessions). `--dry-run` does not
+* **Root** for any mutating action (writing `/etc/iscsi.conf`, loading and
+  persisting the `iscsi` kernel module, enabling/starting `iscsid`, enabling
+  boot-time session re-login, adding iSCSI sessions). `--dry-run` does not
   require root and performs no mutation.
 
 This script intentionally does **not**:
 * call `iscsiadm`, `systemd`, or any Linux package manager;
 * call `iscsictl -R -a` (or otherwise disconnect/remove sessions);
-* restart the `iscsid` service, or touch sessions it did not create;
+* restart the `iscsid` service, start the `iscsictl` rc service, or touch
+  sessions it did not create;
 * assemble `gmultipath` devices. Session creation is not multipath-device
   assembly, and this one-session PoC does not automate `gmultipath`. Any future
   multi-path design must separately map the correct `/dev/da*` devices and
@@ -85,7 +89,35 @@ python3 connect_for_documentation.py --subscription <sub-id-or-name> ...
 | `-n`, `--volumes` | | One or more volume names |
 | `-s`, `--num-of-sessions` | | Sessions per volume; must be exactly 1 (default: 1 -- see "Session count" below) |
 | `--enable-zonal-affinity` | | Opt in to provisional logical→physical AZ IQN suffix (see below) |
+| `--skip-recommended-settings` | | Accepted for CLI parity with the Linux/Windows scripts; no effect on FreeBSD (see "Recommended settings") |
 | `--dry-run` | | Read-only discovery/planning only; no mutation (see below) |
+
+## Execution order
+
+A mutating run always follows the same order as the Linux and Windows
+scripts. Any stop prints one `ERROR: <message>` line on stderr and exits
+with status 1 (no Python traceback):
+
+1. **Privilege**: must be root.
+2. **Platform**: `uname -s` must be `FreeBSD`, the required tools
+   (`iscsictl`, `service`, `sysrc`, `kldstat`, `kldload`, `freebsd-version`)
+   must be on `PATH`, and `freebsd-version -u` must report 13 or later.
+3. **Read-only lookup**: Azure CLI check and per-volume storage-target lookup
+   (plus zonal mapping when opted in).
+4. **Host prerequisites**: iSCSI kernel driver, `iscsid`, and boot-time
+   re-login (see "Host prerequisites").
+5. **Recommended settings**: prints the single informational line described
+   under "Recommended settings"; nothing is changed.
+6. **Pre-mutation plan**: one `iscsictl -L -v` inventory, then every selected
+   volume is classified (see "Existing connections and reruns") before any
+   config or session is changed.
+7. **Connect**: the managed entries for the volumes that need them are written
+   and their sessions are added (see "Atomic write, backup, and rollback").
+8. **Validation**: read-only `[PASS]`/`[WARN]`/`[FAIL]` checks and a summary
+   (see "Validation and exit codes"). Any `[FAIL]` ends the run in error.
+
+Nothing on FreeBSD needs a reboot to take effect, so the script never prints
+a reboot notice.
 
 ## `--dry-run`
 
@@ -94,8 +126,9 @@ and Azure Resource Manager zonal lookups (if `--enable-zonal-affinity` is
 set), the per-volume storage-target lookup, and nickname/config-block
 computation -- and prints the plan (resolved targets, nicknames, and the
 selected entries that would be merged into the managed block). It does **not**
-run `sysrc`, `service`, or `iscsictl`, and does **not** write
-`/etc/iscsi.conf`. It does not require root.
+run `sysrc`, `service`, `iscsictl`, `kldstat`, `kldload`, or
+`freebsd-version`, does **not** write `/etc/iscsi.conf`, and skips the
+privilege/platform checks and validation. It does not require root.
 
 Subprocess output is captured in temporary files, including during dry-run,
 so inherited output handles cannot make timeout cleanup wait indefinitely.
@@ -105,14 +138,13 @@ services and other descendants are not killed as a process group.
 
 Because inspecting existing sessions requires opening `/dev/iscsi` (which
 generally requires root), `--dry-run` does not inspect current session state
-and plans one session per volume. The real run checks readiness before
-submitting a session -- see "Idempotency and reruns" below.
+and plans one session per volume. The real run inventories existing sessions
+before changing anything -- see "Existing connections and reruns" below.
 Native inspection is not inherently read-only:
 [`iscsictl` startup](https://github.com/freebsd/freebsd-src/blob/25985322095d073354d31431da34da1e6871cca5/usr.bin/iscsictl/iscsictl.c#L881-L891)
 can load the kernel module when `/dev/iscsi` is missing. Dry-run avoids all
-`iscsictl` calls, not just session-add commands. A mutating run requires the
-device node to exist, but does not provide a globally read-only native-state
-preflight guarantee.
+`iscsictl` calls, not just session-add commands. A mutating run loads the
+module explicitly (see "Host prerequisites") before inspecting sessions.
 Because the existing config is intentionally not opened in unprivileged
 dry-run mode, retained managed entries for unselected volumes are not included
 in the preview.
@@ -189,12 +221,14 @@ ASCII hostname with valid DNS labels, and the raw port must be an integer from
 is performed.
 
 We deliberately do not set `LoginTimeout`/`PingTimeout` in the generated
-stanzas. `iscsi.conf(5)` exposes both, but this PoC has no evidence-based
-"safe default" for either across Elastic SAN's network paths and simply
-inherits FreeBSD's built-in defaults (`kern.iscsi.login_timeout` = 60s,
+stanzas. `iscsi.conf(5)` only has them on FreeBSD 14.0 and later (13.x
+`iscsictl` rejects the whole file if they appear), the managed-block format is
+shared with the Azure portal script, and this PoC has no evidence-based "safe
+default" for either across Elastic SAN's network paths. The script inherits
+FreeBSD's built-in defaults (`kern.iscsi.login_timeout` = 60s,
 `kern.iscsi.ping_timeout` = 5s). Tune them explicitly in your own
 `/etc/iscsi.conf` if your environment needs different values -- outside the
-managed block, so they survive reruns.
+managed block, so they survive reruns. See "Recommended settings" below.
 
 ### Atomic write, backup, and rollback
 
@@ -203,10 +237,10 @@ Mutating runs are serialized with an exclusive `fcntl.flock` on the separate
 `/etc/iscsi.conf` itself is atomically replaced. The lock is securely opened
 without following symlinks where the platform supports `O_NOFOLLOW`, must be a
 regular non-symlink file, and is created with mode `0600`. It is acquired before
-reading or merging the config and held through backup, atomic write, `iscsid`
-setup, session setup, and any rollback. This prevents concurrent standalone or
-portal-generated runs that honor the same lock contract from losing each
-other's updates. `--dry-run` neither creates nor acquires the lock.
+reading or merging the config and held through backup, atomic write, host
+prerequisites, session setup, and any rollback. This prevents concurrent
+standalone or portal-generated runs that honor the same lock contract from
+losing each other's updates. `--dry-run` neither creates nor acquires the lock.
 
 While holding that lock, every write to `/etc/iscsi.conf` goes through: write a
 temp file in the same directory → `fsync` → preserve the original file's
@@ -216,50 +250,158 @@ exact current bytes are copied to a backup file
 (`/etc/iscsi.conf.bak.pre-esan-connect.<pid>`, created with restrictive `0600`
 permissions regardless of the original file's mode, since preserved unrelated
 stanzas may contain CHAP secrets). The backup is **not** deleted automatically;
-it's left behind for manual recovery.
+it's left behind for manual recovery. Only the volumes that the pre-mutation
+plan selects for connection get a managed entry written; when every selected
+volume is skipped, the file is neither written nor backed up.
 
 If starting/configuring the requested sessions then fails partway through,
-the script restores `/etc/iscsi.conf` from that backup (or deletes the file
-entirely if it did not exist before this run) before re-raising the error.
+the script stops and restores `/etc/iscsi.conf` from that backup (or deletes
+the file entirely if it did not exist before this run) before exiting with an
+error. Validation is not run in that case.
 This only ever rolls back the **config file** -- it never disconnects or
 removes any iSCSI session. After `iscsictl -A` has been submitted, a session
 may already be live or may become live after a timeout even though the config
 file was restored. Always inspect `iscsictl -L -v` before retrying a failed run.
-Service enablement/start is not rolled back either. Input preflight is not an
-all-volume transaction: if connecting a later volume fails, earlier volumes
-may remain connected.
+Host prerequisite changes (kernel module, `iscsid`, `iscsictl_enable`) are not
+rolled back either. Input preflight is not an all-volume transaction: if
+connecting a later volume fails, earlier volumes may remain connected. The
+whole-file restore also removes those earlier volumes' managed entries, so
+they are not re-added at boot and a rerun skips them as "not persistent"
+(the script never rewrites a live volume's configuration). The error message
+names these volumes; to make them persistent, disconnect them during a
+maintenance window and re-run.
 
-## Idempotency and reruns
+## Existing connections and reruns
 
 Re-running the script with the same arguments regenerates an identical
 managed block (nicknames are deterministic), so the config file converges
 rather than accumulating duplicate stanzas.
 
-Before adding a session, the script parses `Target name`, `Target portal`,
-`Enable`, and `Session state` from `iscsictl -L -v`. It matches by **target IQN
-only**, not by the original portal: a successful iSCSI `TargetAddress` login
-redirect legitimately changes the portal shown by FreeBSD.
+Before changing any config or session, the script takes one `iscsictl -L -v`
+inventory and classifies **every** selected volume. It correlates by **target
+IQN only** (exact, case-insensitive), not by the original portal: a
+successful iSCSI `TargetAddress` login redirect legitimately changes the
+portal shown by FreeBSD. "Persistent" means an entry for that IQN in the
+managed block of `/etc/iscsi.conf`.
 
-* A matching `Connected` session is idempotent success and is skipped.
-* A matching disconnected, disabled, or otherwise non-connected session fails
-  with recovery guidance. The script neither adds a duplicate nor removes the
-  stale session.
-* Multiple matching sessions fail because this PoC supports exactly one.
-* With no match, the script submits exactly
-  `iscsictl -A -n <nickname> -c /etc/iscsi.conf` (without `-w`), then polls
-  `iscsictl -L -v` for up to 30 seconds until that target IQN is `Connected`.
-  Unrelated disconnected sessions are ignored. A timeout is explicit and does
-  not remove or roll back a session that may already have been created.
+| Live sessions for the IQN | Managed entries for the IQN | Action |
+| --- | --- | --- |
+| none | none | Connect: write the entry and add the session |
+| none | exactly this volume's entry | Re-establish that single configured session; no new entry |
+| none | a different entry (for example, written with differently cased resource names) or several | Skip: `persistent configuration exists but no live sessions`, with the `iscsictl -A -n <nickname>` command to establish it. A second entry is never added |
+| one `Connected` | any | Skip: `already connected (<live> live / <persistent> persistent)`. With no managed entry the session is reported as not persistent; the script does not add one (disconnect it and re-run to make it persistent) |
+| more than one, or any not `Connected`/disabled | any | Skip as a pre-existing anomaly, with manual-recovery guidance. The script never adds, removes, or modifies those sessions |
 
-## `iscsid` service management
+A skipped volume's state is reported by validation as `[WARN]`, because this
+script never disconnects or rewrites existing sessions. Stanzas outside the
+managed block are not inspected: a hand-written stanza for the same IQN
+elsewhere in `/etc/iscsi.conf` is not detected. Selecting the same volume
+twice in one run (for example `-n vol1 VOL1`, which resolve to the same IQN)
+is rejected during planning, before any change.
 
-The script enables `iscsid` persistently with `sysrc iscsid_enable=YES`, but
-only writes that value if `sysrc -n iscsid_enable` doesn't already report
-`YES`; an unset variable (reported by `sysrc` as a non-zero exit) is treated
-as disabled and set to `YES` (idempotent, avoids noisy reruns). It checks
-whether `iscsid` is already running with `service iscsid onestatus` and only
-runs `service iscsid start` if it isn't. It never restarts `iscsid` and never
-touches sessions/targets it did not create itself.
+For a volume being connected, the script submits exactly
+`iscsictl -A -n <nickname> -c /etc/iscsi.conf` (without `-w`), then polls
+`iscsictl -L -v` for up to 30 seconds until that target IQN is `Connected`.
+Just before submitting, it re-checks that volume's sessions; if one appeared
+since the inventory, it is skipped (`Connected`) or the run stops (anomaly).
+Unrelated disconnected sessions are ignored. A timeout is explicit and does
+not remove or roll back a session that may already have been created.
+
+## Host prerequisites
+
+* **iSCSI kernel driver.** `kldstat -q -n iscsi` detects the loadable
+  `iscsi.ko` module by file name. (`kldstat -m iscsi` would also match a
+  driver compiled into the kernel.)
+  * Module loaded: `iscsi_load="YES"` is persisted with
+    `sysrc -f /boot/loader.conf iscsi_load=YES`, only if it is not already set.
+  * No module but `/dev/iscsi` exists: the driver is compiled into the kernel;
+    nothing is loaded or persisted.
+  * Neither: `kldload iscsi`, then persist as above. If loading fails, or
+    `/dev/iscsi` still does not exist, the run stops before touching the
+    config or any session.
+* **`iscsid`.** The script enables `iscsid` persistently with
+  `sysrc iscsid_enable=YES`, but only writes that value if
+  `sysrc -n iscsid_enable` doesn't already report `YES`; an unset variable
+  (reported by `sysrc` as a non-zero exit) is treated as disabled and set to
+  `YES`. It checks whether `iscsid` is already running with
+  `service iscsid onestatus` and only runs `service iscsid start` if it isn't.
+  It never restarts `iscsid` and never touches sessions/targets it did not
+  create itself.
+* **Boot persistence (`iscsictl_enable`).** FreeBSD keeps iSCSI sessions only
+  in kernel memory. After a reboot, nothing re-adds them unless the
+  `iscsictl` rc service is enabled; the earlier versions of this script and of
+  the Azure portal FreeBSD script did not enable it, so managed sessions were
+  not re-established after a reboot. This is the FreeBSD equivalent of
+  Windows persistent logins and Linux `node.startup = automatic`.
+  * If `iscsictl_flags` is the stock `-Aa` (the `/etc/defaults/rc.conf`
+    value) or undefined, the script sets `iscsictl_enable=YES` (only if it
+    isn't already `YES`).
+  * If `iscsictl_flags` is customized, neither variable is changed and
+    validation reports a `[WARN]`. An explicitly empty value counts as
+    customized: `rc.d/iscsictl` would then run a bare `iscsictl`, which only
+    lists sessions.
+  * The service is only enabled, not started, so this run doesn't connect
+    anything else. **Note:** at boot, the stock `iscsictl -Aa` adds **every**
+    stanza in `/etc/iscsi.conf` as a session, not only the managed ones.
+    Stanzas with `Enable = Off` are added disabled and don't log in; use that
+    for your own stanzas that should stay manual.
+
+## Recommended settings (`--skip-recommended-settings`)
+
+The Windows and Linux scripts apply the client-side values from
+[Elastic SAN configuration best practices](https://learn.microsoft.com/azure/storage/elastic-san/elastic-san-best-practices)
+unless `-SkipRecommendedSettings` / `--skip-recommended-settings` is passed.
+On FreeBSD, none of those values has a safe, documented equivalent, so this
+script changes nothing and prints exactly one line in the settings step:
+
+```
+Recommended settings: not applicable on FreeBSD; no Elastic SAN tuning value has a documented FreeBSD equivalent.
+```
+
+`--skip-recommended-settings` is accepted so the same command line works for
+every platform, and has no effect. The Azure portal's generated FreeBSD script
+prints the same line.
+
+| Windows / Linux setting | Value | FreeBSD |
+| --- | --- | --- |
+| `MaxTransferLength` / `MaxXmitDataSegmentLength`, `MaxRecvDataSegmentLength` | 262144 | No `iscsi.conf(5)` or `iscsi(4)` knob. The initiator limit comes from the undocumented, host-wide sysctl `kern.icl.soft.max_data_segment_length`, which already defaults to 256 KiB (`sys/dev/iscsi/icl_soft.c`, FreeBSD 13.0 and 14.1). |
+| `MaxBurstLength`, `FirstBurstLength` | 262144 | No documented knob; only the undocumented, host-wide `kern.icl.soft.max_burst_length` / `first_burst_length` sysctls (1 MiB, negotiated down to the target's value). |
+| `InitialR2T` | 0 / `No` | Not configurable: `iscsid` always proposes `InitialR2T=Yes` (`usr.sbin/iscsid/login.c`). |
+| `ImmediateData` | 1 / `Yes` | Not configurable: `iscsid` always proposes `ImmediateData=Yes`, which already matches. |
+| `WMIRequestTimeout` / `node.conn[0].timeo.login_timeout` | 30 | `LoginTimeout` exists in `iscsi.conf(5)` only on FreeBSD 14.0+; 13.x `iscsictl` rejects the file, and it would change the shared managed-block format. `kern.iscsi.login_timeout` (`iscsi(4)`) is host-wide and defaults to 60 s, already more tolerant than 30 s. |
+| `node.conn[0].timeo.logout_timeout` | 15 | No equivalent. |
+| `LinkDownTime` | 30 | No equivalent. `kern.iscsi.ping_timeout` and `kern.iscsi.fail_on_disconnection` have different semantics and are host-wide. |
+| MPIO (MSDSM claim, round robin, disk timeout) / Linux `multipath.conf` | -- | Not applicable: this PoC uses one session per volume and does not automate `gmultipath(8)`. |
+| Header/data digest `CRC32C` | always | Always written in every managed stanza (not opt-out) and checked by validation. |
+
+## Validation and exit codes
+
+After the connect phase completes, the script runs read-only checks and prints
+one line per check, followed by a summary:
+
+```
+[PASS] iscsid_enable: YES
+[PASS] iscsictl_enable: YES (sessions are re-added at boot)
+[PASS] iSCSI kernel driver: iscsi.ko loaded; iscsi_load="YES" in /boot/loader.conf
+[PASS] volume1 [iqn...] session: 1 Connected
+[PASS] volume1 [iqn...] digests: header CRC32C, data CRC32C
+[PASS] volume1 [iqn...] managed entry: esan-...-s1
+Validation: 6 passed, 0 warnings, 0 failed
+```
+
+| Check | PASS | WARN | FAIL |
+| --- | --- | --- | --- |
+| `iscsid_enable` | `YES` | | anything else |
+| `iscsictl_enable` | `YES` with stock `iscsictl_flags` | `iscsictl_flags` customized (left unchanged) | not `YES` with stock flags |
+| iSCSI kernel driver | `iscsi.ko` loaded and `iscsi_load="YES"`, or compiled into the kernel | | otherwise |
+| `<volume> [<iqn>] session` | exactly one `Connected` session | more than one session; or a skipped volume with no `Connected` session | no `Connected` session on a volume connected in this run |
+| `<volume> [<iqn>] digests` | header and data `CRC32C` | not `CRC32C` on a skipped volume | not `CRC32C` on a volume connected in this run |
+| `<volume> [<iqn>] managed entry` | exactly one managed entry | none on a skipped volume (not persistent), or more than one | none on a volume connected in this run |
+
+If the session inventory or the config cannot be read during validation, that
+is reported as one `[FAIL]` line and the dependent per-volume checks are
+omitted. Any `[FAIL]` makes the script exit with status 1 and an
+`ERROR: Validation reported N failed check(s)` line on stderr.
 
 ## Session count
 
@@ -339,8 +481,10 @@ yourself before depending on it in production:
    initiator fork, scripts, and target/backend version before production use.
 5. **Native and end-to-end qualification is outstanding.** Unit tests do not
    establish suffix parsing/routing support, native login or redirect behavior,
-   reboot recovery, dual-stack operation, zone-failure recovery, or an
-   approximately 30-second recovery-time objective.
+   kernel-module loading, boot-time re-login through `iscsictl_enable`,
+   dual-stack operation, zone-failure recovery, or an approximately 30-second
+   recovery-time objective. Validate on FreeBSD 13.x and 14.x before relying
+   on it.
 
 ## Testing
 
