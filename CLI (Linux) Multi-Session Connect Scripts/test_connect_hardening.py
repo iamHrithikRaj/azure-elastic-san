@@ -11,6 +11,8 @@ from unittest import mock
 
 from test_connect_for_documentation import SCRIPT_PATH, connect
 
+REAL_FIND_TOOL = connect.find_tool
+
 
 def iqn(volume):
     return "iqn.2023-01.net.windows.core.blob.elasticsan.es-test:" + volume
@@ -62,7 +64,12 @@ class FakeHost(object):
         self.sessions = []  # [sid, target name, portal]
         self.next_sid = 1
         self.sudo_allowed = True
+        self.tools = {"sudo", "iscsi-iname", "mpathconf", "apt-get", "dnf", "yum", "zypper", "tdnf"}
         self.failed_logins = set()
+        self.login_error_with_session = False
+        self.session_reads_fail_after_login = False
+        self.login_attempted = False
+        self.failed_updates = set()
         self.fail_clones = False
         self.negotiated_data_digest = "CRC32C"
         self.registered = set()
@@ -82,6 +89,9 @@ class FakeHost(object):
                 return out.encode("utf-8"), err.encode("utf-8")
 
         return Process()
+
+    def find_tool(self, name):
+        return "/usr/sbin/" + name if name in self.tools else None
 
     def add_session(self, target_name, portal=PORTAL):
         self.sessions.append([str(self.next_sid), target_name, portal])
@@ -174,6 +184,8 @@ class FakeHost(object):
 
     def iscsiadm(self, args):
         if args == ["-m", "session"]:
+            if self.session_reads_fail_after_login and self.login_attempted:
+                return 1, "", "iscsiadm: permission denied"
             if not self.sessions:
                 return 21, "", "iscsiadm: No active sessions."
             return 0, "".join("tcp: [{}] {},-1 {} (non-flash)\n".format(sid, portal, target)
@@ -209,12 +221,17 @@ class FakeHost(object):
             del self.nodes[key]
             return 0, "", ""
         if args[-1] == "--login":
+            self.login_attempted = True
             if key[1] in self.failed_logins:
+                if self.login_error_with_session:
+                    self.add_session(*key)
                 return 15, "", "iscsiadm: Could not login to [{}]".format(key[1])
             for _ in range(int(self.nodes[key]["node.session.nr_sessions"])):
                 self.add_session(*key)
             return 0, "Login successful", ""
         assert args[args.index("--op") + 1] == "update", args
+        if args[args.index("-n") + 1] in self.failed_updates:
+            return 1, "", "iscsiadm: update failed"
         self.nodes[key][args[args.index("-n") + 1]] = args[args.index("-v") + 1]
         return 0, "", ""
 
@@ -233,6 +250,7 @@ class HardeningTestCase(unittest.TestCase):
         patches = (
             mock.patch.object(connect.subprocess, "Popen", side_effect=self.host),
             mock.patch.object(connect.os, "geteuid", create=True, return_value=1000),
+            mock.patch.object(connect, "find_tool", side_effect=lambda name: self.host.find_tool(name)),
             mock.patch.object(connect, "read_os_release", return_value={"ID": "ubuntu", "ID_LIKE": "debian"}),
             mock.patch.object(connect, "get_iqns", side_effect=lookup),
             mock.patch.object(connect.time, "sleep"),
@@ -305,11 +323,12 @@ class PlatformTests(HardeningTestCase):
                                    "device-mapper-multipath"]),
         ):
             with self.subTest(family=family, has_dnf=has_dnf):
-                host = FakeHost(family)
+                self.host = host = FakeHost(family)
                 host.packages.clear()
+                if not has_dnf:
+                    host.tools.discard("dnf")
                 with mock.patch.object(connect.subprocess, "Popen", side_effect=host):
-                    with mock.patch.object(connect.os.path, "exists", side_effect=lambda path: has_dnf):
-                        connect.ensure_prerequisites(family)
+                    connect.ensure_prerequisites(family)
                 self.assertIn(expected, host.commands)
                 self.assertEqual(family == "debian", ["sudo", "apt-get", "update", "-q"] in host.commands)
                 self.assertEqual(set(connect.PREREQUISITE_PACKAGES[family]), host.packages)
@@ -326,7 +345,7 @@ class PlatformTests(HardeningTestCase):
                          [c for c in self.host.ran("sudo", "systemctl") if "open-iscsi" in c])
 
     def test_rhel_creates_missing_initiator_name_and_multipath_conf(self):
-        host = FakeHost("rhel")
+        self.host = host = FakeHost("rhel")
         host.files.clear()
         with mock.patch.object(connect.subprocess, "Popen", side_effect=host):
             connect.ensure_prerequisites("rhel")
@@ -336,6 +355,48 @@ class PlatformTests(HardeningTestCase):
         self.assertLess(host.index(lambda c: c[1:2] == ["mpathconf"]),
                         host.index(lambda c: c[-1] == "multipathd" and "--now" in c))
         self.assertIn(connect.MULTIPATH_CONF, host.files)
+
+    def test_tools_are_found_outside_a_non_root_path(self):
+        def which(name, path=None):
+            return None if path is None else "/usr/sbin/" + name
+
+        with mock.patch.object(connect.shutil, "which", side_effect=which) as probe:
+            self.assertEqual("/usr/sbin/mpathconf", REAL_FIND_TOOL("mpathconf"))
+        self.assertEqual([mock.call("mpathconf"), mock.call("mpathconf", path=connect.TOOL_SEARCH_PATH)],
+                         probe.call_args_list)
+
+    def test_missing_tools_stop_with_guidance_before_running_them(self):
+        def missing_sudo(host):
+            connect.check_privileges()
+
+        def missing_iname(host):
+            del host.files[connect.INITIATOR_NAME_FILE]
+            connect.ensure_prerequisites("debian")
+
+        def missing_mpathconf(host):
+            del host.files[connect.MULTIPATH_CONF]
+            connect.ensure_prerequisites("rhel")
+
+        def missing_tdnf(host):
+            host.packages.clear()
+            connect.ensure_prerequisites("azurelinux")
+
+        for tool, family, act in (("sudo", "debian", missing_sudo), ("iscsi-iname", "debian", missing_iname),
+                                  ("mpathconf", "rhel", missing_mpathconf), ("tdnf", "azurelinux", missing_tdnf)):
+            with self.subTest(tool=tool):
+                self.host = FakeHost(family)
+                self.host.tools.discard(tool)
+                with mock.patch.object(connect.subprocess, "Popen", side_effect=self.host):
+                    with self.assertRaisesRegex(connect.ConnectScriptError, "^{} was not found".format(tool)):
+                        act(self.host)
+                self.assertFalse(any(tool in command for command in self.host.commands))
+
+    def test_missing_login_unit_warns(self):
+        self.host.unit_files = {"iscsid", "multipathd"}
+        self.run_main()
+        self.assertIn("[WARN] iSCSI login unit: neither open-iscsi.service nor iscsi.service exists; "
+                      "automatic node records may not log in at boot", self.stdout)
+        self.assertEqual([], [c for c in self.host.ran("sudo", "systemctl", "enable") if "--now" not in c])
 
     def test_help_documents_the_opt_out_and_keeps_existing_arguments(self):
         parser = connect.create_argument_parser()
@@ -521,6 +582,36 @@ class FailureAndValidationTests(HardeningTestCase):
                       "above".format(iqn("volume1")), self.stdout)
         self.assertIn("[FAIL] volume1 [{}] persistent records: none".format(iqn("volume1")), self.stdout)
         self.assertIn("[PASS] volume2 [{}] live sessions: 4 (requested 4)".format(iqn("volume2")), self.stdout)
+
+    def test_failed_login_keeps_the_record_if_a_session_appeared_or_sessions_are_unreadable(self):
+        for flag, reason in (("login_error_with_session", "a new session for the target appeared"),
+                             ("session_reads_fail_after_login", "the sessions could not be read")):
+            with self.subTest(flag=flag):
+                self.setUp()
+                self.host.failed_logins.add(PORTAL)
+                setattr(self.host, flag, True)
+                with self.assertRaisesRegex(RuntimeError, "Login failed through every target portal"):
+                    connect.connect_volume("volume1", iqn("volume1"), [(HOST, 4)], 3260)
+                self.assertIn((iqn("volume1"), PORTAL), self.host.nodes)
+                self.assertEqual([], [c for c in self.host.commands if c[-2:] == ["--op", "delete"]])
+                self.assertIn("kept the node record created by this run because " + reason, self.stderr)
+
+    def test_failed_tuning_update_on_a_skipped_volume_warns_and_keeps_the_notice(self):
+        self.host.nodes[(iqn("volume1"), PORTAL)] = connected_record(**{
+            "node.session.iscsi.MaxBurstLength": "16776192",
+            "node.conn[0].timeo.login_timeout": "15",
+            "node.session.nr_sessions": "4",
+        })
+        for _ in range(4):
+            self.host.add_session(iqn("volume1"))
+        self.host.failed_updates.add("node.session.iscsi.MaxBurstLength")
+        self.run_main()
+        self.assertIn("Warning: volume1 [{}], portal {}: setting node.session.iscsi.MaxBurstLength failed: "
+                      "iscsiadm".format(iqn("volume1"), PORTAL), self.stderr)
+        self.assertEqual("30", self.host.nodes[(iqn("volume1"), PORTAL)]["node.conn[0].timeo.login_timeout"])
+        self.assertIn("log out/in or reboot for updated iSCSI settings", self.stdout)
+        self.assertIn("[WARN] volume1 [{}] recommended settings: differ for {}".format(iqn("volume1"), PORTAL),
+                      self.stdout)
 
     def test_same_shortfall_fails_when_connected_and_warns_when_skipped(self):
         self.host.fail_clones = True

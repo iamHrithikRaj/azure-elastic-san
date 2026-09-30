@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -96,6 +97,8 @@ DOCUMENTED_MULTIPATH_DEFAULTS = (
     ("polling_interval", "5"),
     ("user_friendly_names", "yes"),
 )
+# Non-root PATHs often omit the sbin directories where these tools live.
+TOOL_SEARCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 MULTIPATH_WAIT_ATTEMPTS = 10
 MULTIPATH_WAIT_SECONDS = 2
 
@@ -113,6 +116,15 @@ def run_command(command, input_text=None):
         return 127, "", str(error)
     out, err = process.communicate(None if input_text is None else input_text.encode("utf-8"))
     return process.returncode, _decode_output(out), _decode_output(err).strip()
+
+
+def find_tool(name):
+    return shutil.which(name) or shutil.which(name, path=TOOL_SEARCH_PATH)
+
+
+def _require_tool(name, guidance):
+    if not find_tool(name):
+        raise ConnectScriptError("{} was not found. {}".format(name, guidance))
 
 
 def _run_required(command, action):
@@ -148,6 +160,7 @@ def check_privileges():
     geteuid = getattr(os, "geteuid", None)
     if geteuid is not None and geteuid() == 0:
         return
+    _require_tool("sudo", "Run this script as root, or install sudo and configure passwordless sudo.")
     if run_command(["sudo", "-n", "true"])[0] != 0:
         raise ConnectScriptError(
             "This script configures iSCSI and multipath and must run as root or as a user with "
@@ -198,7 +211,7 @@ def _install_command(family, packages):
     if family == "debian":
         return ["sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "-q"] + packages
     if family == "rhel":
-        return ["sudo", "dnf" if os.path.exists("/usr/bin/dnf") else "yum", "install", "-y"] + packages
+        return ["sudo", "dnf" if find_tool("dnf") else "yum", "install", "-y"] + packages
     if family == "suse":
         return ["sudo", "zypper", "--non-interactive", "install"] + packages
     return ["sudo", "tdnf", "install", "-y"] + packages
@@ -218,6 +231,7 @@ def _ensure_initiator_name():
     if any(line.strip().startswith("InitiatorName=") and line.strip() != "InitiatorName="
            for line in content.splitlines()):
         return False
+    _require_tool("iscsi-iname", "Set InitiatorName= in {} and re-run this script.".format(INITIATOR_NAME_FILE))
     name = _run_required(["sudo", "iscsi-iname"], "Generating an iSCSI initiator name").strip()
     _write_root_file(INITIATOR_NAME_FILE, "InitiatorName={}\n".format(name))
     print("Created {}".format(INITIATOR_NAME_FILE))
@@ -227,10 +241,13 @@ def _ensure_initiator_name():
 def ensure_prerequisites(family):
     missing = [package for package in PREREQUISITE_PACKAGES[family] if not _package_installed(family, package)]
     if missing:
+        command = _install_command(family, missing)
+        _require_tool("apt-get" if family == "debian" else command[1],
+                      "Install {} with the distro's package manager and re-run this script.".format(" ".join(missing)))
         print("Installing missing packages: {}".format(" ".join(missing)))
         if family == "debian":
             _run_required(["sudo", "apt-get", "update", "-q"], "Refreshing package lists")
-        _run_required(_install_command(family, missing), "Installing " + " ".join(missing))
+        _run_required(command, "Installing " + " ".join(missing))
     created_initiator_name = _ensure_initiator_name()
     _run_required(["sudo", "systemctl", "enable", "--now", "iscsid"], "Enabling iscsid")
     if created_initiator_name:
@@ -244,6 +261,8 @@ def ensure_prerequisites(family):
     if family == "rhel" and _read_root_file(MULTIPATH_CONF) is None:
         # RHEL's multipathd does not start without a configuration file;
         # mpathconf writes the distro's standard minimal one.
+        _require_tool("mpathconf", "Create {} (for example with 'mpathconf --enable') and re-run this script.".format(
+            MULTIPATH_CONF))
         _run_required(["sudo", "mpathconf", "--enable", "--with_multipathd", "y"], "Creating " + MULTIPATH_CONF)
     _run_required(["sudo", "systemctl", "enable", "--now", "multipathd"], "Enabling multipathd")
 
@@ -388,6 +407,9 @@ def _validate_host(report, apply_recommended):
         enabled = run_command(["systemctl", "is-enabled", login_unit])[1].strip() or "unknown"
         report.add("PASS" if enabled in ENABLED_UNIT_STATES else "FAIL", "iSCSI login unit",
                    "{} is {}; it logs in automatic node records at boot".format(login_unit, enabled))
+    else:
+        report.add("WARN", "iSCSI login unit", "neither open-iscsi.service nor iscsi.service exists; "
+                   "automatic node records may not log in at boot")
     if not apply_recommended:
         return
     path = multipath_drop_in_path()
@@ -1031,16 +1053,23 @@ def check_connection(target_iqn, target_portal_hostname, target_portal_port, vol
     return ExistingState(records, sessions)
 
 
-def update_recommended_settings(state, recommended_settings):
+def update_recommended_settings(volume_name, target_iqn, state, recommended_settings):
     """Applies only differing recommended values to existing records; True if live sessions need a re-login."""
     changed = False
     for target_name, portal, settings in state.records:
         for key, value in recommended_settings:
-            if settings.get(key, "").lower() != value.lower():
+            if settings.get(key, "").lower() == value.lower():
+                continue
+            try:
                 _iscsiadm(["-m", "node", "--targetname", target_name, "--portal", portal,
                            "--op", "update", "-n", key, "-v", value])
-                settings[key] = value
-                changed = True
+            except (OSError, RuntimeError) as error:
+                # Keep going so values that did change still trigger the re-login notice.
+                print("Warning: {} [{}], portal {}: setting {} failed: {}".format(
+                    volume_name, target_iqn, portal, key, error), file=sys.stderr)
+                continue
+            settings[key] = value
+            changed = True
     return changed and bool(state.sessions)
 
 
@@ -1051,11 +1080,26 @@ def _session_ids(target_iqn):
     ) if iqn == target_iqn}
 
 
-def _delete_created_node(volume_name, target_iqn, node):
+def _delete_created_node(volume_name, target_iqn, node, sessions_before):
     # A record created by this run that never got a session would make every
-    # re-run skip the volume, so remove exactly that record. iscsiadm refuses to
-    # delete a record that still has a session.
+    # re-run skip the volume, so remove exactly that record. Keep it whenever a
+    # session may be using it: a failed login can still bring one up.
     portal = node[node.index("--portal") + 1]
+    reason = None
+    if sessions_before is None:
+        reason = "the sessions could not be read before the login"
+    else:
+        try:
+            if _session_ids(target_iqn) - sessions_before:
+                reason = "a new session for the target appeared"
+        except (OSError, RuntimeError) as error:
+            reason = "the sessions could not be read: {}".format(error)
+    if reason:
+        print("Warning: {} [{}], portal {}: kept the node record created by this run because {}. Check "
+              "'sudo iscsiadm -m session'; if no session uses it, remove it with "
+              "'sudo iscsiadm -m node -T {} -p {} -o delete' before re-running.".format(
+                  volume_name, target_iqn, portal, reason, target_iqn, portal), file=sys.stderr)
+        return
     try:
         _iscsiadm(node + ["--op", "delete"])
     except (OSError, RuntimeError) as error:
@@ -1078,9 +1122,11 @@ def connect_volume(volume_name, target_iqn, portals, target_portal_port, recomme
         node = ["-m", "node", "--targetname", target_iqn,
                 "--portal", "{}:{}".format(portal, target_portal_port)]
         created = logged_in = False
+        sessions_before = None
         try:
             _iscsiadm(node + ["--op", "new"])
             created = True
+            sessions_before = _session_ids(target_iqn)
             # Native --login honors nr_sessions: seed once, then clone by SID.
             for key, value in (
                 ("node.session.nr_sessions", "1"), ("node.startup", "automatic"),
@@ -1104,7 +1150,7 @@ def connect_volume(volume_name, target_iqn, portals, target_portal_port, recomme
                 volume_name, target_iqn, portal, target_portal_port, error
             ), file=sys.stderr)
             if created and not logged_in:
-                _delete_created_node(volume_name, target_iqn, node)
+                _delete_created_node(volume_name, target_iqn, node, sessions_before)
     if not connected:
         raise RuntimeError("{} [{}]: Login failed through every target portal".format(volume_name, target_iqn))
 
@@ -1190,7 +1236,8 @@ def connect_volumes(
                 print("{} [{}]: {}".format(volume_name, target_iqn, existing.describe()))
                 # Only tuning values change on connected volumes; digests,
                 # nr_sessions, startup and sessions are left as they are.
-                outcome.settings_changed_while_live = update_recommended_settings(existing, recommended_settings)
+                outcome.settings_changed_while_live = update_recommended_settings(
+                    volume_name, target_iqn, existing, recommended_settings)
             else:
                 connect_volume(volume_name, target_iqn, portals, target_port, recommended_settings)
         except (OSError, RuntimeError) as error:

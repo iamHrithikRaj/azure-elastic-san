@@ -45,8 +45,9 @@ Each portal uses one seed login, SID-specific clones, CRC32C digest settings, th
 recommended node values (unless `--skip-recommended-settings`), and the full
 persistent session count. The seed temporarily uses `nr_sessions=1`
 because native login already honors that setting. Login failures warn and allow
-other portals to proceed; if a portal's first login fails, the node record this
-run created for it is deleted so a re-run can connect. A volume that no portal
+other portals to proceed; if a portal's first login fails and no new session for
+the target appeared, the node record this run created for it is deleted so a
+re-run can connect (it is kept, with a warning, if sessions can't be read). A volume that no portal
 logs in to is reported and the script continues with the next volume. Clone or
 persistence failures also warn, so a usable connection may have fewer sessions
 or incomplete saved settings; validation reports them. Native commands use ordinary `sudo`.
