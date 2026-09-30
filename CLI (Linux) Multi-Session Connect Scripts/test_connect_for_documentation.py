@@ -851,5 +851,33 @@ class ZonalAffinityTests(unittest.TestCase):
         mutate.assert_not_called()
 
 
+class ConnectorRegressionTests(unittest.TestCase):
+    def test_digest_argv_and_full_persistent_count(self):
+        for count in (1, 4, 32):
+            with self.subTest(count=count):
+                commands = []
+
+                def launch(command, **kwargs):
+                    commands.append(command)
+                    process = mock.Mock(returncode=0)
+                    output = b"tcp: [17] portal.example:3260,-1 iqn.original\n"
+                    process.communicate.return_value = (output, b"")
+                    return process
+
+                with mock.patch.object(connect.subprocess, "Popen", side_effect=launch):
+                    with mock.patch("builtins.print"):
+                        connect.connect_volume("volume", "iqn.original", "portal.example", 3260, count)
+                clones = [c for c in commands if c[2:4] == ["-m", "session"] and "-r" in c]
+                self.assertEqual(count - 1, len(clones))
+                for digest in ("HeaderDigest", "DataDigest"):
+                    self.assertIn([
+                        "sudo", "iscsiadm", "-m", "node", "--targetname", "iqn.original",
+                        "--portal", "portal.example:3260", "--op", "update",
+                        "-n", "node.conn[0].iscsi." + digest, "-v", "CRC32C",
+                    ], commands)
+                persisted = [c for c in commands if "node.session.nr_sessions" in c]
+                self.assertEqual([str(count)], [c[-1] for c in persisted])
+
+
 if __name__ == "__main__":
     unittest.main()
