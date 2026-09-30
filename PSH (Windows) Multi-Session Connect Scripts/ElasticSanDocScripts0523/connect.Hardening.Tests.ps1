@@ -406,6 +406,17 @@ Describe 'Hardened default flow' {
             @(Get-TestLogins | Where-Object { $_[1] -eq 'iqn.test:vol10' }).Count | Should Be 0
         }
 
+        It 'connects a volume selected more than once only once' {
+            # The lookup mock returns one entry per selection, as Get-AzElasticSanVolume would.
+            $script:volumes = @(New-TestVolume 'vol1' 'iqn.test:vol1' 4; New-TestVolume 'VOL1' 'IQN.TEST:VOL1' 4)
+            Invoke-EsanConnect -ResourceGroupName 'rg' -ElasticSanName 'san' -VolumeGroupName 'vg' -VolumeName 'vol1', 'VOL1', 'vol1'
+            Assert-MockCalled Get-EsanVolumeData -Times 1 -Exactly -Scope It -ParameterFilter { ($VolumeName -join ',') -ceq 'vol1' }
+            @($script:nativeCalls | Where-Object { $_[0] -eq 'AddTarget' }).Count | Should Be 1
+            @(Get-TestLogins).Count | Should Be 4
+            @($script:hostLines | Where-Object { $_ -like '*persistent logins: *' }).Count | Should Be 1
+            $script:hostLines[-1] | Should Be 'Validation: 9 passed, 0 warnings, 0 failed'
+        }
+
         It 'fails closed before any change when persistent logins cannot be read' {
             $script:persistentError = $true
             { Invoke-TestConnect } | Should Throw 'Could not read the live iSCSI sessions or persistent logins'
@@ -502,8 +513,19 @@ Describe 'Hardened default flow' {
             $output | Should Match '\[PASS\] one \[iqn\.test:one:az-eastus-az3\] persistent logins: 32 of 32 requested'
             $output | Should Match '\[WARN\] one \[iqn\.test:one:az-eastus-az3\] live sessions: 0 of 32 requested'
             $output | Should Match '\[PASS\] one \[iqn\.test:one\] persistent logins: 4 of 4 requested'
-            $output | Should Match 'Reboot required: the saved persistent logins for one establish their sessions at boot\.'
-            $script:hostLines[-1] | Should Be 'Reboot required: changed MaxTransferLength, which take effect only after the VM restarts; the saved persistent logins for one establish their sessions at boot.'
+            # The zonal/VIP path announces the reboot for its saved logins itself, so the shared line
+            # only reports setting changes.
+            $output | Should Not Match 'saved persistent logins for one'
+            $script:hostLines[-1] | Should Be 'Reboot required: changed MaxTransferLength, which take effect only after the VM restarts.'
+        }
+
+        It 'passes a volume selected more than once to the zonal and VIP path once' {
+            Mock Connect-ElasticSanVolumes {
+                $script:modeNames = $Names -join ','
+                [pscustomobject]@{ Plans = @(); RebootChanges = @() }
+            }
+            Invoke-EsanConnect -ResourceGroupName 'rg' -ElasticSanName 'san' -VolumeGroupName 'vg' -VolumeName 'one', 'ONE', 'two', 'one' -EnableVipDistribution
+            $script:modeNames | Should Be 'one,two'
         }
     }
 

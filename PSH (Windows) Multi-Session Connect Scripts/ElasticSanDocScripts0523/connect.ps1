@@ -22,8 +22,9 @@ never reported as success.
  5. If enabling Multipath I/O needs a restart, stops before adding sessions: reboot, then re-run the
     script. Sessions added before MPIO is active show up as duplicate disks.
  6. Reads the live sessions and persistent logins of every volume before changing anything. A volume
-    that already has either is skipped; this script never adds to, or removes, existing sessions. Also
-    stops if the new sessions would exceed the Windows limit of 256 persistent iSCSI logins.
+    that already has either is skipped; this script never adds to, or removes, existing sessions. A volume
+    selected more than once is connected once. Also stops if the new sessions would exceed the Windows
+    limit of 256 persistent iSCSI logins.
  7. Saves the persistent logins of each remaining volume, prints a validation report ([PASS], [WARN] and
     [FAIL] lines and a summary), and says when a reboot is needed: for changed settings, or for saved
     persistent logins whose sessions aren't live yet.
@@ -581,6 +582,11 @@ function Get-EsanIscsiInventory {
 
 function Get-EsanConnectionPlan($Volumes) {
     # Decide for every volume before connecting any, so a stop never leaves a half-connected batch.
+    # A volume selected more than once (same IQN, any case) is planned and connected once.
+    $seen = @{}
+    $Volumes = @(foreach ($volume in $Volumes) {
+        if (-not $seen.ContainsKey($volume.TargetIQN)) { $seen[$volume.TargetIQN] = $true; $volume }
+    })
     $inventory = Get-EsanIscsiInventory
     $plan = @(foreach ($volume in $Volumes) {
         $live = @($inventory.Sessions | Where-Object { $_.TargetNodeAddress -ieq $volume.TargetIQN }).Count
@@ -749,14 +755,15 @@ function Initialize-EsanHost([string]$Edition, [int]$SessionCount, [switch]$Skip
     $rebootChanges
 }
 
-function Complete-EsanConnection($Plan, [string]$Edition, [int]$SessionCount, [switch]$SkipRecommendedSettings, [string[]]$RebootChanges) {
+function Complete-EsanConnection($Plan, [string]$Edition, [int]$SessionCount, [switch]$SkipRecommendedSettings, [string[]]$RebootChanges, [switch]$SessionRebootAnnounced) {
     # Validation, reboot notice and the final error, shared by every connect mode.
     $validation = Test-EsanConnection -Plan $Plan -Edition $Edition -SessionCount $SessionCount -CheckRecommendedSettings (-not $SkipRecommendedSettings)
     $reasons = @()
     if ($RebootChanges.Count -gt 0) {
         $reasons += "changed $($RebootChanges -join ', '), which take effect only after the VM restarts"
     }
-    if ($validation.PendingVolumes.Count -gt 0) {
+    # The zonal/VIP path already tells the runner to reboot for its saved logins; don't repeat it.
+    if ($validation.PendingVolumes.Count -gt 0 -and -not $SessionRebootAnnounced) {
         $reasons += "the saved persistent logins for $($validation.PendingVolumes -join ', ') establish their sessions at boot"
     }
     if ($reasons.Count -gt 0) {
@@ -782,6 +789,11 @@ function Invoke-EsanConnect {
         throw 'Run this script from an elevated PowerShell session (Run as administrator). Without elevation, iscsicli output can look successful while no sessions are added.'
     }
     $edition = Get-EsanWindowsEdition
+    # A volume selected more than once is connected once. Azure resource names are case-insensitive.
+    $seen = @{}
+    $VolumeName = @(foreach ($name in $VolumeName) {
+        if (-not $seen.ContainsKey("$name")) { $seen["$name"] = $true; $name }
+    })
 
     if ($EnableZonalAffinity -or $EnableVipDistribution) {
         # Zonal mapping and VIP distribution keep their own lookup, existing-state checks and connect
@@ -796,7 +808,7 @@ function Invoke-EsanConnect {
                 Action = if ($item.Skip) { 'Skip' } else { 'Connect' }
             }
         })
-        Complete-EsanConnection -Plan $plan -Edition $edition -SessionCount $sessionCount -SkipRecommendedSettings:$SkipRecommendedSettings -RebootChanges $result.RebootChanges
+        Complete-EsanConnection -Plan $plan -Edition $edition -SessionCount $sessionCount -SkipRecommendedSettings:$SkipRecommendedSettings -RebootChanges $result.RebootChanges -SessionRebootAnnounced
         return
     }
 
