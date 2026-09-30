@@ -3,296 +3,274 @@ $tokens = $null
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($connectPath, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
-foreach ($definition in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -like '*-Zonal*' }, $false)) {
+foreach ($definition in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -match '-' }, $false)) {
     . ([scriptblock]::Create($definition.Extent.Text))
 }
 
-function New-TestPlan {
-    $vips = @('10.0.0.1', '10.0.0.2', 'fd00::1')
-    [pscustomobject]@{
-        Name = 'one'; RawIqn = 'iqn.test:one'; Iqn = 'iqn.test:one:az-eastus-az3'
-        Port = 3260; Vips = $vips; Slots = @(Get-ZonalSessionSlots $vips); Skip = $false
-    }
+function Get-AzContext { [CmdletBinding()]param() }
+function Get-WindowsFeature { [CmdletBinding()]param($Name) }
+function Get-IscsiSession { [CmdletBinding()]param() }
+function iscsicli {
+    $script:nativeCalls.Add(@($args))
+    $global:LASTEXITCODE = 0
+    if ($args[0] -eq 'ListPersistentTargets') { $script:persistentOutput; return }
+    $global:LASTEXITCODE = $script:nativeExit
+    $script:nativeOutput
+    # PersistentLoginTarget saves configuration; it does not create a live session.
 }
 
-function New-TestInventory($Plan, [int]$Count = 32, [bool]$Correlate = $true) {
-    $sessions = @()
-    $persistent = @()
-    $connections = @{}
-    for ($i = 0; $i -lt $Count; $i++) {
-        $id = '0000000000000001-{0:x16}' -f ($i + 1)
-        $sessions += [pscustomobject]@{
-            SessionIdentifier = $id; TargetNodeAddress = $Plan.Iqn
-            IsConnected = $true; IsPersistent = $true
-            IsHeaderDigest = $true; IsDataDigest = $true; NumberOfConnections = 1
-        }
-        $persistent += [pscustomobject]@{
-            TargetName = $Plan.Iqn; Address = $Plan.Slots[$i % 32]; Port = $Plan.Port
-            SessionIdentifier = $(if ($Correlate) { $id } else { $null })
-            InitiatorInstance = 'Root\ISCSIPRT\0000_0'; IsInformationalSession = $false
-            InitiatorPortNumber = [uint32]::MaxValue; Version = 0; SecurityFlags = 0; AuthType = 0
-            InformationSpecified = 3; LoginFlags = 2; HeaderDigest = 1; DataDigest = 1
-        }
-        # Current endpoints deliberately differ from the original login VIPs.
-        $connections[$id] = @([pscustomobject]@{
-            ConnectionIdentifier = "connection-$i"; TargetAddress = '10.20.30.40'; TargetPortNumber = 3260
-        })
+function Set-TestConnectionBoundaries {
+    Mock Get-ZonalComputeMetadata {
+        [pscustomobject]@{ zone = '2'; subscriptionId = 'abcdef01-2345-6789-abcd-0123456789ab'; location = 'eastus' }
     }
-    [pscustomobject]@{ Sessions = $sessions; Persistent = $persistent; Connections = $connections; Targets = @() }
-}
-
-Describe 'Windows-owned VIP normalization and allocation' {
-    It 'sorts unsigned packed bytes, IPv4 first, after canonicalization and deduplication' {
-        (@(ConvertTo-ZonalVips @('10.0.0.10', '10.0.0.2', '10.0.0.1', '10.0.0.2')) -join ',') | Should Be '10.0.0.1,10.0.0.2,10.0.0.10'
-        (@(ConvertTo-ZonalVips @('FD00::0010', 'fd00::2', 'FD00::0001', 'fd00::1')) -join ',') | Should Be 'fd00::1,fd00::2,fd00::10'
-        (@(ConvertTo-ZonalVips @('fd00::1', '::ffff:10.0.0.10', '10.0.0.2', '10.0.0.10')) -join ',') | Should Be '10.0.0.2,10.0.0.10,fd00::1'
-        (@(ConvertTo-ZonalVips @('192.168.1.1', '20.1.2.3', '172.16.0.1')) -join ',') | Should Be '20.1.2.3,172.16.0.1,192.168.1.1'
-        (ConvertTo-ZonalAddress '::192.0.2.1') | Should Be '::c000:201'
-        (ConvertTo-ZonalAddress '2001:0:0:1:0:0:1:1') | Should Be '2001::1:0:0:1:1'
+    Mock Get-VipHostAddresses {
+        if ($HostName -eq $script:dnsFailureHost) { throw [System.Net.Sockets.SocketException]::new(11001) }
+        foreach ($address in $script:dnsAnswers) { [System.Net.IPAddress]::Parse($address) }
     }
-    It 'rejects invalid extras instead of filtering a valid triple out of an answer' {
-        foreach ($invalid in @('invalid', '', $null, 1, ' 10.0.0.1', "10.0.0.1`n", '10.1',
-            '010.0.0.1', '0x0a000001', '167772161', '0xa.0.0.1', '10.0.0.256', '[fd00::1]',
-            '+10.0.0.1', '::ffff:10.1', '::ffff:0xa.0.0.1', '::ffff:010.0.0.1',
-            '0.0.0.0', '::', '127.0.0.2', '::ffff:127.0.0.1', '::1', '224.0.0.1', 'ff02::1',
-            '169.254.1.1', 'fe80::1', 'fd00::1%3', '255.255.255.255')) {
-            { ConvertTo-ZonalVips @('10.0.0.1', '10.0.0.2', '10.0.0.3', $invalid) } | Should Throw
-        }
-    }
-    It 'requires exactly three endpoints in a single answer' {
-        foreach ($answer in @(@(), @('10.0.0.1'), @('10.0.0.1', '10.0.0.2'),
-            @('10.0.0.1', '::ffff:10.0.0.1', '10.0.0.2'),
-            @('10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.4'),
-            @('10.0.0.1', '10.0.0.2', '10.0.0.3', 'fd00::1', 'fd00::2', 'fd00::3'))) {
-            { ConvertTo-ZonalVips $answer } | Should Throw 'exactly three'
-        }
-    }
-    It 'allocates exactly 32 deterministic round-robin slots with 11/11/10 counts' {
-        $vips = @('fd00::1', '10.0.0.2', '10.0.0.1')
-        $sorted = @(ConvertTo-ZonalVips $vips)
-        $slots = @(Get-ZonalSessionSlots $vips)
-        $slots.Count | Should Be 32
-        for ($i = 0; $i -lt 32; $i++) { $slots[$i] | Should Be $sorted[$i % 3] }
-        for ($i = 0; $i -lt 3; $i++) { @($slots | Where-Object { $_ -eq $sorted[$i] }).Count | Should Be @(11,11,10)[$i] }
-    }
-    It 'requires a decimal port in the supported range without trimming or truncating' {
-        (ConvertTo-ZonalPort '1') | Should Be 1
-        (ConvertTo-ZonalPort 65535) | Should Be 65535
-        foreach ($port in @($null, '', '0', '-1', 65536, '3260x', "3260`n", ' 3260', '3260.0')) {
-            { ConvertTo-ZonalPort $port } | Should Throw 'Invalid target port'
+    Mock Invoke-ZonalProviderRequest {
+        $script:requests.Add([pscustomobject]@{ Command = $Command; Parameters = $Parameters })
+        if (@($script:nativeCalls | Where-Object { $_[0] -ne 'ListPersistentTargets' }).Count) { throw 'mutation preceded batch discovery' }
+        switch ($Command) {
+            'Get-AzElasticSan' { [pscustomobject]@{ Location = 'eastus' } }
+            'Invoke-AzRestMethod' { [pscustomobject]@{
+                StatusCode = 200; Content = '{"value":[{"name":"eastus","availabilityZoneMappings":[{"logicalZone":"2","physicalZone":"eastus-az3"}]}]}'
+            } }
+            'Get-AzElasticSanVolumeGroup' { [pscustomobject]@{} }
+            'Get-AzElasticSanVolume' {
+                if ($Parameters.Name -eq 'two' -and $script:badSecond -eq 'provider') { throw 'second volume provider deadline' }
+                $volume = [pscustomobject]@{
+                    StorageTargetIqn = $(if ($script:duplicateIqn) { 'iqn.test:shared' } else { "iqn.test:$($Parameters.Name)" })
+                    StorageTargetPortalHostname = "$($Parameters.Name).EXAMPLE"; StorageTargetPortalPort = $script:port
+                }
+                if ($Parameters.Name -eq 'two') {
+                    switch ($script:badSecond) {
+                        'iqn' { $volume.StorageTargetIqn = 'iqn.test:UPPER' }
+                        'host' { $volume.StorageTargetPortalHostname = 'bad host' }
+                        'port' { $volume.StorageTargetPortalPort = 65536 }
+                    }
+                }
+                $volume
+            }
+            default { throw "Unexpected provider command $Command" }
         }
     }
 }
 
-Describe 'Bounded host-local DNS' {
+Describe 'IPv4 portal selection' {
+    BeforeEach { Mock Get-VipHostAddresses {} }
+    It 'uses the requested synchronous host resolver boundary' {
+        $definition = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-VipHostAddresses' }, $false)[0]
+        $definition.Extent.Text | Should Match '\[System.Net.Dns\]::GetHostAddresses\(\$HostName\)'
+    }
+    It 'fails clearly for no addresses or IPv6-only answers' {
+        { Resolve-VipPortals 'portal.example' } | Should Throw 'no IPv4 addresses'
+        Mock Get-VipHostAddresses { [System.Net.IPAddress]::Parse('fd00::1') }
+        { Resolve-VipPortals 'portal.example' } | Should Throw 'no IPv4 addresses'
+    }
+    It 'retains the original FQDN when only one distinct IPv4 remains' {
+        Mock Get-VipHostAddresses {
+            [System.Net.IPAddress]::Parse('10.0.0.9')
+            [System.Net.IPAddress]::Parse('10.0.0.9')
+            [System.Net.IPAddress]::Parse('fd00::1')
+        }
+        (@(Resolve-VipPortals 'PORTAL.EXAMPLE') -join ',') | Should Be 'PORTAL.EXAMPLE'
+    }
+    It 'deduplicates and sorts two or more IPv4 addresses numerically while ignoring IPv6' {
+        Mock Get-VipHostAddresses {
+            foreach ($address in @('10.0.0.10', 'fd00::1', '10.0.0.9', '10.0.0.10', '2.0.0.1')) {
+                [System.Net.IPAddress]::Parse($address)
+            }
+        }
+        (@(Resolve-VipPortals 'portal.example') -join ',') | Should Be '2.0.0.1,10.0.0.9,10.0.0.10'
+        Mock Get-VipHostAddresses {
+            [System.Net.IPAddress]::Parse('10.0.0.10'); [System.Net.IPAddress]::Parse('10.0.0.9')
+        }
+        (@(Resolve-VipPortals 'portal.example') -join ',') | Should Be '10.0.0.9,10.0.0.10'
+    }
+    It 'reports the hostname on resolver failure' {
+        Mock Get-VipHostAddresses { throw [System.Net.Sockets.SocketException]::new(11001) }
+        { Resolve-VipPortals 'failed.example' } | Should Throw "DNS lookup failed for 'failed.example'"
+    }
+}
+
+Describe 'Persistent-login configuration without live-session polling' {
     BeforeEach {
-        $script:dnsAttempts = 0
-        Mock Start-Sleep {}
-        Mock Start-ZonalDnsLookup { $script:dnsAttempts++; [pscustomobject]@{ Attempt = $script:dnsAttempts } }
-    }
-    It 'bounds each asynchronous wait to five seconds' {
-        $lookup = New-Object PSObject
-        $lookup | Add-Member ScriptMethod Wait { param($milliseconds) $script:waitMilliseconds = $milliseconds; $false }
-        { Wait-ZonalDnsLookup $lookup } | Should Throw 'five-second'
-        $script:waitMilliseconds | Should Be 5000
-        $completion = New-Object 'System.Threading.Tasks.TaskCompletionSource[System.Net.IPAddress[]]'
-        $completion.SetResult([System.Net.IPAddress[]]@([System.Net.IPAddress]::Parse('10.0.0.1')))
-        (@(Wait-ZonalDnsLookup $completion.Task) -join ',') | Should Be '10.0.0.1'
-        $start = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-ZonalDnsLookup' }, $false)[0]
-        $start.Extent.Text | Should Match 'GetHostAddressesAsync'
-    }
-    It 'retries independent answers and caches only a successful triple within this run' {
-        Mock Wait-ZonalDnsLookup {
-            if ($Lookup.Attempt -eq 1) { '10.0.0.1'; return }
-            '10.0.0.3'; '10.0.0.1'; '10.0.0.2'
+        $script:nativeCalls = New-Object 'System.Collections.Generic.List[object]'
+        $script:requests = New-Object 'System.Collections.Generic.List[object]'
+        $script:nativeExit = 0; $script:nativeOutput = 'The operation completed successfully.'
+        # Assumed English CLI format, not a captured native-host fixture.
+        $script:persistentOutput = @('Total of 0 persistent targets', 'The operation completed successfully.')
+        $script:existing = @(); $script:badSecond = ''; $script:duplicateIqn = $false
+        $script:dnsAnswers = @('10.0.0.10', '10.0.0.9', '10.0.0.8')
+        $script:dnsFailureHost = ''; $script:port = 3260
+        Mock Get-Service { [pscustomobject]@{ Status = 'Running' } }
+        Mock Get-WindowsFeature { [pscustomobject]@{ InstallState = 'Installed' } }
+        Mock Get-IscsiSession { $script:existing }
+        Mock Write-Host {}
+        Mock Start-Sleep { throw 'Persistent logins must not wait for live sessions.' }
+        Set-TestConnectionBoundaries
+        Mock Get-AzContext {
+            # The actual file defines helpers before its first external boundary.
+            Set-TestConnectionBoundaries
+            [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = 'abcdef01-2345-6789-abcd-0123456789ab' } }
         }
-        $cache = @{}
-        (@(Resolve-ZonalVips 'portal.example' $cache) -join ',') | Should Be '10.0.0.1,10.0.0.2,10.0.0.3'
-        $null = Resolve-ZonalVips 'PORTAL.EXAMPLE' $cache
-        $script:dnsAttempts | Should Be 2
-        Assert-MockCalled Start-Sleep -Scope It -Times 1 -Exactly -ParameterFilter { $Seconds -eq 1 }
     }
-    It 'never unions rotating partial answers or caches failure' {
-        Mock Wait-ZonalDnsLookup { "10.0.0.$($Lookup.Attempt)" }
-        $cache = @{}
-        { Resolve-ZonalVips 'portal.example' $cache } | Should Throw 'three attempts'
-        $script:dnsAttempts | Should Be 3
-        $cache.Count | Should Be 0
-        Assert-MockCalled Start-Sleep -Scope It -Times 1 -Exactly -ParameterFilter { $Seconds -eq 1 }
-        Assert-MockCalled Start-Sleep -Scope It -Times 1 -Exactly -ParameterFilter { $Seconds -eq 2 }
-    }
-    It 'bounds retries on timeout or resolver failure without FQDN fallback' {
-        Mock Wait-ZonalDnsLookup { throw 'DNS timeout' }
-        { Resolve-ZonalVips 'portal.example' @{} } | Should Throw 'DNS timeout'
-        Assert-MockCalled Start-ZonalDnsLookup -Scope It -Times 3 -Exactly
-    }
-    It 'rejects numeric, missing, single-label and malformed hostnames before lookup' {
-        foreach ($name in @('10.0.0.1', 'fd00::1', '', 'portal', 'bad host.example')) {
-            { Resolve-ZonalVips $name @{} } | Should Throw 'FQDN'
+    foreach ($case in @(
+        @{ Label='32 over 3'; Count=32; Addresses=@('10.0.0.10','10.0.0.9','10.0.0.8'); Counts=@(11,11,10) },
+        @{ Label='32 over 2'; Count=32; Addresses=@('10.0.0.10','10.0.0.9'); Counts=@(16,16) },
+        @{ Label='1 over 3'; Count=1; Addresses=@('10.0.0.10','10.0.0.9','10.0.0.8'); Counts=@(1,0,0) }
+    )) {
+        It "saves $($case.Label) using round-robin original portals without creating live sessions" {
+            $script:dnsAnswers = $case.Addresses
+            Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') $case.Count -VipDistribution
+            $logins = @($script:nativeCalls | Where-Object { $_[0] -eq 'PersistentLoginTarget' })
+            $registrations = @($script:nativeCalls | Where-Object { $_[0] -eq 'AddTarget' })
+            # The literal expected numeric order differs from lexical order for .9/.10.
+            $portals = if ($case.Addresses.Count -eq 2) { @('10.0.0.9','10.0.0.10') } else { @('10.0.0.8','10.0.0.9','10.0.0.10') }
+            $logins.Count | Should Be $case.Count
+            $registrations.Count | Should Be ([Math]::Min($case.Count, $portals.Count))
+            for ($i = 0; $i -lt $registrations.Count; $i++) {
+                ($registrations[$i] -join '|') | Should Be "AddTarget|iqn.test:one|*|$($portals[$i])|3260|*|0|*|*|*|*|*|*|*|*|*|0"
+            }
+            for ($i = 0; $i -lt $logins.Count; $i++) {
+                ($logins[$i] -join '|') | Should Be "PersistentLoginTarget|iqn.test:one|t|$($portals[$i % $portals.Count])|3260|Root\ISCSIPRT\0000_0|-1|*|0x00000002|1|1|*|*|*|*|*|*|*|0"
+            }
+            for ($i = 0; $i -lt $portals.Count; $i++) {
+                @($logins | Where-Object { $_[3] -eq $portals[$i] }).Count | Should Be $case.Counts[$i]
+            }
+            $script:existing.Count | Should Be 0
+            Assert-MockCalled Get-IscsiSession -Scope It -Times 1 -Exactly
+            Assert-MockCalled Start-Sleep -Scope It -Times 0 -Exactly
+            Assert-MockCalled Write-Host -Scope It -Times 1 -Exactly -ParameterFilter { "$Object" -like '*Reboot is required*' }
         }
-        $script:dnsAttempts | Should Be 0
     }
-}
-
-Describe 'Original persistent portal and live-session proof' {
-    BeforeEach { $plan = New-TestPlan; $inventory = New-TestInventory $plan }
-    It 'skips only the complete correlated layout even after redirects' {
-        (Test-ZonalLayout $plan $inventory) | Should Be $true
+    It 'uses FQDN registration and login with one IPv4, preserving a non-default port' {
+        $script:dnsAnswers = @('10.0.0.9'); $script:port = 3261
+        Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') 2 -VipDistribution
+        ($script:nativeCalls[1] -join '|') | Should Be 'AddTarget|iqn.test:one|*|one.EXAMPLE|3261|*|0|*|*|*|*|*|*|*|*|*|0'
+        $script:nativeCalls[2][3] | Should Be 'one.example'
+        $script:nativeCalls[2][4] | Should Be '3261'
     }
-    It 'does not infer missing correlation from apparently correct current endpoints' {
-        $inventory = New-TestInventory $plan 32 $false
-        for ($i = 0; $i -lt 32; $i++) { $inventory.Connections[$inventory.Sessions[$i].SessionIdentifier][0].TargetAddress = $plan.Slots[$i] }
-        { Test-ZonalLayout $plan $inventory } | Should Throw 'correlation'
-    }
-    It 'accepts current-run observations only when every live identity and origin is accounted for' {
-        $inventory = New-TestInventory $plan 32 $false
-        $observed = @{}
-        for ($i = 0; $i -lt 32; $i++) { $observed[$inventory.Sessions[$i].SessionIdentifier] = $plan.Slots[$i] }
-        (Test-ZonalLayout $plan $inventory 32 $observed) | Should Be $true
-        $observed[$inventory.Sessions[0].SessionIdentifier] = $plan.Vips[1]
-        { Test-ZonalLayout $plan $inventory 32 $observed } | Should Throw 'origins'
-    }
-    It 'refuses partial, extra, stale, undecorated and differently decorated state' {
-        foreach ($count in @(1,31,33)) { { Test-ZonalLayout $plan (New-TestInventory $plan $count) } | Should Throw }
-        foreach ($iqn in @($plan.RawIqn, "$($plan.RawIqn):az-eastus-az1")) {
-            $inventory = New-TestInventory $plan
-            $inventory.Sessions[0].TargetNodeAddress = $iqn
-            { Test-ZonalLayout $plan $inventory } | Should Throw
+    It 'skips any related live or persistent target, including another zone, without resolving DNS' {
+        foreach ($target in @('iqn.test:one','IQN.TEST:ONE:az-eastus-az3','iqn.test:one:az-eastus-az1')) {
+            $script:existing = @([pscustomobject]@{ TargetNodeAddress = $target })
+            Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') 32 -VipDistribution
+            $script:existing = @()
+            $script:persistentOutput = @('Total of 1 peristent targets', "`tTarget   Name `t: $target ", 'Address and Socket : 10.0.0.1 3260', 'The operation completed successfully.')
+            Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') 32 -VipDistribution
+            $script:persistentOutput = @('Total of 0 persistent targets', 'The operation completed successfully.')
         }
-        $empty = New-TestInventory $plan 0
-        (Test-ZonalLayout $plan $empty) | Should Be $false
-        $empty.Targets = @([pscustomobject]@{NodeAddress = $plan.Iqn})
-        { Test-ZonalLayout $plan $empty } | Should Throw
-        $inventory = New-TestInventory $plan
-        $inventory.Sessions = @()
-        { Test-ZonalLayout $plan $inventory } | Should Throw
-    }
-    It 'refuses unhealthy sessions, missing connections and duplicate identifiers' {
-        foreach ($field in @('IsConnected','IsPersistent','IsHeaderDigest','IsDataDigest')) {
-            $inventory = New-TestInventory $plan
-            $inventory.Sessions[0].$field = $false
-            { Test-ZonalLayout $plan $inventory } | Should Throw
+        @($script:nativeCalls | Where-Object { $_[0] -ne 'ListPersistentTargets' }).Count | Should Be 0
+        Assert-MockCalled Get-VipHostAddresses -Scope It -Times 0 -Exactly
+        Assert-MockCalled Write-Host -Scope It -Times 6 -Exactly -ParameterFilter {
+            "$Object" -like '*already configured; run disconnect.ps1 first to change the layout*'
         }
-        $inventory = New-TestInventory $plan
-        $inventory.Connections[$inventory.Sessions[0].SessionIdentifier] = @()
-        { Test-ZonalLayout $plan $inventory } | Should Throw 'readiness'
-        $inventory = New-TestInventory $plan
-        $inventory.Sessions[0].SessionIdentifier = $inventory.Sessions[1].SessionIdentifier
-        { Test-ZonalLayout $plan $inventory } | Should Throw 'ambiguous'
     }
-    It 'rejects foreign persistent options, ports, identities and allocations' {
-        foreach ($change in @(
-            @{ Field='Port'; Value=3261 }, @{ Field='InitiatorPortNumber'; Value=1 },
-            @{ Field='AuthType'; Value=1 }, @{ Field='SecurityFlags'; Value=1 },
-            @{ Field='InformationSpecified'; Value=1 }, @{ Field='HeaderDigest'; Value=0 },
-            @{ Field='DataDigest'; Value=0 }, @{ Field='LoginFlags'; Value=0 },
-            @{ Field='Version'; Value=1 }, @{ Field='IsInformationalSession'; Value=$true },
-            @{ Field='InitiatorInstance'; Value='another-initiator' },
-            @{ Field='TargetName'; Value=$plan.RawIqn },
-            @{ Field='Address'; Value='10.0.0.99' }, @{ Field='Address'; Value=$plan.Vips[1] }
+    It 'does not mistake an unrelated or prefix-sharing IQN for this volume' {
+        $script:existing = @([pscustomobject]@{ TargetNodeAddress = 'iqn.test:one-more:az-eastus-az3' })
+        $script:persistentOutput = @('Total of 1 persistent targets','Target Name : iqn.test:other','The operation completed successfully.')
+        Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') 1 -VipDistribution
+        @($script:nativeCalls | Where-Object { $_[0] -eq 'PersistentLoginTarget' }).Count | Should Be 1
+    }
+    It 'finishes batch DNS preflight before any registration or saved login' {
+        $script:dnsFailureHost = 'two.EXAMPLE'
+        { Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one','two') 32 -VipDistribution } | Should Throw "DNS lookup failed for 'two.EXAMPLE'"
+        @($script:nativeCalls | Where-Object { $_[0] -ne 'ListPersistentTargets' }).Count | Should Be 0
+        $script:dnsFailureHost = ''; $script:dnsAnswers = @()
+        { Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') 32 -VipDistribution } | Should Throw 'no IPv4 addresses'
+        @($script:nativeCalls | Where-Object { $_[0] -ne 'ListPersistentTargets' }).Count | Should Be 0
+    }
+    It 'preserves mapping batch checks for invalid later IQN, host, port or provider result' {
+        foreach ($failure in @('iqn','host','port','provider')) {
+            $script:badSecond = $failure
+            { Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one','two') 2 -ZonalAffinity -VipDistribution } | Should Throw
+            $script:nativeCalls.Count | Should Be 0
+        }
+    }
+    It 'rejects empty and duplicate selections and shared service IQNs before mutation' {
+        { Connect-ElasticSanVolumes 'rg' 'san' 'vg' @() 2 -VipDistribution } | Should Throw 'No volumes'
+        { Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one','ONE') 2 -VipDistribution } | Should Throw 'duplicate'
+        $script:duplicateIqn = $true
+        { Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one','two') 2 -VipDistribution } | Should Throw 'same raw IQN'
+        $script:nativeCalls.Count | Should Be 0
+    }
+    It 'reports native failures and partial saved configuration without claiming live readiness' {
+        $script:nativeExit = 5
+        { Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') 2 -VipDistribution } | Should Throw 'exit 5'
+        $script:nativeCalls.Clear()
+        $script:nativeExit = 0; $script:nativeOutput = 'The operation failed.'
+        { Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') 2 -VipDistribution } | Should Throw 'may remain'
+        $script:nativeCalls.Clear()
+        $script:nativeOutput = "The operation completed successfully.`nThe operation failed."
+        { Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') 2 -VipDistribution } | Should Throw 'unrecognized status'
+    }
+    It 'fails before mutation when the persistent listing fails, is truncated or unrecognized' {
+        foreach ($listing in @(
+            @('The operation failed.'),
+            @('Total of 1 persistent targets','Target Name : ','The operation completed successfully.'),
+            @('Total of 1 persistent targets','The operation completed successfully.'),
+            @('unrecognized inventory','The operation completed successfully.'),
+            @('Total of 0 persistent targets','Total of 0 persistent targets','The operation completed successfully.')
         )) {
-            $inventory = New-TestInventory $plan
-            $inventory.Persistent[0].($change.Field) = $change.Value
-            { Test-ZonalLayout $plan $inventory } | Should Throw
+            $script:persistentOutput = $listing
+            { Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') 2 -VipDistribution } | Should Throw
         }
+        @($script:nativeCalls | Where-Object { $_[0] -ne 'ListPersistentTargets' }).Count | Should Be 0
     }
-    It 'refuses duplicate, stale and malformed optional SessionId correlations' {
-        foreach ($id in @('1-2', '1-ff', "1-1`n", 'not-an-id', '0-0')) {
-            $inventory = New-TestInventory $plan
-            $inventory.Persistent[0].SessionIdentifier = $id
-            { Test-ZonalLayout $plan $inventory } | Should Throw
+    It 'rejects counts outside 1-32 before discovery' {
+        foreach ($count in @(0,33)) {
+            { . $connectPath 'rg' 'san' 'vg' @('one') $count -EnableVipDistribution } | Should Throw
         }
+        $script:requests.Count | Should Be 0
+        $script:nativeCalls.Count | Should Be 0
     }
-    It 'does not hide incompatible visible records behind pending counts' {
-        $inventory = New-TestInventory $plan 1
-        $inventory.Sessions = @()
-        $inventory.Persistent[0].Port = 3261
-        { Test-ZonalLayout $plan $inventory 1 @{} -AllowPending } | Should Throw 'incompatible'
-    }
-    It 'checks partial target identities and portal over-allocation before allowing pending state' {
-        $inventory = New-TestInventory $plan 1
-        $inventory.Targets = @([pscustomobject]@{ NodeAddress = $plan.RawIqn })
-        { Test-ZonalLayout $plan $inventory 2 @{} -AllowPending } | Should Throw 'different zonal'
-        $inventory = New-TestInventory $plan 2
-        $inventory.Persistent[1].Address = $plan.Vips[0]
-        { Test-ZonalLayout $plan $inventory 3 @{} -AllowPending } | Should Throw 'allocation'
-    }
-    It 'refuses lost current-run sessions and contradictory native correlation' {
-        $inventory = New-TestInventory $plan 1
-        $observed = @{ '0000000000000001-0000000000000001' = $plan.Vips[1] }
-        { Test-ZonalLayout $plan $inventory 1 $observed -AllowPending } | Should Throw 'conflicts'
-        $inventory = New-TestInventory $plan 0
-        { Test-ZonalLayout $plan $inventory 2 $observed -AllowPending } | Should Throw 'no longer ready'
+    It 'handles more than three VIPs without changing the requested session count' {
+        $script:dnsAnswers = @('10.0.0.4','10.0.0.3','10.0.0.2','10.0.0.1')
+        Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') 7 -VipDistribution
+        $logins = @($script:nativeCalls | Where-Object { $_[0] -eq 'PersistentLoginTarget' })
+        $logins.Count | Should Be 7
+        (@($logins | ForEach-Object { $_[3] }) -join ',') | Should Be '10.0.0.1,10.0.0.2,10.0.0.3,10.0.0.4,10.0.0.1,10.0.0.2,10.0.0.3'
     }
 }
 
-Describe 'Read-only native ABI without calling the native DLL' {
-    BeforeEach {
-        $buffer = [IntPtr]::Zero
-        Initialize-ZonalNativeInventory
-        $nativePlan = New-TestPlan
-        $nativeLogin = New-Object 'ElasticSan.ZonalPersistentInventory+Login'
-        $nativeLogin.TargetName = $nativePlan.Iqn
-        $nativeLogin.InitiatorInstance = 'Root\ISCSIPRT\0000_0'
-        $nativeLogin.InitiatorPortNumber = [uint32]::MaxValue
-        $portal = New-Object 'ElasticSan.ZonalPersistentInventory+Portal'
-        $portal.Address = $nativePlan.Vips[0]; $portal.Socket = 3260
-        $nativeLogin.TargetPortal = $portal
-        $options = New-Object 'ElasticSan.ZonalPersistentInventory+Options'
-        $options.InformationSpecified = 3; $options.LoginFlags = 2
-        $options.HeaderDigest = 1; $options.DataDigest = 1
-        $nativeLogin.LoginOptions = $options
-        $nativeMapping = New-Object 'ElasticSan.ZonalPersistentInventory+Mapping'
-        $nativeMapping.TargetName = $nativePlan.Iqn
-        $id = New-Object 'ElasticSan.ZonalPersistentInventory+SessionId'
-        $id.AdapterUnique = 1; $id.AdapterSpecific = 1
-        $nativeMapping.SessionId = $id
-        $stride = [Runtime.InteropServices.Marshal]::SizeOf($nativeLogin)
-        $size = $stride + [Runtime.InteropServices.Marshal]::SizeOf($nativeMapping)
-        $buffer = [Runtime.InteropServices.Marshal]::AllocHGlobal($size)
-        $nativeLogin.Mappings = [IntPtr]::Add($buffer, $stride)
-        [Runtime.InteropServices.Marshal]::StructureToPtr($nativeMapping, $nativeLogin.Mappings, $false)
-        [Runtime.InteropServices.Marshal]::StructureToPtr($nativeLogin, $buffer, $false)
-    }
-    AfterEach { if ($null -ne $buffer -and $buffer -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::FreeHGlobal($buffer) } }
-    It 'matches the Windows Unicode ABI field offsets' {
-        [Runtime.InteropServices.Marshal]::SizeOf($portal) | Should Be 1026
-        [Runtime.InteropServices.Marshal]::OffsetOf($nativeMapping.GetType(), 'SessionId').ToInt32() | Should Be 1480
-        [Runtime.InteropServices.Marshal]::OffsetOf($nativeLogin.GetType(), 'TargetPortal').ToInt32() | Should Be 968
-        [Runtime.InteropServices.Marshal]::OffsetOf($nativeLogin.GetType(), 'SecurityFlags').ToInt32() | Should Be 2000
-        [Runtime.InteropServices.Marshal]::OffsetOf($nativeLogin.GetType(), 'Mappings').ToInt32() | Should Be 2008
-    }
-    It 'decodes original portals and optional mappings, not redirected connections' {
-        $records = @([ElasticSan.ZonalPersistentInventory]::Decode($buffer, $size, 1))
-        $records.Count | Should Be 1
-        $records[0].Address | Should Be '10.0.0.1'
-        $records[0].Port | Should Be 3260
-        $records[0].SessionIdentifier | Should Be '0000000000000001-0000000000000001'
-        $inventory = New-TestInventory $nativePlan
-        $inventory.Persistent[0] = $records[0]
-        (Test-ZonalLayout $nativePlan $inventory) | Should Be $true
-    }
-    It 'never manufactures correlation from absent or zero native SessionId' {
-        $nativeMapping.SessionId = New-Object 'ElasticSan.ZonalPersistentInventory+SessionId'
-        [Runtime.InteropServices.Marshal]::StructureToPtr($nativeMapping, $nativeLogin.Mappings, $false)
-        [ElasticSan.ZonalPersistentInventory]::Decode($buffer, $size, 1)[0].SessionIdentifier | Should BeNullOrEmpty
-        $nativeLogin.Mappings = [IntPtr]::Zero
-        [Runtime.InteropServices.Marshal]::StructureToPtr($nativeLogin, $buffer, $false)
-        $record = [ElasticSan.ZonalPersistentInventory]::Decode($buffer, $size, 1)[0]
-        $record.SessionIdentifier | Should BeNullOrEmpty
-        $inventory = New-TestInventory $nativePlan
-        $inventory.Persistent[0] = $record
-        { Test-ZonalLayout $nativePlan $inventory } | Should Throw 'correlation'
-    }
-    It 'rejects conflicting target identity and out-of-buffer mappings before dereferencing' {
-        $nativeMapping.TargetName = 'iqn.test:foreign'
-        [Runtime.InteropServices.Marshal]::StructureToPtr($nativeMapping, $nativeLogin.Mappings, $false)
-        { [ElasticSan.ZonalPersistentInventory]::Decode($buffer, $size, 1) } | Should Throw 'Conflicting'
-        { [ElasticSan.ZonalPersistentInventory]::Decode($buffer, ($stride - 1), 1) } | Should Throw 'Truncated'
-        foreach ($offset in @(-1, $size, 0)) {
-            $nativeLogin.Mappings = [IntPtr]::Add($buffer, $offset)
-            [Runtime.InteropServices.Marshal]::StructureToPtr($nativeLogin, $buffer, $false)
-            { [ElasticSan.ZonalPersistentInventory]::Decode($buffer, $size, 1) } | Should Throw 'Invalid persistent session mapping'
+foreach ($mode in @(
+    @{ Label='zonal only'; Zonal=$true; Vip=$false; Iqn='iqn.test:one:az-eastus-az3'; Portal='one.example'; Count=1 },
+    @{ Label='VIP only'; Zonal=$false; Vip=$true; Iqn='iqn.test:one'; Portal='10.0.0.8'; Count=31 },
+    @{ Label='both'; Zonal=$true; Vip=$true; Iqn='iqn.test:one:az-eastus-az3'; Portal='10.0.0.8'; Count=$null }
+)) {
+    Describe "Actual script independent switches: $($mode.Label)" {
+        It 'uses only the requested mechanisms and succeeds with no live session created' {
+            $script:nativeCalls = New-Object 'System.Collections.Generic.List[object]'
+            $script:requests = New-Object 'System.Collections.Generic.List[object]'
+            $script:nativeExit = 0; $script:nativeOutput = 'The operation completed successfully.'
+            $script:persistentOutput = @('Total of 0 persistent targets','The operation completed successfully.')
+            $script:dnsAnswers = @('10.0.0.10','10.0.0.9','10.0.0.8')
+            $script:dnsFailureHost = ''; $script:port = 3260; $script:badSecond = ''; $script:duplicateIqn = $false
+            Mock Get-Service { [pscustomobject]@{ Status = 'Running' } }
+            Mock Get-WindowsFeature { [pscustomobject]@{ InstallState = 'Installed' } }
+            Mock Get-IscsiSession {}
+            Mock Write-Host {}
+            Mock Get-AzContext {
+                Set-TestConnectionBoundaries
+                [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = 'abcdef01-2345-6789-abcd-0123456789ab' } }
+            }
+            $parameters = @{
+                ResourceGroupName='rg'; ElasticSanName='san'; VolumeGroupName='vg'; VolumeName=@('one')
+                EnableZonalAffinity=$mode.Zonal; EnableVipDistribution=$mode.Vip
+            }
+            if ($null -ne $mode.Count) { $parameters.NumSession = $mode.Count }
+            . $connectPath @parameters
+            $logins = @($script:nativeCalls | Where-Object { $_[0] -eq 'PersistentLoginTarget' })
+            $logins.Count | Should Be $(if ($null -eq $mode.Count) { 32 } else { $mode.Count })
+            $logins[0][1] | Should Be $mode.Iqn
+            $logins[0][3] | Should Be $mode.Portal
+            Assert-MockCalled Get-ZonalComputeMetadata -Scope It -Times ([int]$mode.Zonal) -Exactly
+            Assert-MockCalled Get-VipHostAddresses -Scope It -Times ([int]$mode.Vip) -Exactly
+            @($script:requests | Where-Object { $_.Command -in @('Get-AzElasticSan','Invoke-AzRestMethod') }).Count | Should Be (2 * [int]$mode.Zonal)
+            foreach ($request in $script:requests) {
+                $request.Parameters.DefaultProfile.Subscription.Id | Should Be 'abcdef01-2345-6789-abcd-0123456789ab'
+            }
+            Assert-MockCalled Get-IscsiSession -Scope It -Times 1 -Exactly
         }
     }
 }
