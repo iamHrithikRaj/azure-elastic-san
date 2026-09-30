@@ -1904,29 +1904,42 @@ class ExistingStatePolicyTests(unittest.TestCase):
                 self.assertIn(healthy.nicknames[0].encode("ascii"), content)
                 self.assertNotIn(anomalous.nicknames[0].encode("ascii"), content)
 
-    def test_rollback_error_names_earlier_volumes_that_lost_their_entries(self):
+    def test_failed_volume_rollback_keeps_entries_of_volumes_connected_earlier(self):
         first = _volume_plan("vol1")
         second = _volume_plan("vol2")
-        self._write_config()
-        with mock.patch.object(connect, "ensure_freebsd_prerequisites"):
-            with mock.patch.object(
-                connect,
-                "list_iscsi_sessions",
-                side_effect=[[], [], [_session(first.target_name)], [_session(first.target_name)]],
-            ):
-                with mock.patch.object(
-                    connect,
-                    "add_iscsi_session",
-                    side_effect=[None, connect.ElasticSanConnectError("kernel rejected vol2")],
-                ):
-                    with mock.patch("builtins.print"):
-                        with self.assertRaisesRegex(
-                            connect.ElasticSanConnectError,
-                            r"restored .* Volume\(s\) 'vol1' connected earlier in this run .* "
-                            r"Original error: kernel rejected vol2",
+        for config_existed in (True, False):
+            with self.subTest(config_existed=config_existed):
+                for name in os.listdir(self.tempdir):
+                    os.remove(os.path.join(self.tempdir, name))
+                if config_existed:
+                    self._write_config()
+                with mock.patch.object(connect, "ensure_freebsd_prerequisites"):
+                    with mock.patch.object(
+                        connect,
+                        "list_iscsi_sessions",
+                        side_effect=[
+                            [], [], [_session(first.target_name)], [_session(first.target_name)]
+                        ],
+                    ):
+                        with mock.patch.object(
+                            connect,
+                            "add_iscsi_session",
+                            side_effect=[None, connect.ElasticSanConnectError("kernel rejected vol2")],
                         ):
-                            connect.execute_connection_plan([first, second], self.config_path, 1)
-        self.assertNotIn(first.nicknames[0].encode("ascii"), self._read_config())
+                            with mock.patch("builtins.print"):
+                                with self.assertRaisesRegex(
+                                    connect.ElasticSanConnectError,
+                                    r"session for 'vol2'; restored .* before this volume.* earlier "
+                                    r"in this run keep their sessions and entries: 'vol1'\..* "
+                                    r"Original error: kernel rejected vol2",
+                                ):
+                                    connect.execute_connection_plan(
+                                        [first, second], self.config_path, 1
+                                    )
+                content = self._read_config()
+                self.assertEqual(config_existed, content.startswith(b"# operator content\n"))
+                self.assertIn(first.nicknames[0].encode("ascii"), content)
+                self.assertNotIn(second.nicknames[0].encode("ascii"), content)
 
 
 class ValidationTests(unittest.TestCase):

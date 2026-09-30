@@ -111,8 +111,8 @@ with status 1 (no Python traceback):
 6. **Pre-mutation plan**: one `iscsictl -L -v` inventory, then every selected
    volume is classified (see "Existing connections and reruns") before any
    config or session is changed.
-7. **Connect**: the managed entries for the volumes that need them are written
-   and their sessions are added (see "Atomic write, backup, and rollback").
+7. **Connect**: one volume at a time, its managed entry is written and its
+   session is added (see "Atomic write, backup, and rollback").
 8. **Validation**: read-only `[PASS]`/`[WARN]`/`[FAIL]` checks and a summary
    (see "Validation and exit codes"). Any `[FAIL]` ends the run in error.
 
@@ -245,31 +245,35 @@ losing each other's updates. `--dry-run` neither creates nor acquires the lock.
 While holding that lock, every write to `/etc/iscsi.conf` goes through: write a
 temp file in the same directory → `fsync` → preserve the original file's
 permissions and ownership (where the platform supports it) → `os.replace`
-(atomic rename). Before any of that, if `/etc/iscsi.conf` already existed, its
-exact current bytes are copied to a backup file
-(`/etc/iscsi.conf.bak.pre-esan-connect.<pid>`, created with restrictive `0600`
-permissions regardless of the original file's mode, since preserved unrelated
-stanzas may contain CHAP secrets). The backup is **not** deleted automatically;
-it's left behind for manual recovery. Only the volumes that the pre-mutation
-plan selects for connection get a managed entry written; when every selected
-volume is skipped, the file is neither written nor backed up.
+(atomic rename).
 
-If starting/configuring the requested sessions then fails partway through,
-the script stops and restores `/etc/iscsi.conf` from that backup (or deletes
-the file entirely if it did not exist before this run) before exiting with an
-error. Validation is not run in that case.
+Each volume that the pre-mutation plan selects for connection is its own
+config transaction: back up the current file, add that volume's managed entry,
+then establish its session. The backup is the exact current bytes of
+`/etc/iscsi.conf`, including entries added for volumes connected earlier in
+this run. It is written to `/etc/iscsi.conf.bak.pre-esan-connect.<pid>` with
+restrictive `0600` permissions regardless of the original file's mode, since
+preserved unrelated stanzas may contain CHAP secrets. Each volume's backup
+replaces the previous one, so the file always holds the state before the
+volume in progress; content outside the managed block is identical in every
+copy. The backup is **not** deleted automatically; it's left behind for manual
+recovery. No backup is taken while the file doesn't exist yet. When every
+selected volume is skipped, the file is neither written nor backed up.
+
+If establishing a volume's session fails, the script restores
+`/etc/iscsi.conf` from that volume's backup (or deletes the file if it did not
+exist before this run and this was the first volume), which removes only the
+failed volume's entry. It then stops with an error that names the failed
+volume and any volumes connected earlier in this run; those keep their
+sessions and managed entries, so they stay persistent. Validation is not run
+in that case.
 This only ever rolls back the **config file** -- it never disconnects or
 removes any iSCSI session. After `iscsictl -A` has been submitted, a session
 may already be live or may become live after a timeout even though the config
 file was restored. Always inspect `iscsictl -L -v` before retrying a failed run.
 Host prerequisite changes (kernel module, `iscsid`, `iscsictl_enable`) are not
-rolled back either. Input preflight is not an all-volume transaction: if
-connecting a later volume fails, earlier volumes may remain connected. The
-whole-file restore also removes those earlier volumes' managed entries, so
-they are not re-added at boot and a rerun skips them as "not persistent"
-(the script never rewrites a live volume's configuration). The error message
-names these volumes; to make them persistent, disconnect them during a
-maintenance window and re-run.
+rolled back either. A rerun after fixing the cause skips the volumes that are
+already connected and connects the rest.
 
 ## Existing connections and reruns
 

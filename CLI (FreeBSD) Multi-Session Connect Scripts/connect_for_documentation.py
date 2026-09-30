@@ -1551,39 +1551,40 @@ def execute_connection_plan(plans, config_path, number_of_sessions):
         if not plans_to_connect:
             return []
 
-        new_content = compute_new_config_content(
-            existing_content_bytes, render_full_managed_block(plans_to_connect)
-        )
-        backup_path = backup_config(config_path, existing_content_bytes, existed)
-        write_config_atomically(config_path, new_content, original_stat)
-
+        current_content, current_existed = existing_content_bytes, existed
         connected_volume_names = []
-        try:
-            for plan in plans_to_connect:
-                add_sessions_for_volume(plan, config_path, number_of_sessions)
-                connected_volume_names.append(plan.volume_name)
-        except (ElasticSanConnectError, OSError) as error:
-            restore_config_from_backup(config_path, backup_path, existed, original_stat)
-            unpersisted = ""
-            if connected_volume_names:
-                # The whole-file restore also removes entries for volumes that did
-                # connect; a rerun then skips them as live but not persistent.
-                unpersisted = (
-                    " Volume(s) {} connected earlier in this run and stay connected, but their "
-                    "managed entries were removed by the restore, so they will not be re-added "
-                    "at boot and a rerun reports them as not persistent. To make them "
-                    "persistent, disconnect them during a maintenance window and re-run.".format(
-                        ", ".join("'{}'".format(name) for name in connected_volume_names)
-                    )
-                )
-            raise ElasticSanConnectError(
-                "Failed while establishing iSCSI sessions; restored {} to its pre-run state. "
-                "This rollback only restores the config file: an iscsictl add request may already "
-                "have created or may still create a live session, and this script never removes "
-                "sessions. Inspect 'iscsictl -L -v' before retrying.{} Original error: {}".format(
-                    config_path, unpersisted, error
-                )
+        for plan in plans_to_connect:
+            # Each volume is its own config transaction, so a failure removes only
+            # that volume's entry and earlier volumes keep theirs (and stay persistent).
+            new_content = compute_new_config_content(
+                current_content, render_full_managed_block([plan])
             )
+            backup_path = backup_config(config_path, current_content, current_existed)
+            write_config_atomically(config_path, new_content, original_stat)
+            try:
+                add_sessions_for_volume(plan, config_path, number_of_sessions)
+            except (ElasticSanConnectError, OSError) as error:
+                restore_config_from_backup(
+                    config_path, backup_path, current_existed, original_stat
+                )
+                earlier = ""
+                if connected_volume_names:
+                    earlier = (
+                        " Volume(s) connected earlier in this run keep their sessions and "
+                        "entries: {}.".format(
+                            ", ".join("'{}'".format(name) for name in connected_volume_names)
+                        )
+                    )
+                raise ElasticSanConnectError(
+                    "Failed while establishing the iSCSI session for '{}'; restored {} to its "
+                    "state before this volume, which removes only that volume's entry.{} This "
+                    "rollback only restores the config file: an iscsictl add request may already "
+                    "have created or may still create a live session, and this script never "
+                    "removes sessions. Inspect 'iscsictl -L -v' before retrying. Original "
+                    "error: {}".format(plan.volume_name, config_path, earlier, error)
+                )
+            current_content, current_existed = new_content, True
+            connected_volume_names.append(plan.volume_name)
         return connected_volume_names
     finally:
         release_config_transaction_lock(lock_fd)
