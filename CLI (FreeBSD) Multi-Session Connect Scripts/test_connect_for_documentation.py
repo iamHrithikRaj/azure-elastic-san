@@ -964,10 +964,9 @@ class AtomicWriteAndBackupTests(unittest.TestCase):
         with open(self.config_path, "wb") as handle:
             handle.write(b"original\n")
         content, existed, original_stat = connect.read_config_file(self.config_path)
-        backup_path = connect.backup_config(self.config_path, content, existed)
 
         connect.write_config_atomically(self.config_path, b"mutated\n", original_stat)
-        connect.restore_config_from_backup(self.config_path, backup_path, existed, original_stat)
+        connect.restore_config_content(self.config_path, content, existed, original_stat)
 
         with open(self.config_path, "rb") as handle:
             self.assertEqual(b"original\n", handle.read())
@@ -975,7 +974,7 @@ class AtomicWriteAndBackupTests(unittest.TestCase):
     def test_rollback_removes_file_that_did_not_exist_before(self):
         connect.write_config_atomically(self.config_path, b"brand new\n", None)
         self.assertTrue(os.path.exists(self.config_path))
-        connect.restore_config_from_backup(self.config_path, None, False, None)
+        connect.restore_config_content(self.config_path, b"", False, None)
         self.assertFalse(os.path.exists(self.config_path))
 
 
@@ -1647,7 +1646,7 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
             original_content = handle.read()
 
         plans = self._plans()
-        original_restore = connect.restore_config_from_backup
+        original_restore = connect.restore_config_content
 
         def restore_while_locked(*args):
             self.assertEqual(
@@ -1663,7 +1662,7 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
                 ):
                     with mock.patch.object(
                         connect,
-                        "restore_config_from_backup",
+                        "restore_config_content",
                         side_effect=restore_while_locked,
                     ):
                         with self.assertRaisesRegex(connect.ElasticSanConnectError, "restored"):
@@ -1921,12 +1920,12 @@ class ExistingStatePolicyTests(unittest.TestCase):
     def test_failed_volume_rollback_keeps_entries_of_volumes_connected_earlier(self):
         first = _volume_plan("vol1")
         second = _volume_plan("vol2")
+        backup_path = "{}.bak.pre-esan-connect.{}".format(self.config_path, os.getpid())
         for config_existed in (True, False):
             with self.subTest(config_existed=config_existed):
                 for name in os.listdir(self.tempdir):
                     os.remove(os.path.join(self.tempdir, name))
-                if config_existed:
-                    self._write_config()
+                original = self._write_config() if config_existed else b""
                 with mock.patch.object(connect, "ensure_freebsd_prerequisites"):
                     with mock.patch.object(
                         connect,
@@ -1950,10 +1949,20 @@ class ExistingStatePolicyTests(unittest.TestCase):
                                     connect.execute_connection_plan(
                                         [first, second], self.config_path, 1
                                     )
-                content = self._read_config()
-                self.assertEqual(config_existed, content.startswith(b"# operator content\n"))
-                self.assertIn(first.nicknames[0].encode("ascii"), content)
-                self.assertNotIn(second.nicknames[0].encode("ascii"), content)
+                # The config is exactly the state after vol1 connected.
+                self.assertEqual(
+                    connect.compute_new_config_content(
+                        original, connect.render_full_managed_block([first])
+                    ),
+                    self._read_config(),
+                )
+                self.assertNotIn(second.nicknames[0].encode("ascii"), self._read_config())
+                # The on-disk backup is still the pre-run config (none if there was no file).
+                if config_existed:
+                    with open(backup_path, "rb") as handle:
+                        self.assertEqual(original, handle.read())
+                else:
+                    self.assertFalse(os.path.exists(backup_path))
 
 
 class ValidationTests(unittest.TestCase):

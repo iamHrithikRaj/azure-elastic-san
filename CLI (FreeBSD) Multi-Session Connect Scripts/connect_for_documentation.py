@@ -1027,21 +1027,17 @@ def write_config_atomically(path, new_content_bytes, original_stat):
         raise
 
 
-def restore_config_from_backup(path, backup_path, existed, original_stat):
-    """Roll back a mutation: restore the pre-mutation content and permissions
-    (or remove the file entirely if it did not exist before this run created
-    it). *original_stat* must be the stat() of the file captured before it
-    was mutated -- the backup file itself is deliberately created with
-    restrictive permissions regardless of the original file's mode, since
-    unrelated stanzas preserved outside the managed block may contain CHAP
-    secrets."""
+def restore_config_content(path, content_bytes, existed, original_stat):
+    """Roll back a mutation to *content_bytes*, captured in memory before it,
+    through the same atomic write (or remove the file if it did not exist
+    before this run created it). *original_stat* must be the stat() of the
+    file captured before this run mutated it, so its permissions and
+    ownership are preserved."""
     if not existed:
         if os.path.exists(path):
             os.remove(path)
         return
-    with open(backup_path, "rb") as handle:
-        backup_content = handle.read()
-    write_config_atomically(path, backup_content, original_stat)
+    write_config_atomically(path, content_bytes, original_stat)
 
 
 # ---------------------------------------------------------------------------
@@ -1552,6 +1548,9 @@ def execute_connection_plan(plans, config_path, number_of_sessions):
         if not plans_to_connect:
             return []
 
+        # The on-disk backup is taken once and stays the pre-run config for manual
+        # recovery; per-volume rollback uses the in-memory bytes from before that volume.
+        backup_config(config_path, existing_content_bytes, existed)
         current_content, current_existed = existing_content_bytes, existed
         connected_volume_names = []
         for plan in plans_to_connect:
@@ -1560,13 +1559,12 @@ def execute_connection_plan(plans, config_path, number_of_sessions):
             new_content = compute_new_config_content(
                 current_content, render_full_managed_block([plan])
             )
-            backup_path = backup_config(config_path, current_content, current_existed)
             write_config_atomically(config_path, new_content, original_stat)
             try:
                 add_sessions_for_volume(plan, config_path, number_of_sessions)
             except (ElasticSanConnectError, OSError) as error:
-                restore_config_from_backup(
-                    config_path, backup_path, current_existed, original_stat
+                restore_config_content(
+                    config_path, current_content, current_existed, original_stat
                 )
                 earlier = ""
                 if connected_volume_names:

@@ -247,26 +247,24 @@ temp file in the same directory → `fsync` → preserve the original file's
 permissions and ownership (where the platform supports it) → `os.replace`
 (atomic rename).
 
-Each volume that the pre-mutation plan selects for connection is its own
-config transaction: back up the current file, add that volume's managed entry,
-then establish its session. The backup is the exact current bytes of
-`/etc/iscsi.conf`, including entries added for volumes connected earlier in
-this run. It is written to `/etc/iscsi.conf.bak.pre-esan-connect.<pid>` with
-restrictive `0600` permissions regardless of the original file's mode, since
-preserved unrelated stanzas may contain CHAP secrets. Each volume's backup
-replaces the previous one, so the file always holds the state before the
-volume in progress; content outside the managed block is identical in every
-copy. The backup is **not** deleted automatically; it's left behind for manual
-recovery. No backup is taken while the file doesn't exist yet. When every
-selected volume is skipped, the file is neither written nor backed up.
+Before the first write, if `/etc/iscsi.conf` already exists, its exact current
+bytes are copied once to `/etc/iscsi.conf.bak.pre-esan-connect.<pid>`, created
+with restrictive `0600` permissions regardless of the original file's mode,
+since preserved unrelated stanzas may contain CHAP secrets. That file always
+holds the pre-run config; it is **not** deleted automatically and is left
+behind for manual recovery. When every selected volume is skipped, the file is
+neither written nor backed up.
 
-If establishing a volume's session fails, the script restores
-`/etc/iscsi.conf` from that volume's backup (or deletes the file if it did not
-exist before this run and this was the first volume), which removes only the
-failed volume's entry. It then stops with an error that names the failed
-volume and any volumes connected earlier in this run; those keep their
-sessions and managed entries, so they stay persistent. Validation is not run
-in that case.
+Each volume that the pre-mutation plan selects for connection is then its own
+config transaction: the script keeps the current config bytes in memory
+(including entries added for volumes connected earlier in this run), adds that
+volume's managed entry, and establishes its session. If establishing the
+session fails, it restores those in-memory bytes through the same atomic write
+(or deletes the file if it did not exist before this run and this was the
+first volume), which removes only the failed volume's entry. It then stops
+with an error that names the failed volume and any volumes connected earlier
+in this run; those keep their sessions and managed entries, so they stay
+persistent. Validation is not run in that case.
 This only ever rolls back the **config file** -- it never disconnects or
 removes any iSCSI session. After `iscsictl -A` has been submitted, a session
 may already be live or may become live after a timeout even though the config
