@@ -406,7 +406,9 @@ class ConnectFlowTests(HardeningTestCase):
                             self.assertTrue(any(key in c for c in earlier), (portal, key))
                     self.assertEqual({target}, {name for name, _ in self.host.nodes})
                     self.assertEqual(32, len(self.host.sessions))
-                    self.assertIn("[PASS] volume1 node.session.nr_sessions: 32 (requested 32)", self.stdout)
+                    self.assertIn("[PASS] volume1 [{}] persistent records: nr_sessions total 32 across {} node "
+                                  "record(s), node.startup automatic (requested 32)".format(target, 3 if vip else 1),
+                                  self.stdout)
 
     def test_opt_out_keeps_digests_but_skips_every_recommended_change(self):
         self.host.multipath_defaults["find_multipaths"] = "strict"
@@ -420,7 +422,7 @@ class ConnectFlowTests(HardeningTestCase):
         self.assertEqual([], self.host.ran("sudo", "multipath", "-a"))
         self.assertNotIn("recommended settings", self.stdout)
         # Without WWID registration, strict find_multipaths leaves the volume unmapped.
-        self.assertIn("[FAIL] volume1 multipath: no multipath map", self.stdout)
+        self.assertIn("[FAIL] volume1 [{}] multipath paths: no multipath map".format(iqn("volume1")), self.stdout)
 
 
 class ExistingStateTests(HardeningTestCase):
@@ -495,11 +497,11 @@ class ExistingStateTests(HardeningTestCase):
                                  [c[c.index("-n") + 1] for c in self.host.commands if "update" in c])
                 self.assertEqual("None", record["node.conn[0].iscsi.DataDigest"])
                 # Pre-existing problems on a skipped volume only warn.
-                self.assertIn("[WARN] volume1 digests: not CRC32C for " + PORTAL, self.stdout)
+                self.assertIn("[WARN] volume1 [{}] digests: not CRC32C for {}".format(iqn("volume1"), PORTAL), self.stdout)
                 self.assertEqual(notice, "log out/in or reboot for updated iSCSI settings" in self.stdout)
                 if not live:
-                    self.assertIn("[WARN] volume1 sessions: 0 live (requested 8); persistent configuration exists "
-                                  "but no live sessions: log in with 'sudo iscsiadm -m node -T {} -p {} -l'".format(
+                    self.assertIn("[WARN] volume1 [{0}] live sessions: 0 (requested 8); persistent configuration "
+                                  "exists but no live sessions: log in with 'sudo iscsiadm -m node -T {0} -p {1} -l'".format(
                                       iqn("volume1"), PORTAL), self.stdout)
 
 
@@ -509,26 +511,28 @@ class FailureAndValidationTests(HardeningTestCase):
         connect.get_iqns.side_effect = lambda *args: targets[args[-1]]
         self.host.failed_logins.add("bad.example:3260")
         self.host.nodes[(iqn("volume10"), "bad.example:3260")] = connected_record()
-        with self.assertRaisesRegex(connect.ConnectScriptError, "Validation found 1 failed check"):
+        with self.assertRaisesRegex(connect.ConnectScriptError, "Validation found 2 failed check"):
             self.run_main(volumes=["volume1", "volume2"])
         self.assertNotIn((iqn("volume1"), "bad.example:3260"), self.host.nodes)
         self.assertIn((iqn("volume10"), "bad.example:3260"), self.host.nodes)
         self.assertIn((iqn("volume2"), PORTAL), self.host.nodes)
         self.assertIn("removed the node record created for portal bad.example:3260", self.stderr)
-        self.assertIn("[FAIL] volume1 connection: not connected", self.stdout)
-        self.assertIn("[PASS] volume2 sessions: 4 live (requested 4)", self.stdout)
+        self.assertIn("[FAIL] volume1 [{}] live sessions: 0 (requested 4); not connected, see the errors "
+                      "above".format(iqn("volume1")), self.stdout)
+        self.assertIn("[FAIL] volume1 [{}] persistent records: none".format(iqn("volume1")), self.stdout)
+        self.assertIn("[PASS] volume2 [{}] live sessions: 4 (requested 4)".format(iqn("volume2")), self.stdout)
 
     def test_same_shortfall_fails_when_connected_and_warns_when_skipped(self):
         self.host.fail_clones = True
         with self.assertRaises(connect.ConnectScriptError):
             self.run_main()
-        self.assertIn("[FAIL] volume1 sessions: 1 live (requested 4)", self.stdout)
+        self.assertIn("[FAIL] volume1 [{}] live sessions: 1 (requested 4)".format(iqn("volume1")), self.stdout)
 
         self.setUp()
         self.host.nodes[(iqn("volume1"), PORTAL)] = connected_record(**{"node.session.nr_sessions": "1"})
         self.host.add_session(iqn("volume1"))
         self.run_main(volumes=["volume1"])
-        self.assertIn("[WARN] volume1 sessions: 1 live (requested 4)", self.stdout)
+        self.assertIn("[WARN] volume1 [{}] live sessions: 1 (requested 4)".format(iqn("volume1")), self.stdout)
         self.assertIn("Validation: ", self.stdout)
         self.assertNotIn("[FAIL]", self.stdout)
 
@@ -537,14 +541,28 @@ class FailureAndValidationTests(HardeningTestCase):
         for _ in range(32):
             self.host.add_session(iqn("volume1"))
         self.run_main(count=4)
-        self.assertIn("[WARN] volume1 sessions: 32 live (requested 4)", self.stdout)
-        self.assertIn("[WARN] volume1 node.session.nr_sessions: 32 (requested 4)", self.stdout)
+        self.assertIn("[WARN] volume1 [{}] live sessions: 32 (requested 4)".format(iqn("volume1")), self.stdout)
+        self.assertIn("[WARN] volume1 [{}] persistent records: nr_sessions total 32 across 1 node record(s), "
+                      "node.startup automatic (requested 4)".format(iqn("volume1")), self.stdout)
+
+    def test_check_names_match_the_shared_linux_validation_contract(self):
+        self.run_main()
+        labels = [line.split("] ", 1)[1].split(": ", 1)[0] for line in self.stdout.splitlines()
+                  if line.startswith(("[PASS]", "[WARN]", "[FAIL]"))]
+        volume = "volume1 [{}] ".format(iqn("volume1"))
+        self.assertEqual(
+            ["iscsid service", "multipathd service", "iSCSI login unit", "multipath drop-in", "multipath defaults"]
+            + [volume + check for check in ("live sessions", "persistent records", "digests",
+                                            "recommended settings", "multipath paths")],
+            labels,
+        )
+        self.assertIn("Validation: 10 passed, 0 warnings, 0 failed", self.stdout)
 
     def test_digests_are_validated_from_the_node_record(self):
         self.host.negotiated_data_digest = "None"
         self.run_main()
-        self.assertIn("[PASS] volume1 digests: CRC32C in the node records; negotiated header/data: CRC32C/None",
-                      self.stdout)
+        self.assertIn("[PASS] volume1 [{}] digests: CRC32C in the node records; negotiated header/data: "
+                      "CRC32C/None".format(iqn("volume1")), self.stdout)
 
 
 class MultipathTests(HardeningTestCase):
@@ -570,8 +588,9 @@ class MultipathTests(HardeningTestCase):
             self.host.add_session(iqn("volume2"))
         self.run_main(volumes=["volume1", "volume2"])
         self.assertEqual({iqn("volume1")}, self.host.registered)
-        self.assertIn("[PASS] volume1 multipath: map map-volume1 with 4 active paths", self.stdout)
-        self.assertIn("[WARN] volume2 multipath: no multipath map", self.stdout)
+        self.assertIn("[PASS] volume1 [{}] multipath paths: map map-volume1 with 4 active paths".format(
+            iqn("volume1")), self.stdout)
+        self.assertIn("[WARN] volume2 [{}] multipath paths: no multipath map".format(iqn("volume2")), self.stdout)
         self.assertIn("[WARN] multipath defaults: find_multipaths is strict (documented: yes)", self.stdout)
 
 

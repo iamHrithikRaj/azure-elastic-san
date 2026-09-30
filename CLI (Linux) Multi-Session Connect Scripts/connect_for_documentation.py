@@ -386,13 +386,13 @@ def _validate_host(report, apply_recommended):
     login_unit = find_login_unit()
     if login_unit:
         enabled = run_command(["systemctl", "is-enabled", login_unit])[1].strip() or "unknown"
-        report.add("PASS" if enabled in ENABLED_UNIT_STATES else "FAIL", login_unit + " service",
-                   "{} (logs in automatic node records at boot)".format(enabled))
+        report.add("PASS" if enabled in ENABLED_UNIT_STATES else "FAIL", "iSCSI login unit",
+                   "{} is {}; it logs in automatic node records at boot".format(login_unit, enabled))
     if not apply_recommended:
         return
     path = multipath_drop_in_path()
-    report.add("PASS" if _read_root_file(path) == MULTIPATH_DROP_IN else "FAIL",
-               "multipath Elastic SAN device settings", path)
+    report.add("PASS" if _read_root_file(path) == MULTIPATH_DROP_IN else "FAIL", "multipath drop-in",
+               "{} (vendor MSFT, product Virtual HD)".format(path))
     defaults = get_multipath_defaults()
     if defaults is None:
         report.add("WARN", "multipath defaults", "could not read 'multipathd show config'")
@@ -410,45 +410,53 @@ def _validate_host(report, apply_recommended):
         report.add("PASS", "multipath defaults", "documented values are in effect")
 
 
+def _persistent_records_check(state, requested, problem):
+    if not state.records:
+        return problem, "none; sessions will not return after a reboot"
+    persistent = sum(_to_int(settings.get("node.session.nr_sessions")) for _, _, settings in state.records)
+    manual = [portal for _, portal, settings in state.records if settings.get("node.startup") != "automatic"]
+    if manual:
+        return problem, "node.startup is not automatic for {}; nr_sessions total {} (requested {})".format(
+            ", ".join(manual), persistent, requested)
+    return (_count_status(persistent, requested, problem),
+            "nr_sessions total {} across {} node record(s), node.startup automatic (requested {})".format(
+                persistent, len(state.records), requested))
+
+
 def _validate_volume(report, outcome, state, details, paths, requested, apply_recommended):
     # Problems caused by this run fail; pre-existing state on skipped volumes only
     # warns, because this script never disconnects anything.
     problem = "FAIL" if outcome.connected_this_run else "WARN"
-    name = outcome.volume_name
-    if not state:
-        report.add(problem, name + " connection", "not connected; see the errors above")
-        return
+    label = "{} [{}] ".format(outcome.volume_name, outcome.target_iqn)
     live = len(state.sessions)
-    detail = "{} live (requested {})".format(live, requested)
-    if state.records and not live:
+    detail = "{} (requested {})".format(live, requested)
+    if not state:
+        detail += "; not connected, see the errors above"
+    elif state.records and not live:
         target_name, portal, _ = state.records[0]
         detail += ("; persistent configuration exists but no live sessions: log in with "
                    "'sudo iscsiadm -m node -T {} -p {} -l', or run disconnect_for_documentation.py "
                    "and re-run this script".format(target_name, portal))
-    report.add(_count_status(live, requested, problem), name + " sessions", detail)
-    if not state.records:
-        report.add(problem, name + " node records", "none; the sessions will not return after a reboot")
-    else:
-        manual = [portal for _, portal, settings in state.records if settings.get("node.startup") != "automatic"]
-        report.add(problem if manual else "PASS", name + " node.startup",
-                   "not automatic for {}".format(", ".join(manual)) if manual else "automatic")
-        persistent = sum(_to_int(settings.get("node.session.nr_sessions")) for _, _, settings in state.records)
-        report.add(_count_status(persistent, requested, problem), name + " node.session.nr_sessions",
-                   "{} (requested {})".format(persistent, requested))
+    report.add(_count_status(live, requested, problem), label + "live sessions", detail)
+    status, detail = _persistent_records_check(state, requested, problem)
+    report.add(status, label + "persistent records", detail)
+    if not state:
+        return
+    if state.records:
         # The node record is authoritative; some kernels do not negotiate DataDigest.
         negotiated = _volume_session_details(details, outcome.volume_iqn)[1]
         wrong = [portal for _, portal, settings in state.records
                  if any(settings.get(key, "").upper() != value for key, value in DIGEST_SETTINGS)]
-        report.add(problem if wrong else "PASS", name + " digests", "{}; negotiated header/data: {}".format(
+        report.add(problem if wrong else "PASS", label + "digests", "{}; negotiated header/data: {}".format(
             "not CRC32C for " + ", ".join(wrong) if wrong else "CRC32C in the node records",
             ", ".join(negotiated) or "none"))
         if apply_recommended:
             wrong = [portal for _, portal, settings in state.records
                      if any(settings.get(key, "").lower() != value.lower() for key, value in RECOMMENDED_NODE_SETTINGS)]
-            report.add(problem if wrong else "PASS", name + " recommended settings",
+            report.add(problem if wrong else "PASS", label + "recommended settings",
                        "differ for " + ", ".join(wrong) if wrong else "applied")
     ok, detail = _multipath_check(outcome.volume_iqn, live, details, paths)
-    report.add("PASS" if ok else problem, name + " multipath", detail)
+    report.add("PASS" if ok else problem, label + "multipath paths", detail)
 
 
 def validate_connections(outcomes, requested, apply_recommended):

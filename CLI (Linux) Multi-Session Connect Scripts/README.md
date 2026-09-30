@@ -72,10 +72,12 @@ only volumes connected in this run have their WWIDs registered.
 `--skip-recommended-settings` skips the node values, the multipath file and WWID
 registration; prerequisites and CRC32C digests are always configured.
 
-A final validation prints `[PASS]`, `[WARN]` or `[FAIL]` lines for services,
-multipath settings and, per volume, live sessions, `node.startup`,
-`nr_sessions`, digests (from the node record), recommended values and the
-multipath map. Problems on volumes connected in this run fail; pre-existing
+A final validation prints `[PASS]`, `[WARN]` or `[FAIL]` lines for the host
+checks `iscsid service`, `multipathd service`, `iSCSI login unit`,
+`multipath drop-in` and `multipath defaults`, and for each volume as
+`<volume> [<iqn>] <check>`: `live sessions`, `persistent records`
+(`node.startup` and `nr_sessions`), `digests` (from the node record),
+`recommended settings` and `multipath paths`. Problems on volumes connected in this run fail; pre-existing
 state on skipped volumes and counts above the request only warn. Any failure,
 or any stop before connecting, prints one `ERROR:` line and exits with code 1.
 
