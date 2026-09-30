@@ -1,4 +1,61 @@
-﻿Param(
+﻿<#
+.SYNOPSIS
+Connects Azure Elastic SAN volumes to this Windows machine with multiple persistent iSCSI sessions per volume.
+
+.DESCRIPTION
+Run from an elevated PowerShell session with the Az.ElasticSan module signed in (Connect-AzAccount).
+
+The script runs these steps in order. It stops (throws) before adding any session when a step fails, so a
+partial or misleading connection is never reported as success.
+
+ 1. Checks that the session is elevated and detects Windows 10/11 (client) or Windows Server.
+ 2. Looks up each volume's target IQN, portal and port with the Az.ElasticSan module.
+ 3. Makes sure the iSCSI initiator service (MSiSCSI) starts automatically and is running, enables
+    Multipath I/O (an optional feature on client, a server feature on Windows Server) and makes MSDSM
+    claim iSCSI disks.
+ 4. Unless -SkipRecommendedSettings is set, applies the client settings from
+    https://learn.microsoft.com/azure/storage/elastic-san/elastic-san-best-practices: MSDSM round robin
+    load balance policy, a 30-second MPIO disk timeout, and the iSCSI initiator registry values. Only
+    values that differ are changed.
+ 5. If enabling Multipath I/O needs a restart, stops before adding sessions: reboot, then re-run the
+    script. Sessions added before MPIO is active show up as duplicate disks.
+ 6. Reads the live sessions and persistent logins of every volume before changing anything. A volume
+    that already has either is skipped; this script never adds to, or removes, existing sessions. Also
+    stops if the new sessions would exceed the Windows limit of 256 persistent iSCSI logins.
+ 7. Connects each remaining volume, prints a validation report ([PASS], [WARN] and [FAIL] lines and a
+    summary), and says when a reboot is needed for changed settings to take effect.
+
+The script throws, which gives a non-zero exit code with powershell.exe -File, when it stops early or
+when any validation check fails.
+
+.PARAMETER ResourceGroupName
+Resource group of the Elastic SAN.
+
+.PARAMETER ElasticSanName
+Elastic SAN name.
+
+.PARAMETER VolumeGroupName
+Volume group name.
+
+.PARAMETER VolumeName
+Volumes to connect.
+
+.PARAMETER SkipRecommendedSettings
+Opt out of the recommended client settings: the MSDSM load balance policy, the MPIO disk timeout and the
+iSCSI initiator registry values are neither changed nor validated. The iSCSI service, Multipath I/O and
+MSDSM iSCSI claiming are still configured, because multiple sessions don't work correctly without them.
+
+.PARAMETER NumSession
+Sessions per volume, 1-32. Default 32. Windows allows at most 256 iSCSI sessions in total, so use fewer
+sessions per volume when connecting more than eight volumes. Use 1 on Windows editions without Multipath I/O.
+
+.EXAMPLE
+.\connect.ps1 -ResourceGroupName myRG -ElasticSanName mySan -VolumeGroupName myVG -VolumeName vol1,vol2
+
+.EXAMPLE
+.\connect.ps1 -ResourceGroupName myRG -ElasticSanName mySan -VolumeGroupName myVG -VolumeName vol1 -NumSession 8 -SkipRecommendedSettings
+#>
+Param(
     [Parameter(Mandatory, 
     HelpMessage = "Resource group name")]
     [string]
@@ -15,6 +72,9 @@
     HelpMessage = "Volumes to be connected")]
     [string[]]
     $VolumeName,
+    [Parameter(HelpMessage = "Skip applying and validating the recommended client settings (MSDSM load balance policy, MPIO disk timeout, iSCSI initiator registry values).")]
+    [switch]
+    $SkipRecommendedSettings,
     [Parameter(HelpMessage = "Number of sessions to be connected for each volume. Default value is 32. Input value should be in range of 1-32.")]
     [ValidateRange(1,32)]
     [int]
@@ -326,86 +386,381 @@ if ($EnableZonalAffinity -or $EnableVipDistribution) {
 }
 
 ##################### CHECK DEPENDENCY #################################
-$title    = 'Confirm'
-$choices  = '&Yes to terminate','&No to proceed with rest of the steps'
-$choices = @(
-    [System.Management.Automation.Host.ChoiceDescription]::new("&Yes to terminate", "Yes to terminate")
-    [System.Management.Automation.Host.ChoiceDescription]::new("&No to proceed with rest of the steps", "No to proceed with rest of the steps")
-)
+# The functions below harden the default flow. Invoke-EsanConnect, called at the end of this file, runs
+# them in order. Every stop is a throw from inside a function, never exit, so it can't close the console.
 
-## iSCSI initiator check 
-$iscsiWarning = $false 
-try {
-    $checkResult = Get-Service -Name MSiSCSI -ErrorAction Stop
-} catch {
-    $iscsiWarning = $true 
+function Test-EsanAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
-if (($checkResult.Status -ne "Running") -or $iscsiWarning) {
-    $question = 'iSCSI initiator is not installed or enabled. It is required for successful execution of this connect script. Do you wish to terminate the script to install it?'
-    $decision = $Host.UI.PromptForChoice($title, $question, $choices, 0)
-    if ($decision -eq 0) {
-        exit
+
+function Get-EsanWindowsEdition {
+    # Multipath I/O is an optional feature on Windows 10/11 and a server feature on Windows Server, and
+    # each is managed by different cmdlets.
+    $productType = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).ProductType
+    switch ($productType) {
+        1 { return 'Client' }
+        { $_ -in 2, 3 } { return 'Server' }
+    }
+    throw "Unsupported Windows product type '$productType'. This script supports Windows 10/11 and Windows Server."
+}
+
+function Install-EsanIscsiService {
+    $service = Get-Service -Name MSiSCSI -ErrorAction Stop
+    if ("$($service.StartType)" -ne 'Automatic') {
+        Set-Service -Name MSiSCSI -StartupType Automatic -ErrorAction Stop
+        Write-Host 'Set the iSCSI initiator service (MSiSCSI) to start automatically.' -ForegroundColor Cyan
+    }
+    if ("$($service.Status)" -ne 'Running') {
+        Start-Service -Name MSiSCSI -ErrorAction Stop
+        Write-Host 'Started the iSCSI initiator service (MSiSCSI).' -ForegroundColor Cyan
+    }
+    if ("$((Get-Service -Name MSiSCSI -ErrorAction Stop).Status)" -ne 'Running') {
+        throw 'The iSCSI initiator service (MSiSCSI) is not running. Start it with Start-Service MSiSCSI, then re-run this script. No sessions were added.'
     }
 }
 
-## Multipath I/O check
-$multipathWarning = $false 
-try {
-    $checkResult = Get-WindowsFeature -Name 'Multipath-IO' -ErrorAction Stop
-} catch {
-    $multipathWarning = $true 
+function Get-EsanMultipathIOState([string]$Edition) {
+    if ($Edition -eq 'Server') {
+        $feature = Get-WindowsFeature -Name Multipath-IO -ErrorAction Stop
+        if ($null -eq $feature) { return 'Unavailable' }
+        if ("$($feature.InstallState)" -eq 'Installed') { return 'Installed' }
+        return 'NotInstalled'
+    }
+    try {
+        $feature = Get-WindowsOptionalFeature -Online -FeatureName MultiPathIO -ErrorAction Stop
+    } catch {
+        # Some client editions don't include the MultiPathIO feature, and DISM reports it as unknown.
+        return 'Unavailable'
+    }
+    if ($null -eq $feature) { return 'Unavailable' }
+    if ("$($feature.State)" -eq 'Enabled') { return 'Installed' }
+    'NotInstalled'
 }
-if (($checkResult.InstallState -ne "Installed") -or $multipathWarning) {
-    $question = 'Multipath I/O is not installed or enabled. It is recommended for multi-session setup. Do you wish to terminate the script to install it?'
-    $decision = $Host.UI.PromptForChoice($title, $question, $choices, 0)
-    if ($decision -eq 0) {
-        exit
+
+function Install-EsanMultipathIO([string]$Edition, [int]$SessionCount) {
+    $state = Get-EsanMultipathIOState -Edition $Edition
+    if ($state -eq 'Unavailable') {
+        if ($SessionCount -gt 1) {
+            throw "Multipath I/O isn't available on this Windows edition, and $SessionCount sessions per volume need it. Use Windows Server, or re-run this script with -NumSession 1. No sessions were added."
+        }
+        Write-Host 'Multipath I/O is not available on this Windows edition. Continuing with 1 session per volume.' -ForegroundColor Yellow
+        return [pscustomobject]@{ Available = $false; RestartNeeded = $false }
+    }
+    $restartNeeded = $false
+    if ($state -ne 'Installed') {
+        if ($Edition -eq 'Server') {
+            $result = Install-WindowsFeature -Name Multipath-IO -ErrorAction Stop
+            if (-not $result.Success) {
+                throw "Install-WindowsFeature Multipath-IO failed with exit code $($result.ExitCode). No sessions were added."
+            }
+            # RestartNeeded is an enum (No, Yes, Maybe). Anything but No means MPIO may not be active yet.
+            $restartNeeded = "$($result.RestartNeeded)" -ne 'No'
+        } else {
+            $result = Enable-WindowsOptionalFeature -Online -FeatureName MultiPathIO -NoRestart -ErrorAction Stop
+            $restartNeeded = [bool]$result.RestartNeeded
+        }
+        Write-Host 'Enabled Multipath I/O.' -ForegroundColor Cyan
+    }
+    [pscustomobject]@{ Available = $true; RestartNeeded = $restartNeeded }
+}
+
+function Test-EsanMsdsmIscsiClaim {
+    (Get-MSDSMAutomaticClaimSettings -ErrorAction Stop).iSCSI -eq $true
+}
+
+function Enable-EsanMsdsmIscsiClaim {
+    if (Test-EsanMsdsmIscsiClaim) { return }
+    Enable-MSDSMAutomaticClaim -BusType iSCSI -Confirm:$false -ErrorAction Stop | Out-Null
+    if (-not (Test-EsanMsdsmIscsiClaim)) {
+        throw "MSDSM still doesn't claim iSCSI disks after Enable-MSDSMAutomaticClaim -BusType iSCSI. No sessions were added, because multiple sessions to a volume that MSDSM doesn't claim show up as duplicate disks."
+    }
+    Write-Host 'Enabled MSDSM automatic claiming of iSCSI disks.' -ForegroundColor Cyan
+}
+
+function Get-EsanIscsiRegistryRecommendation {
+    [ordered]@{
+        MaxTransferLength        = 262144
+        MaxBurstLength           = 262144
+        FirstBurstLength         = 262144
+        MaxRecvDataSegmentLength = 262144
+        InitialR2T               = 0
+        ImmediateData            = 1
+        WMIRequestTimeout        = 30
+        LinkDownTime             = 30
     }
 }
 
+function Find-EsanIscsiInitiatorKey {
+    # The instance number (0000, 0004, ...) differs between machines, so find it by driver description
+    # instead of hard-coding it.
+    $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e97b-e325-11ce-bfc1-08002be10318}'
+    foreach ($key in @(Get-ChildItem -LiteralPath $classKey -ErrorAction SilentlyContinue)) {
+        # Some subkeys, such as Properties, deny reads even to administrators.
+        $description = (Get-ItemProperty -LiteralPath $key.PSPath -Name DriverDesc -ErrorAction SilentlyContinue).DriverDesc
+        if ($description -eq 'Microsoft iSCSI Initiator') { $key.PSPath }
+    }
+}
+
+function Set-EsanRecommendedSettings([bool]$MpioActive) {
+    # Changes only values that differ. Outputs the changes that take effect only after a restart.
+    if ($MpioActive) {
+        if ("$(Get-MSDSMGlobalDefaultLoadBalancePolicy -ErrorAction Stop)" -ne 'RR') {
+            Set-MSDSMGlobalDefaultLoadBalancePolicy -Policy RR -ErrorAction Stop | Out-Null
+            Write-Host 'Set the MSDSM default load balance policy to round robin (RR).' -ForegroundColor Cyan
+        }
+        if ((Get-MPIOSetting -ErrorAction Stop).DiskTimeoutValue -ne 30) {
+            Set-MPIOSetting -NewDiskTimeout 30 -ErrorAction Stop | Out-Null
+            Write-Host 'Set the MPIO disk timeout to 30 seconds.' -ForegroundColor Cyan
+            'MPIO disk timeout'
+        }
+    }
+    $keys = @(Find-EsanIscsiInitiatorKey)
+    if ($keys.Count -ne 1) {
+        Write-Host "Warning: found $($keys.Count) 'Microsoft iSCSI Initiator' registry instances instead of 1. Skipped the recommended iSCSI initiator registry values." -ForegroundColor Yellow
+        return
+    }
+    $parameters = Join-Path $keys[0] 'Parameters'
+    $current = Get-ItemProperty -LiteralPath $parameters -ErrorAction Stop
+    $recommended = Get-EsanIscsiRegistryRecommendation
+    foreach ($name in $recommended.Keys) {
+        if ($current.$name -ne $recommended[$name]) {
+            New-ItemProperty -LiteralPath $parameters -Name $name -Value $recommended[$name] -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+            Write-Host "Set the iSCSI initiator registry value $name to $($recommended[$name])." -ForegroundColor Cyan
+            $name
+        }
+    }
+}
 
 ##################### GATHER INFORMATION OF INPUT VOLUMES ####################
-# Get volume group resource to fail fast
-$vg = Get-AzElasticSanVolumeGroup -ResourceGroupName $ResourceGroupName -ElasticSanName $ElasticSanName -Name $VolumeGroupName -ErrorAction Stop
+function Get-EsanVolumeData([string]$ResourceGroupName, [string]$ElasticSanName, [string]$VolumeGroupName, [string[]]$VolumeName, [int]$NumSession) {
+    # Get volume group resource to fail fast
+    $null = Get-AzElasticSanVolumeGroup -ResourceGroupName $ResourceGroupName -ElasticSanName $ElasticSanName -Name $VolumeGroupName -ErrorAction Stop
 
-$volumesToConnect= New-Object System.Collections.Generic.List[VolumeData]
-$invalidVolumes = New-Object System.Collections.Generic.List[string]
-# Get each volume in the input volume list and extract the required info for connections 
-foreach($volume in $volumeName) {
-    try {
-        $vol = Get-AzElasticSanVolume -ResourceGroupName $ResourceGroupName -ElasticSanName $ElasticSanName -VolumeGroupName $VolumeGroupName -Name $volume -ErrorAction Stop
-        $targetIqn = $vol.StorageTargetIqn
-        $targetHostname = $vol.StorageTargetPortalHostname
-        $targetPort = $vol.StorageTargetPortalPort
-        $volumesToConnect.Add([VolumeData]::new($volume,$targetIqn,$targetHostname, $targetPort, $numSession))
-        Write-Host Gathered info of $volume successfully -ForegroundColor Cyan
-    } catch {
-        Write-Error $_
-        $invalidVolumes.Add($volume)
-    }    
-}
-if ($invalidVolumes.Count -gt 0) {
-    # Terminate the script if any of the input volumes are invalid
-    Write-Error "Invalid volumes: $($invalidVolumes -Join ",")" -ErrorAction Stop
+    $volumesToConnect= New-Object System.Collections.Generic.List[VolumeData]
+    $invalidVolumes = New-Object System.Collections.Generic.List[string]
+    # Get each volume in the input volume list and extract the required info for connections
+    foreach($volume in $volumeName) {
+        try {
+            $vol = Get-AzElasticSanVolume -ResourceGroupName $ResourceGroupName -ElasticSanName $ElasticSanName -VolumeGroupName $VolumeGroupName -Name $volume -ErrorAction Stop
+            $targetIqn = $vol.StorageTargetIqn
+            $targetHostname = $vol.StorageTargetPortalHostname
+            $targetPort = $vol.StorageTargetPortalPort
+            $volumesToConnect.Add([VolumeData]::new($volume,$targetIqn,$targetHostname, $targetPort, $numSession))
+            Write-Host Gathered info of $volume successfully -ForegroundColor Cyan
+        } catch {
+            Write-Error $_
+            $invalidVolumes.Add($volume)
+        }
+    }
+    if ($invalidVolumes.Count -gt 0) {
+        # Terminate the script if any of the input volumes are invalid
+        Write-Error "Invalid volumes: $($invalidVolumes -Join ",")" -ErrorAction Stop
+    }
+    $volumesToConnect
 }
 
 ############################### CONNECT VOLUMES ############################
-$sessions = Get-IscsiSession
-if ($sessions -ne $null) {
-    $sessions = (Get-IscsiSession).TargetNodeAddress.ToLower() | Select -Unique
+function Get-EsanIscsiInventory {
+    # Persistent logins come from the documented, locale-independent WMI class instead of localized
+    # iscsicli output. Without a complete inventory a re-run could add duplicate persistent logins and
+    # push the initiator toward its session limit, so any read failure stops the script.
+    try {
+        $sessions = @(Get-IscsiSession -ErrorAction Stop)
+        $persistentLogins = @(Get-CimInstance -Namespace root\wmi -ClassName MSiSCSIInitiator_PersistentLoginClass -ErrorAction Stop)
+    } catch {
+        throw "Could not read the live iSCSI sessions or persistent logins, so the script stopped: $($_.Exception.Message)"
+    }
+    [pscustomobject]@{ Sessions = $sessions; PersistentLogins = $persistentLogins }
 }
 
-foreach($volume in $volumesToConnect) {
-    # Check if the volume is already connected 
-    if ($sessions -ne $null -and $sessions.Contains($volume.TargetIQN.ToLower())) {
-        Write-Host $volume.VolumeName [$($volume.TargetIQN)]: Skipped as this volume is already connected -ForegroundColor Magenta
-        continue
+function Get-EsanConnectionPlan($Volumes) {
+    # Decide for every volume before connecting any, so a stop never leaves a half-connected batch.
+    $inventory = Get-EsanIscsiInventory
+    $plan = @(foreach ($volume in $Volumes) {
+        $live = @($inventory.Sessions | Where-Object { $_.TargetNodeAddress -ieq $volume.TargetIQN }).Count
+        $persistent = @($inventory.PersistentLogins | Where-Object { $_.TargetName -ieq $volume.TargetIQN }).Count
+        $action = 'Skip'
+        $warning = $null
+        if ($live -eq 0 -and $persistent -eq 0) {
+            $action = 'Connect'
+            $message = 'Connecting to this volume'
+        } elseif ($live -eq 0) {
+            $message = "Skipped: persistent configuration exists but no live sessions (0 live / $persistent persistent)"
+            $warning = 'persistent configuration exists but no live sessions. Reboot the VM (persistent logins re-establish at boot), or run disconnect.ps1 for this volume and re-run this script.'
+        } else {
+            $message = "Skipped: already connected ($live live / $persistent persistent)"
+            if ($persistent -eq 0) {
+                $warning = "the live sessions are not persistent and won't reconnect after a reboot. To make them persistent, run disconnect.ps1 for this volume and re-run this script."
+            }
+        }
+        [pscustomobject]@{ Volume = $volume; Action = $action; Message = $message; Warning = $warning }
+    })
+
+    $newSessions = 0
+    foreach ($item in $plan) {
+        if ($item.Action -eq 'Connect') { $newSessions += $item.Volume.NumSession }
     }
-    # connect volume 
-    Write-Host $volume.VolumeName [$($volume.TargetIQN)]: Connecting to this volume -ForegroundColor Cyan
-    iscsicli AddTarget $volume.TargetIQN * $volume.TargetHostName $volume.TargetPort * 0 * * * * * * * * * 0
+    $existing = $inventory.PersistentLogins.Count
+    if ($existing + $newSessions -gt 256) {
+        throw "Connecting would bring this machine to $($existing + $newSessions) persistent iSCSI logins ($existing existing + $newSessions new), above the Windows limit of 256. Re-run with a lower -NumSession or fewer volumes. No sessions were added."
+    }
+    $plan
+}
+
+function Connect-EsanVolume($Volume) {
+    iscsicli AddTarget $Volume.TargetIQN * $Volume.TargetHostName $Volume.TargetPort * 0 * * * * * * * * * 0
+    # Each PersistentLoginTarget both creates a live session and persists it. A separate LoginTarget
+    # would double the sessions.
     $LoginOptions = '0x00000002'
-    for ($i = 0; $i -lt $volume.NumSession; $i++) {
-        iscsicli PersistentLoginTarget $volume.TargetIQN.ToLower() t $volume.TargetHostname.ToLower() $volume.TargetPort Root\ISCSIPRT\0000_0 -1 * $LoginOptions 1 1 * * * * * * * 0
+    for ($i = 0; $i -lt $Volume.NumSession; $i++) {
+        iscsicli PersistentLoginTarget $Volume.TargetIQN.ToLower() t $Volume.TargetHostname.ToLower() $Volume.TargetPort Root\ISCSIPRT\0000_0 -1 * $LoginOptions 1 1 * * * * * * * 0
     }
 }
+
+##################### VALIDATE ####################
+function New-EsanCheck([string]$Status, [string]$Check, [string]$Detail) {
+    [pscustomobject]@{ Status = $Status; Check = $Check; Detail = $Detail }
+}
+
+function Get-EsanCountStatus([int]$Actual, [int]$Requested, [string]$Shortfall) {
+    if ($Actual -eq $Requested) { return 'PASS' }
+    if ($Actual -gt $Requested) { return 'WARN' }
+    $Shortfall
+}
+
+function Test-EsanConnection($Plan, [string]$Edition, [int]$SessionCount, [bool]$CheckRecommendedSettings) {
+    # Read-only. Re-reads the machine state instead of trusting what earlier steps reported.
+    $results = @(
+        $service = Get-Service -Name MSiSCSI -ErrorAction Stop
+        $status = if ("$($service.Status)" -eq 'Running' -and "$($service.StartType)" -eq 'Automatic') { 'PASS' } else { 'FAIL' }
+        New-EsanCheck $status 'iSCSI service' "MSiSCSI is $($service.Status) with startup type $($service.StartType)"
+
+        $mpioState = Get-EsanMultipathIOState -Edition $Edition
+        $mpioInstalled = $mpioState -eq 'Installed'
+        if ($mpioInstalled) {
+            New-EsanCheck 'PASS' 'Multipath I/O' 'installed'
+        } elseif ($SessionCount -le 1) {
+            New-EsanCheck 'WARN' 'Multipath I/O' "$mpioState; not needed for 1 session per volume"
+        } else {
+            New-EsanCheck 'FAIL' 'Multipath I/O' "$mpioState; required for $SessionCount sessions per volume"
+        }
+        if ($mpioInstalled) {
+            $status = if (Test-EsanMsdsmIscsiClaim) { 'PASS' } else { 'FAIL' }
+            New-EsanCheck $status 'MSDSM iSCSI claim' "automatic claiming of iSCSI disks is $(if ($status -eq 'PASS') { 'enabled' } else { 'disabled' })"
+        }
+
+        if ($CheckRecommendedSettings) {
+            if ($mpioInstalled) {
+                $policy = "$(Get-MSDSMGlobalDefaultLoadBalancePolicy -ErrorAction Stop)"
+                $status = if ($policy -eq 'RR') { 'PASS' } else { 'FAIL' }
+                New-EsanCheck $status 'MSDSM load balance policy' "$policy (recommended RR)"
+                $timeout = (Get-MPIOSetting -ErrorAction Stop).DiskTimeoutValue
+                $status = if ($timeout -eq 30) { 'PASS' } else { 'FAIL' }
+                New-EsanCheck $status 'MPIO disk timeout' "$timeout seconds (recommended 30)"
+            }
+            $keys = @(Find-EsanIscsiInitiatorKey)
+            if ($keys.Count -ne 1) {
+                New-EsanCheck 'WARN' 'iSCSI initiator registry' "found $($keys.Count) 'Microsoft iSCSI Initiator' instances instead of 1; values not checked"
+            } else {
+                $current = Get-ItemProperty -LiteralPath (Join-Path $keys[0] 'Parameters') -ErrorAction Stop
+                $recommended = Get-EsanIscsiRegistryRecommendation
+                $wrong = @(foreach ($name in $recommended.Keys) {
+                    if ($current.$name -ne $recommended[$name]) { "$name is '$($current.$name)', recommended $($recommended[$name])" }
+                })
+                if ($wrong.Count -eq 0) {
+                    New-EsanCheck 'PASS' 'iSCSI initiator registry' "all $($recommended.Count) recommended values are set"
+                } else {
+                    New-EsanCheck 'FAIL' 'iSCSI initiator registry' ($wrong -join '; ')
+                }
+            }
+        }
+
+        $inventory = Get-EsanIscsiInventory
+        foreach ($item in $Plan) {
+            $volume = $item.Volume
+            $label = "$($volume.VolumeName) [$($volume.TargetIQN)]"
+            # This script never disconnects, so problems on volumes it skipped are pre-existing and only
+            # warnings. Problems on volumes it connected in this run are failures.
+            $shortfall = if ($item.Action -eq 'Connect') { 'FAIL' } else { 'WARN' }
+            $sessions = @($inventory.Sessions | Where-Object { $_.TargetNodeAddress -ieq $volume.TargetIQN })
+            $persistent = @($inventory.PersistentLogins | Where-Object { $_.TargetName -ieq $volume.TargetIQN }).Count
+            New-EsanCheck (Get-EsanCountStatus $sessions.Count $volume.NumSession $shortfall) "$label live sessions" "$($sessions.Count) of $($volume.NumSession) requested"
+            New-EsanCheck (Get-EsanCountStatus $persistent $volume.NumSession $shortfall) "$label persistent logins" "$persistent of $($volume.NumSession) requested"
+            if ($sessions.Count -gt 0) {
+                $unhealthy = @($sessions | Where-Object { -not ($_.IsConnected -and $_.IsPersistent -and $_.IsHeaderDigest -and $_.IsDataDigest) }).Count
+                if ($unhealthy -eq 0) {
+                    New-EsanCheck 'PASS' "$label session state" "all $($sessions.Count) sessions are connected and persistent, with header and data digests"
+                } else {
+                    New-EsanCheck $shortfall "$label session state" "$unhealthy of $($sessions.Count) sessions are disconnected, not persistent, or missing a header or data digest"
+                }
+            }
+        }
+    )
+
+    Write-Host 'Validating the configuration:' -ForegroundColor Cyan
+    $colors = @{ PASS = 'Green'; WARN = 'Yellow'; FAIL = 'Red' }
+    foreach ($result in $results) {
+        Write-Host "[$($result.Status)] $($result.Check): $($result.Detail)" -ForegroundColor $colors[$result.Status]
+    }
+    $summary = [pscustomobject]@{
+        Passed   = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
+        Warnings = @($results | Where-Object { $_.Status -eq 'WARN' }).Count
+        Failed   = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
+    }
+    Write-Host "Validation: $($summary.Passed) passed, $($summary.Warnings) warnings, $($summary.Failed) failed" -ForegroundColor $(if ($summary.Failed -gt 0) { 'Red' } else { 'Green' })
+    $summary
+}
+
+function Invoke-EsanConnect {
+    param(
+        [string]$ResourceGroupName,
+        [string]$ElasticSanName,
+        [string]$VolumeGroupName,
+        [string[]]$VolumeName,
+        [int]$NumSession,
+        [switch]$SkipRecommendedSettings
+    )
+    if (-not (Test-EsanAdministrator)) {
+        throw 'Run this script from an elevated PowerShell session (Run as administrator). Without elevation, iscsicli output can look successful while no sessions are added.'
+    }
+    $edition = Get-EsanWindowsEdition
+    $volumes = @(Get-EsanVolumeData -ResourceGroupName $ResourceGroupName -ElasticSanName $ElasticSanName -VolumeGroupName $VolumeGroupName -VolumeName $VolumeName -NumSession $NumSession)
+    $sessionCount = [int]($volumes | Measure-Object -Property NumSession -Maximum).Maximum
+
+    Install-EsanIscsiService
+    $mpio = Install-EsanMultipathIO -Edition $edition -SessionCount $sessionCount
+    $mpioActive = $mpio.Available -and -not $mpio.RestartNeeded
+    if ($mpioActive) { Enable-EsanMsdsmIscsiClaim }
+
+    $rebootChanges = @()
+    if (-not $SkipRecommendedSettings) {
+        $rebootChanges = @(Set-EsanRecommendedSettings -MpioActive $mpioActive)
+    }
+    if ($mpio.RestartNeeded) {
+        # The feature cmdlet's RestartNeeded is the only signal that blocks connecting.
+        throw 'Windows needs a restart to finish enabling Multipath I/O. No sessions were added, because sessions added before MPIO is active show up as duplicate disks. Reboot the VM, then re-run this script to finish MSDSM claiming, the MPIO settings and the connections.'
+    }
+
+    $plan = @(Get-EsanConnectionPlan -Volumes $volumes)
+    foreach ($item in $plan) {
+        $label = "$($item.Volume.VolumeName) [$($item.Volume.TargetIQN)]"
+        if ($item.Action -eq 'Connect') {
+            Write-Host "${label}: $($item.Message)" -ForegroundColor Cyan
+            Connect-EsanVolume -Volume $item.Volume
+        } else {
+            Write-Host "${label}: $($item.Message)" -ForegroundColor Magenta
+            if ($item.Warning) { Write-Host "${label}: Warning: $($item.Warning)" -ForegroundColor Yellow }
+        }
+    }
+
+    $validation = Test-EsanConnection -Plan $plan -Edition $edition -SessionCount $sessionCount -CheckRecommendedSettings (-not $SkipRecommendedSettings)
+    if ($rebootChanges.Count -gt 0) {
+        Write-Host "Reboot required: changed $($rebootChanges -join ', '). These settings take effect only after the VM restarts; until then all sessions use the previous values." -ForegroundColor Yellow
+    }
+    if ($validation.Failed -gt 0) {
+        throw "Validation failed: $($validation.Failed) check(s) failed. Review the [FAIL] lines above."
+    }
+}
+
+Invoke-EsanConnect -ResourceGroupName $ResourceGroupName -ElasticSanName $ElasticSanName -VolumeGroupName $VolumeGroupName -VolumeName $VolumeName -NumSession $NumSession -SkipRecommendedSettings:$SkipRecommendedSettings
