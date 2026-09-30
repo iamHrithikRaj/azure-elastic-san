@@ -77,15 +77,31 @@ Whole-batch preflight is **not a transaction**. After mutation begins, a failure
 can leave earlier sessions or persistent entries. Inspect `Get-IscsiSession`,
 `Get-IscsiConnection` and `iscsicli ListPersistentTargets`, then use an
 operator-approved target-specific recovery procedure. Do not bulk logout on a
-shared host. The existing disconnect script is unchanged and does not reliably
-handle decorated IQNs; disabling the opt-in is not cleanup.
+shared host. Disabling the opt-in is not cleanup.
+
+## Disconnect
+
+`disconnect.ps1` needs no zonal flag. After confirmation, it logs out every
+live session matching a selected volume's plain IQN or `<plain IQN>:az-`
+prefix (case-insensitive), removes each matching persistent login using its
+recorded portal address and port, then removes each matching target name.
+FQDN, IPv4 and IPv6 portals are supported, including persistent-only state
+before reboot. The existing `ROOT\ISCSIPRT\0000_0` initiator and any-port
+selection are retained. Similar-prefix unrelated targets are left alone.
+
+Persistent inventory is parsed from English `iscsicli ListPersistentTargets`
+output (`Total of ... persistent targets`, `Target Name`, `Address and Socket`).
+Missing/malformed inventory or native command failure stops cleanup explicitly.
+Tests cover the assumed text format only; real Windows output and native cleanup
+still require authorized qualification. Cleanup is not transactional, so a
+failure can leave some sessions or saved logins in place.
 
 ## Tests and qualification
 
 From the repository root:
 
 ```powershell
-powershell.exe -NoProfile -NonInteractive -Command "Invoke-Pester -Script '.\PSH (Windows) Multi-Session Connect Scripts\ElasticSanDocScripts0523\connect.Tests.ps1' -EnableExit"
+powershell.exe -NoProfile -NonInteractive -Command "Invoke-Pester -Script '.\PSH (Windows) Multi-Session Connect Scripts\ElasticSanDocScripts0523\connect.Tests.ps1','.\PSH (Windows) Multi-Session Connect Scripts\ElasticSanDocScripts0523\disconnect.Tests.ps1' -EnableExit"
 ```
 
 The Pester suite uses inline Windows-owned data, mocks Azure/native boundaries,
@@ -99,7 +115,7 @@ execution block is pinned by an LF-normalized SHA-256 fingerprint from upstream
 parsing/stripping and same-zone routing, service identity compatibility, and
 authorized native/end-to-end qualification. Unit tests do not qualify login
 redirects, Windows reboot persistence, zone failover/RTO, IPv6 or NetApp.
-This connect-only layer does not enable those capabilities.
+These scripts do not enable those capabilities.
 
 ## Reconstruction provenance
 
