@@ -53,6 +53,10 @@ class NativeIscsi:
             if not self.nodes:
                 return result(err="iscsiadm: No records found", code=21)
             return result("\n".join("{}:3260,-1 {}".format(portal, iqn) for iqn, portal in self.nodes))
+        if args[:2] == ["-m", "node"] and "--op" not in args and "--login" not in args:
+            # The pre-mutation plan reads existing records for persistent counts.
+            key = (args[args.index("--targetname") + 1], args[args.index("--portal") + 1].rsplit(":", 1)[0])
+            return result("\n".join("{} = {}".format(name, value) for name, value in self.nodes[key].items()))
 
         self.mutations.append(command)
         if args[:2] == ["-m", "session"]:
@@ -67,6 +71,9 @@ class NativeIscsi:
         if args[-2:] == ["--op", "new"]:
             assert key not in self.nodes, "Must not replace an existing node"
             self.nodes[key] = {"node.session.nr_sessions": "8"}
+        elif args[-2:] == ["--op", "delete"]:
+            # A record created by a failed first login is removed so a re-run can connect.
+            del self.nodes[key]
         elif args[-1] == "--login":
             self.logins.append(portal)
             if portal in self.failed_portals:
@@ -165,12 +172,16 @@ class VipConnectionTests(unittest.TestCase):
         self.assertIn("10.0.0.1:3260", self.stderr.getvalue())
         self.assertIn("login failed", self.stderr.getvalue())
 
-    def test_all_portals_failing_raises_after_trying_every_address(self):
+    def test_all_portals_failing_is_reported_after_trying_every_address(self):
+        # A failed volume is reported inline and left to validation instead of
+        # stopping the remaining volumes.
         self.native.failed_portals.update(VIPS)
-        with self.assertRaisesRegex(RuntimeError, "Login failed through every target portal"):
-            self.run_connect()
+        outcomes = connect.connect_volumes(None, "rg", "san", "vg", ["volume"], 32, False, True)
+        self.assertTrue(outcomes[0].failed)
+        self.assertIn("Login failed through every target portal", self.stderr.getvalue())
         self.assertEqual(VIPS, self.native.logins)
         self.assertEqual(3, self.stderr.getvalue().count("Warning:"))
+        self.assertEqual({}, self.native.nodes)
 
     def test_one_session_uses_spare_addresses_only_after_allocated_login_failure(self):
         self.run_connect(count=1)
@@ -188,8 +199,8 @@ class VipConnectionTests(unittest.TestCase):
 
     def test_all_spare_addresses_are_tried_when_they_also_fail(self):
         self.native.failed_portals.update(VIPS)
-        with self.assertRaises(RuntimeError):
-            self.run_connect(count=1)
+        outcomes = connect.connect_volumes(None, "rg", "san", "vg", ["volume"], 1, False, True)
+        self.assertTrue(outcomes[0].failed)
         self.assertEqual(VIPS, self.native.logins)
 
     def test_dns_failure_never_creates_nodes_or_sessions(self):
@@ -198,7 +209,7 @@ class VipConnectionTests(unittest.TestCase):
             self.run_connect()
         self.assertEqual([], self.native.mutations)
 
-    def test_existing_plain_or_decorated_session_or_node_skips_without_dns(self):
+    def test_existing_plain_or_decorated_session_or_node_is_skipped(self):
         for iqn in (IQN, IQN + ":az-eastus-az3", IQN + ":az-westus-az1"):
             for mode in ("session", "node"):
                 with self.subTest(iqn=iqn, mode=mode):
@@ -210,9 +221,10 @@ class VipConnectionTests(unittest.TestCase):
                         self.native.nodes[(iqn, "old.example")] = {}
                     self.run_connect()
         self.assertEqual([], self.native.mutations)
-        self.dns.assert_not_called()
-        self.assertIn("already configured; run disconnect_for_documentation.py first to change the layout",
-                      self.stdout.getvalue())
+        # VIP DNS is part of the read-only lookup that completes before any change.
+        self.assertEqual(6, self.dns.call_count)
+        self.assertIn("Skipped: already connected (1 live / 0 persistent)", self.stdout.getvalue())
+        self.assertIn("Skipped: persistent configuration exists but no live sessions", self.stdout.getvalue())
 
     def test_unrelated_target_is_preserved_and_not_used_as_seed(self):
         sid = self.native.add_session(IQN + "-other", "old.example")
@@ -283,7 +295,9 @@ class ArgumentTests(unittest.TestCase):
                             args.append("--enable-zonal-affinity")
                         if vip:
                             args.append("--enable-vip-distribution")
-                        with mock.patch.object(connect, "check_iscsi"), mock.patch.object(connect, "check_mpio"):
+                        with mock.patch.object(connect, "check_privileges"), \
+                                mock.patch.object(connect, "detect_distro"), \
+                                mock.patch.object(connect, "finish_connections"):
                             with mock.patch.object(connect, "connect_volumes") as run:
                                 connect.main(args)
                         self.assertEqual((expected, zonal, vip), run.call_args.args[-3:])

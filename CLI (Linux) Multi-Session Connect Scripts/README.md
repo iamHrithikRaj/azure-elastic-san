@@ -1,7 +1,8 @@
 # Linux standalone connection options
 
-Use Python 3.5 or later with the existing iSCSI/multipath prerequisites and an
-authenticated Azure CLI with the `elastic-san` extension. Session count defaults
+Use Python 3.5 or later and an authenticated Azure CLI with the `elastic-san`
+extension. Run as root or as a user with passwordless sudo; the script prepares
+the host itself (see below). Session count defaults
 to 32; `-s` accepts smaller positive counts and caps larger values at 32.
 
 | Options | IQN | Original portal selection |
@@ -40,19 +41,57 @@ any login, and this script neither controls nor verifies the resulting placement
 Spreading saved portals avoids depending on one zone for all initial connections;
 it is not a guarantee of successful failover.
 
-Each portal uses one seed login, SID-specific clones, CRC32C digest settings, and
-the full persistent session count. The seed temporarily uses `nr_sessions=1`
+Each portal uses one seed login, SID-specific clones, CRC32C digest settings, the
+recommended node values (unless `--skip-recommended-settings`), and the full
+persistent session count. The seed temporarily uses `nr_sessions=1`
 because native login already honors that setting. Login failures warn and allow
-other portals to proceed; the volume fails only if none logs in. Clone or
+other portals to proceed; if a portal's first login fails, the node record this
+run created for it is deleted so a re-run can connect. A volume that no portal
+logs in to is reported and the script continues with the next volume. Clone or
 persistence failures also warn, so a usable connection may have fewer sessions
-or incomplete saved settings. Native commands use ordinary `sudo`.
+or incomplete saved settings; validation reports them. Native commands use ordinary `sudo`.
+
+## Host preparation, recommended settings and validation
+
+Every mode runs the same steps: privilege check (root or passwordless sudo), a
+distro guard from `/etc/os-release` (Debian/Ubuntu, RHEL family, SLES/openSUSE,
+Azure Linux), the Azure/zone/DNS lookups for all volumes, then prerequisites:
+missing `open-iscsi`/`iscsi-initiator-utils` and multipath packages are installed
+non-interactively, an initiator name is generated if missing, `iscsid` and
+`multipathd` are enabled and started, and the boot login unit (`open-iscsi` or
+`iscsi`) is enabled but not started. On RHEL without `/etc/multipath.conf`,
+`mpathconf --enable` creates the distro default.
+
+By default the script applies the
+[best-practice](https://learn.microsoft.com/azure/storage/elastic-san/elastic-san-best-practices)
+node values and writes `azure-elastic-san.conf` into multipath's `config_dir`,
+scoped to vendor `MSFT` / product `Virtual HD`. `/etc/multipath.conf` and global
+defaults are never changed; differing `find_multipaths`, `polling_interval` or
+`user_friendly_names` are reported as warnings. With `find_multipaths strict`,
+only volumes connected in this run have their WWIDs registered.
+`--skip-recommended-settings` skips the node values, the multipath file and WWID
+registration; prerequisites and CRC32C digests are always configured.
+
+A final validation prints `[PASS]`, `[WARN]` or `[FAIL]` lines for services,
+multipath settings and, per volume, live sessions, `node.startup`,
+`nr_sessions`, digests (from the node record), recommended values and the
+multipath map. Problems on volumes connected in this run fail; pre-existing
+state on skipped volumes and counts above the request only warn. Any failure,
+or any stop before connecting, prints one `ERROR:` line and exits with code 1.
 
 ## Existing connections and limits
 
-Any session or node record for the plain IQN or its `:az-*` variants skips the
-volume: **already configured; run `disconnect_for_documentation.py` first to
-change the layout**. No layout proof, repair, rebalance, or automatic cleanup is
-performed. A failed attempt can leave node records or sessions behind. Review
+Every volume is checked before any volume changes. Any session or node record
+for the plain IQN or its `:az-*` variants, on any portal and in any letter case,
+skips the volume:
+`Skipped: already connected (<live> live / <persistent> persistent)`. For
+records without sessions, validation warns and shows the `iscsiadm ... -l`
+command to log in.
+Run `disconnect_for_documentation.py` first to change the layout. On skipped
+volumes only differing recommended node values are updated (never digests,
+session counts or startup); if sessions are live, the script asks for a
+log out/in or reboot. No layout proof, repair, rebalance, or automatic cleanup is
+performed. Review
 warnings and use an approved disconnect/reconnect procedure; do not run competing
 connection tools for the same volume.
 

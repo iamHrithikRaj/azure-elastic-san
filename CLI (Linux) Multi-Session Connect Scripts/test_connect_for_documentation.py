@@ -464,9 +464,9 @@ class ZonalAffinityTests(unittest.TestCase):
                         )
 
         resolve_physical_zone.assert_not_called()
-        check.assert_called_once_with("iqn.original", "portal.example", 3260)
+        check.assert_called_once_with("iqn.original", "portal.example", 3260, volume_iqn="iqn.original")
         connect_volume.assert_called_once_with(
-            "volume1", "iqn.original", [("portal.example", 4)], 3260
+            "volume1", "iqn.original", [("portal.example", 4)], 3260, ()
         )
 
     def test_opt_in_uses_decorated_iqn_for_connection_commands(self):
@@ -487,9 +487,9 @@ class ZonalAffinityTests(unittest.TestCase):
         decorated_iqn = "iqn.original:az-eastus-az3"
         resolve_context.assert_called_once_with("sub", "rg", "san")
         get_target.assert_called_once_with("sub-id", "rg", "san", "vg", "volume1")
-        check.assert_called_once_with(decorated_iqn, "portal.example", 3260)
+        check.assert_called_once_with(decorated_iqn, "portal.example", 3260, volume_iqn="iqn.original")
         connect_volume.assert_called_once_with(
-            "volume1", decorated_iqn, [("portal.example", 4)], 3260
+            "volume1", decorated_iqn, [("portal.example", 4)], 3260, ()
         )
 
     def test_full_iqn_rejects_unsafe_identity_without_rewriting(self):
@@ -672,7 +672,7 @@ class ZonalAffinityTests(unittest.TestCase):
             events.append(("az", command))
             return completed_process(responses.pop(0))(command, **kwargs)
 
-        def check(*args):
+        def check(*args, **kwargs):
             events.append(("check", args))
             return False
 
@@ -687,14 +687,15 @@ class ZonalAffinityTests(unittest.TestCase):
                             connect.connect_volumes(None, "rg", "san", "vg", ["first", "second"], 4, True)
 
         legacy_lookup.assert_not_called()
+        # Every volume is inventoried before the first one is changed.
         self.assertEqual(
-            ["az", "az", "az", "az", "az", "check", "connect", "check", "connect"],
+            ["az", "az", "az", "az", "az", "check", "check", "connect", "connect"],
             [event[0] for event in events],
         )
         for command in (events[3][1], events[4][1]):
             self.assertEqual(subscription_id, command[command.index("--subscription") + 1])
         self.assertEqual(
-            ("second", "iqn.second:az-eastus-az3", [("second.example", 4)], 3261),
+            ("second", "iqn.second:az-eastus-az3", [("second.example", 4)], 3261, ()),
             events[-1][1],
         )
 
@@ -775,16 +776,18 @@ class ZonalAffinityTests(unittest.TestCase):
                     with self.assertRaises(connect.ZonalAffinityError):
                         connect.get_mapped_volume_target("sub-id", "rg", "san", "vg", "volume")
 
-    def test_opt_out_preserves_per_volume_discovery_and_skip_output(self):
+    def test_opt_out_discovers_every_volume_before_inventory_and_connect(self):
         events = []
 
         def discover(*args):
             events.append(("discover", args[-1]))
             return "IQN." + args[-1], "portal.example", 3260
 
-        def check(iqn, *args):
+        def check(iqn, *args, **kwargs):
             events.append(("check", iqn))
-            return iqn == "IQN.first"
+            if iqn == "IQN.first":
+                return connect.ExistingState([], [("1", iqn, "portal.example:3260")])
+            return connect.ExistingState([], [])
 
         def mutate(name, *args):
             events.append(("connect", name))
@@ -797,12 +800,13 @@ class ZonalAffinityTests(unittest.TestCase):
                             connect.connect_volumes(None, "rg", "san", "vg", ["first", "second"], 4)
         preflight.assert_not_called()
         self.assertEqual(
-            [("discover", "first"), ("check", "IQN.first"),
-             ("discover", "second"), ("check", "IQN.second"), ("connect", "second")],
+            [("discover", "first"), ("discover", "second"),
+             ("check", "IQN.first"), ("check", "IQN.second"), ("connect", "second")],
             events,
         )
         self.assertEqual(
-            "first [IQN.first]: already configured; run disconnect_for_documentation.py first to change the layout\n",
+            "first [IQN.first]: Skipped: already connected (1 live / 0 persistent); these sessions are "
+            "not persistent and will not return after a reboot\n",
             output.getvalue(),
         )
 
@@ -817,20 +821,25 @@ class ZonalAffinityTests(unittest.TestCase):
                         args.append("--enable-zonal-affinity")
                     if count is not None:
                         args.extend(["-s", count])
-                    with mock.patch.object(connect, "check_iscsi", side_effect=lambda: events.append("iscsi")):
-                        with mock.patch.object(connect, "check_mpio", side_effect=lambda: events.append("mpio")):
+                    with mock.patch.object(connect, "check_privileges", side_effect=lambda: events.append("privilege")):
+                        with mock.patch.object(connect, "detect_distro", side_effect=lambda: events.append("distro")):
                             with mock.patch.object(connect, "connect_volumes") as run:
-                                connect.main(args)
-                    self.assertEqual(["iscsi", "mpio"], events)
-                    run.assert_called_once_with("sub", "rg", "san", "vg", ["volume"], expected, enabled, False)
+                                with mock.patch.object(connect, "finish_connections") as finish:
+                                    connect.main(args)
+                    self.assertEqual(["privilege", "distro"], events)
+                    run.assert_called_once_with(
+                        "sub", "rg", "san", "vg", ["volume"], expected, enabled, False,
+                        recommended_settings=connect.RECOMMENDED_NODE_SETTINGS, prepare_host=mock.ANY,
+                    )
+                    finish.assert_called_once_with(run.return_value, expected, True)
 
     def test_enabled_entrypoint_rejects_later_iqn_before_native_inventory_or_connect(self):
         args = [
             "-g", "rg", "-e", "san", "-v", "vg", "-n", "first", "second",
             "--enable-zonal-affinity",
         ]
-        with mock.patch.object(connect, "check_iscsi") as iscsi:
-            with mock.patch.object(connect, "check_mpio") as mpio:
+        with mock.patch.object(connect, "check_privileges") as privileges:
+            with mock.patch.object(connect, "detect_distro", return_value="debian") as distro:
                 with mock.patch.object(
                     connect, "resolve_zonal_affinity_context",
                     return_value=("sub-id", "eastus-az3"),
@@ -839,14 +848,17 @@ class ZonalAffinityTests(unittest.TestCase):
                         ("iqn.first", "first.example", 3260),
                         ("IQN.second", "second.example", 3260),
                     ]) as lookup:
-                        with mock.patch.object(connect, "check_connection") as inventory:
-                            with mock.patch.object(connect, "connect_volume") as mutate:
-                                with self.assertRaises(connect.ZonalAffinityError):
-                                    connect.main(args)
-        # Existing package-manager prerequisites are read-only and stay in place.
-        iscsi.assert_called_once_with()
-        mpio.assert_called_once_with()
+                        with mock.patch.object(connect, "prepare_iscsi_host") as prepare:
+                            with mock.patch.object(connect, "check_connection") as inventory:
+                                with mock.patch.object(connect, "connect_volume") as mutate:
+                                    with self.assertRaises(connect.ZonalAffinityError):
+                                        connect.main(args)
+        # Privilege and platform checks come first; a failed read-only lookup
+        # stops before any prerequisite is installed or any volume changes.
+        privileges.assert_called_once_with()
+        distro.assert_called_once_with()
         self.assertEqual(2, lookup.call_count)
+        prepare.assert_not_called()
         inventory.assert_not_called()
         mutate.assert_not_called()
 
