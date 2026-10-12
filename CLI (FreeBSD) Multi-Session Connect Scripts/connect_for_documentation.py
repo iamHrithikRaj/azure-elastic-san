@@ -1,4 +1,4 @@
-"""Standalone Azure Elastic SAN connect script for stock FreeBSD 13+.
+"""Standalone Azure Elastic SAN connect script for FreeBSD 13+.
 
 This is a separate implementation from the Linux connect script in
 "CLI (Linux) Multi-Session Connect Scripts". FreeBSD uses a different iSCSI
@@ -23,7 +23,8 @@ Prerequisites (see README.md in this directory for full detail):
 
 This script intentionally does NOT:
     * call iscsiadm, systemd, or any Linux package manager;
-    * call 'iscsictl -R -a' or otherwise remove/tear down sessions;
+    * call 'iscsictl -R -a' or otherwise remove/tear down sessions (use
+      disconnect_for_documentation.py for the selected volumes);
     * restart the iscsid service or touch sessions it did not create;
     * assemble gmultipath devices (session creation is not multipath device
       assembly -- see README.md).
@@ -31,6 +32,7 @@ This script intentionally does NOT:
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -71,6 +73,8 @@ SHORT_COMMAND_TIMEOUT_SECONDS = 15
 ISCSICTL_COMMAND_TIMEOUT_SECONDS = 15
 SESSION_READY_TIMEOUT_SECONDS = 30
 SESSION_POLL_INTERVAL_SECONDS = 1
+MAX_SESSIONS_PER_VOLUME = 32
+DEFAULT_SESSIONS_PER_VOLUME = 32
 
 MAX_IQN_UTF8_BYTES = 223
 PHYSICAL_ZONE_PATTERN = re.compile(r"^[a-z0-9.-]+$")
@@ -100,6 +104,20 @@ MANAGED_BLOCK_END = "# END AZURE ELASTIC SAN FREEBSD MANAGED BLOCK"
 # configured value to inject a second statement/stanza.
 _FORBIDDEN_CONFIG_CHARS = frozenset('"{}#;')
 NICKNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+
+# Each session is its own kernel disk path; assembling them is the host's multipath layer's job.
+MULTIPATH_NOTICE = (
+    "Multipath: each iSCSI session exposes its own disk device; this script does not assemble "
+    "multipath devices. Use the host's multipath layer (gmultipath(8) or the initiator's "
+    "multipath support) before using the volumes."
+)
+# The kernel rejects a session whose target name and address text both match an existing one
+# unless the initiator permits it, so a second session to one portal is where support shows.
+SAME_PORTAL_REJECTED_HINT = (
+    "The initiator rejected another session to the same target portal; stock FreeBSD allows one "
+    "session per target and portal. Re-run with a --num-of-sessions value the initiator "
+    "supports, or with --enable-vip-distribution."
+)
 
 
 class ElasticSanConnectError(Exception):
@@ -587,6 +605,36 @@ def format_target_address(hostname, port, volume_name):
     )
 
 
+def resolve_session_portals(hostname, number_of_sessions, enable_vip_distribution=False):
+    """Return [(portal host, session count)] for one volume.
+
+    Matches the Linux and Windows scripts: without the opt-in every session uses the
+    FQDN. With it, the FQDN's IPv4 answers are deduplicated, sorted numerically and
+    given n // N sessions each, the first n % N one more (32 over 3 is 11/11/10). One
+    address keeps the FQDN; addresses with no share are not configured.
+    """
+    if not enable_vip_distribution:
+        return [(hostname, number_of_sessions)]
+    try:
+        addresses = sorted({
+            ipaddress.IPv4Address(answer[4][0])
+            for answer in socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
+        })
+    except (OSError, ValueError) as error:
+        raise ElasticSanConnectError("DNS lookup failed for '{}': {}".format(hostname, error))
+    if not addresses:
+        raise ElasticSanConnectError(
+            "DNS lookup returned no IPv4 addresses for '{}'".format(hostname)
+        )
+    if len(addresses) == 1:
+        return [(hostname, number_of_sessions)]
+    share, remainder = divmod(number_of_sessions, len(addresses))
+    portals = [
+        (str(address), share + (index < remainder)) for index, address in enumerate(addresses)
+    ]
+    return [(portal, count) for portal, count in portals if count]
+
+
 def sanitize_identity_component(value, field_name):
     if not isinstance(value, string_types) or not value.strip():
         raise ElasticSanConnectError("{} must be a non-empty string".format(field_name))
@@ -614,9 +662,13 @@ def build_nickname(volume_group_name, volume_name, target_name, session_index):
     sanitized_volume = sanitize_identity_component(volume_name, "Volume name")
     if not isinstance(target_name, string_types) or not target_name:
         raise ElasticSanConnectError("Target IQN must be a non-empty string")
-    if session_index != 1:
+    if (
+        isinstance(session_index, bool)
+        or not isinstance(session_index, int)
+        or not 1 <= session_index <= MAX_SESSIONS_PER_VOLUME
+    ):
         raise ElasticSanConnectError(
-            "Stock FreeBSD supports exactly one session per Elastic SAN volume in this PoC"
+            "Session index must be an integer from 1 to {}".format(MAX_SESSIONS_PER_VOLUME)
         )
 
     readable_base = "esan-{}-{}".format(sanitized_group, sanitized_volume)
@@ -626,7 +678,7 @@ def build_nickname(volume_group_name, volume_name, target_name, session_index):
         separators=(",", ":"),
     )
     identity_hash = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()[:16]
-    suffix = "-{}-s1".format(identity_hash)
+    suffix = "-{}-s{}".format(identity_hash, session_index)
     readable_prefix = readable_base[: 128 - len(suffix)].rstrip("-")
     nickname = readable_prefix + suffix
 
@@ -833,7 +885,8 @@ def compute_new_config_content(existing_content_bytes, managed_block_bytes):
             raise ElasticSanConnectError(
                 "Generated nickname '{}' conflicts with an existing managed entry: "
                 "existing target/address is '{}'/'{}', selected target/address is "
-                "'{}'/'{}'. Refusing to overwrite it.".format(
+                "'{}'/'{}'. Refusing to overwrite it. Run disconnect_for_documentation.py for "
+                "that volume to change its layout, then re-run.".format(
                     entry.nickname,
                     existing_entry.target_name,
                     existing_entry.target_address,
@@ -848,6 +901,12 @@ def compute_new_config_content(existing_content_bytes, managed_block_bytes):
     if prefix and not prefix.endswith(b"\n"):
         prefix += b"\n"
     return prefix + merged_block + suffix
+
+
+def read_managed_entries(content_bytes):
+    """Return the strictly parsed managed entries in *content_bytes* (possibly empty)."""
+    _, block, _ = _split_managed_block(content_bytes)
+    return parse_managed_block(block) if block is not None else []
 
 
 def read_config_file(path):
@@ -927,13 +986,13 @@ def release_config_transaction_lock(lock_fd):
         os.close(lock_fd)
 
 
-def backup_config(path, existing_content_bytes, existed):
+def backup_config(path, existing_content_bytes, existed, label="connect"):
     """Write a backup of the current config content before mutating it.
     Returns the backup path (or None if the file did not exist yet, in which
     case there is nothing to back up)."""
     if not existed:
         return None
-    backup_path = "{}.bak.pre-esan-connect.{}".format(path, os.getpid())
+    backup_path = "{}.bak.pre-esan-{}.{}".format(path, label, os.getpid())
     directory = os.path.dirname(path) or "."
     fd, temp_path = tempfile.mkstemp(prefix=".iscsi.conf.bak.", dir=directory)
     try:
@@ -1079,6 +1138,28 @@ def sessions_for_target(sessions, target_name):
     ]
 
 
+def belongs_to_volume(target_name, volume_iqn):
+    """True for the volume's own IQN or that IQN with one ':az-<zone>' suffix.
+
+    Exact and case-insensitive (never a substring), matching the Linux and Windows
+    scripts, so a volume connected in either zonal mode is recognized on every portal.
+    """
+    target_name, volume_iqn = target_name.lower(), volume_iqn.lower()
+    if target_name == volume_iqn:
+        return True
+    prefix = volume_iqn + ":az-"
+    zone = target_name[len(prefix):] if target_name.startswith(prefix) else ""
+    return bool(zone) and ":" not in zone
+
+
+def sessions_for_volume(sessions, volume_iqn):
+    return [
+        session
+        for session in sessions
+        if belongs_to_volume(session.get("Target name", ""), volume_iqn)
+    ]
+
+
 def session_is_connected(session):
     return (
         session.get("Session state", "").strip().lower() == "connected"
@@ -1106,23 +1187,26 @@ def wait_for_connected_session(
     poll_interval=SESSION_POLL_INTERVAL_SECONDS,
     monotonic=None,
     sleep=None,
+    expected_count=1,
 ):
-    """Poll only *target_name* until a connected session is visible."""
+    """Poll only *target_name* until *expected_count* connected sessions are visible."""
     monotonic = time.monotonic if monotonic is None else monotonic
     sleep = time.sleep if sleep is None else sleep
     deadline = monotonic() + timeout
     while True:
         matching_sessions = sessions_for_target(list_iscsi_sessions(), target_name)
-        if any(session_is_connected(session) for session in matching_sessions):
+        connected_count = len(
+            [session for session in matching_sessions if session_is_connected(session)]
+        )
+        if connected_count >= expected_count:
             return
         now = monotonic()
         if now >= deadline:
             raise ElasticSanConnectError(
-                "Timed out after {} seconds waiting for target '{}' to become Connected. "
-                "The iscsictl add request was already submitted and may still create or leave "
-                "a live session; inspect 'iscsictl -L -v' before retrying.".format(
-                    timeout, target_name
-                )
+                "Timed out after {} seconds waiting for {} session(s) to target '{}' to become "
+                "Connected ({} Connected). The iscsictl add requests were already submitted and "
+                "may still create or leave live sessions; inspect 'iscsictl -L -v' before "
+                "retrying.".format(timeout, expected_count, target_name, connected_count)
             )
         sleep(min(poll_interval, deadline - now))
 
@@ -1132,13 +1216,55 @@ def wait_for_connected_session(
 # ---------------------------------------------------------------------------
 
 class VolumeConnectionPlan(object):
-    __slots__ = ("volume_name", "target_name", "target_address", "nicknames")
+    """One volume's planned sessions.
 
-    def __init__(self, volume_name, target_name, target_address, nicknames):
+    *target_address* is the service FQDN portal. *session_addresses* holds each
+    session's portal, parallel to *nicknames* (all the FQDN unless VIP distribution
+    spread them). *volume_iqn* is the undecorated service IQN, used to recognize the
+    volume's existing sessions whichever zonal mode created them.
+    """
+
+    __slots__ = (
+        "volume_name", "target_name", "target_address", "nicknames", "session_addresses",
+        "volume_iqn",
+    )
+
+    def __init__(
+        self, volume_name, target_name, target_address, nicknames, session_addresses=None,
+        volume_iqn=None,
+    ):
         self.volume_name = volume_name
         self.target_name = target_name
         self.target_address = target_address
         self.nicknames = nicknames
+        self.session_addresses = (
+            list(session_addresses)
+            if session_addresses is not None
+            else [target_address] * len(nicknames)
+        )
+        if len(self.session_addresses) != len(nicknames):
+            raise ElasticSanConnectError("Every planned session needs exactly one target address")
+        self.volume_iqn = volume_iqn or target_name
+
+    def entries(self):
+        return [
+            ManagedConfigEntry(nickname, self.target_name, address)
+            for nickname, address in zip(self.nicknames, self.session_addresses)
+        ]
+
+
+def validate_session_count(number_of_sessions):
+    if (
+        isinstance(number_of_sessions, bool)
+        or not isinstance(number_of_sessions, int)
+        or not 1 <= number_of_sessions <= MAX_SESSIONS_PER_VOLUME
+    ):
+        raise ElasticSanConnectError(
+            "--num-of-sessions must be an integer from 1 to {} (got {!r})".format(
+                MAX_SESSIONS_PER_VOLUME, number_of_sessions
+            )
+        )
+    return number_of_sessions
 
 
 def build_connection_plan(
@@ -1149,21 +1275,18 @@ def build_connection_plan(
     volume_names,
     number_of_sessions,
     enable_zonal_affinity=False,
+    enable_vip_distribution=False,
 ):
-    """Resolve targets and compute the deterministic nickname set for every
+    """Resolve targets, portals and the deterministic nickname set for every
     volume. Discovery queries IMDS/Azure CLI (with temporary subprocess output
-    capture); it does not access iSCSI config, locks, services, or sessions.
-    This is identical for --dry-run and the real execution path."""
+    capture) and, for VIP distribution, DNS; it does not access iSCSI config,
+    locks, services, or sessions. This is identical for --dry-run and the real
+    execution path."""
     if not volume_names:
         raise ElasticSanConnectError(
             "At least one volume must be selected; refusing to build an empty connection plan"
         )
-    if number_of_sessions != 1:
-        raise ElasticSanConnectError(
-            "Stock FreeBSD rejects duplicate target-name/portal sessions, so this PoC supports "
-            "exactly one session per volume. NetApp-specific multi-session behavior requires "
-            "separate validation."
-        )
+    validate_session_count(number_of_sessions)
 
     physical_zone = None
     if enable_zonal_affinity:
@@ -1173,6 +1296,7 @@ def build_connection_plan(
 
     plans = []
     nickname_owners = {}
+    portals_by_hostname = {}
     for volume_name in volume_names:
         target_iqn, target_hostname, target_port = get_volume_storage_target(
             elastic_san_subscription,
@@ -1181,11 +1305,22 @@ def build_connection_plan(
             volume_group_name,
             volume_name,
         )
+        volume_iqn = target_iqn
         if enable_zonal_affinity:
             target_iqn = decorate_target_iqn(target_iqn, physical_zone)
 
         target_name = validate_config_scalar(target_iqn, "Target IQN for '{}'".format(volume_name))
         target_address = format_target_address(target_hostname, target_port, volume_name)
+        # Resolve each FQDN once so every volume behind it gets the same portal layout.
+        if target_hostname not in portals_by_hostname:
+            portals_by_hostname[target_hostname] = resolve_session_portals(
+                target_hostname, number_of_sessions, enable_vip_distribution
+            )
+        session_addresses = [
+            format_target_address(portal, target_port, volume_name)
+            for portal, count in portals_by_hostname[target_hostname]
+            for _ in range(count)
+        ]
         nicknames = [
             build_nickname(volume_group_name, volume_name, target_name, session_index)
             for session_index in range(1, number_of_sessions + 1)
@@ -1200,7 +1335,12 @@ def build_connection_plan(
                     )
                 )
             nickname_owners[nickname] = volume_name
-        plans.append(VolumeConnectionPlan(volume_name, target_name, target_address, nicknames))
+        plans.append(
+            VolumeConnectionPlan(
+                volume_name, target_name, target_address, nicknames, session_addresses,
+                volume_iqn,
+            )
+        )
     return plans
 
 
@@ -1208,17 +1348,15 @@ def render_full_managed_block(plans):
     entries = []
     seen_nicknames = set()
     for plan in plans:
-        for nickname in plan.nicknames:
-            if nickname in seen_nicknames:
+        for entry in plan.entries():
+            if entry.nickname in seen_nicknames:
                 raise ElasticSanConnectError(
                     "Connection plan contains duplicate nickname '{}'; refusing to render it".format(
-                        nickname
+                        entry.nickname
                     )
                 )
-            seen_nicknames.add(nickname)
-            entries.append(
-                ManagedConfigEntry(nickname, plan.target_name, plan.target_address)
-            )
+            seen_nicknames.add(entry.nickname)
+            entries.append(entry)
     if not entries:
         raise ElasticSanConnectError(
             "Refusing to render an empty Azure Elastic SAN connection plan"
@@ -1229,11 +1367,20 @@ def render_full_managed_block(plans):
 def describe_plan(plans, number_of_sessions):
     lines = []
     for plan in plans:
+        portals = []
+        for address in plan.session_addresses:
+            if portals and portals[-1][0] == address:
+                portals[-1][1] += 1
+            else:
+                portals.append([address, 1])
         lines.append(
             "{} -> target {} at {} ({} session(s), nicknames: {})".format(
                 plan.volume_name,
                 plan.target_name,
-                plan.target_address,
+                ", ".join(
+                    address if len(portals) == 1 else "{} ({})".format(address, count)
+                    for address, count in portals
+                ),
                 number_of_sessions,
                 ", ".join(plan.nicknames),
             )
@@ -1245,21 +1392,11 @@ def describe_plan(plans, number_of_sessions):
 # Execution path (mutating)
 # ---------------------------------------------------------------------------
 
-def add_sessions_for_volume(plan, config_path, desired_sessions):
-    if desired_sessions != 1 or len(plan.nicknames) != 1:
-        raise ElasticSanConnectError(
-            "Stock FreeBSD supports exactly one session per volume in this PoC"
-        )
-    existing_sessions = list_iscsi_sessions()
-    matching_sessions = sessions_for_target(existing_sessions, plan.target_name)
-    if len(matching_sessions) > 1:
-        raise ElasticSanConnectError(
-            "{}: found {} sessions for target '{}', but stock FreeBSD supports exactly one "
-            "in this PoC. This script will not remove sessions; inspect 'iscsictl -L -v' and "
-            "reconcile the duplicates manually.".format(
-                plan.volume_name, len(matching_sessions), plan.target_name
-            )
-        )
+def plan_is_already_connected(plan, sessions):
+    """Return True when the volume already has sessions (in any zonal mode, on any
+    portal), so it is skipped and none of its entries are written. Sessions that are
+    not Connected stop the run: this script never adds, removes or modifies them."""
+    matching_sessions = sessions_for_volume(sessions, plan.volume_iqn)
     unhealthy_sessions = [
         session for session in matching_sessions if not session_is_connected(session)
     ]
@@ -1277,25 +1414,39 @@ def add_sessions_for_volume(plan, config_path, desired_sessions):
             )
         )
         raise ElasticSanConnectError(
-            "{}: found an existing non-connected session for target '{}' (state: {}). "
-            "The script will not add a duplicate or remove the stale session. Inspect "
-            "'iscsictl -L -v', recover or remove that specific session manually, and retry.".format(
+            "{} [{}]: found existing session(s) that are not Connected (state: {}). This "
+            "script will not add, remove or modify them. Inspect 'iscsictl -L -v', recover them "
+            "manually or run disconnect_for_documentation.py for this volume, then re-run.".format(
                 plan.volume_name, plan.target_name, ", ".join(states)
             )
         )
-
     if matching_sessions:
         print(
-            "{} [{}]: Skipped -- a Connected session is already established".format(
-                plan.volume_name, plan.target_name
+            "{} [{}]: Skipped -- {} Connected session(s) already established; run "
+            "disconnect_for_documentation.py first to change the layout".format(
+                plan.volume_name, plan.target_name, len(matching_sessions)
             )
         )
-        return
+        return True
+    return False
 
-    add_iscsi_session(plan.nicknames[0], config_path)
-    wait_for_connected_session(plan.target_name)
+
+def add_sessions_for_volume(plan, config_path):
+    """Add every planned session, then wait until all of them are Connected."""
+    added_addresses = set()
+    for nickname, address in zip(plan.nicknames, plan.session_addresses):
+        try:
+            add_iscsi_session(nickname, config_path)
+        except ElasticSanConnectError as error:
+            if address in added_addresses:
+                raise ElasticSanConnectError("{} {}".format(error, SAME_PORTAL_REJECTED_HINT))
+            raise
+        added_addresses.add(address)
+    wait_for_connected_session(plan.target_name, expected_count=len(plan.nicknames))
     print(
-        "{} [{}]: Connected".format(plan.volume_name, plan.target_name)
+        "{} [{}]: Connected {} session(s)".format(
+            plan.volume_name, plan.target_name, len(plan.nicknames)
+        )
     )
 
 
@@ -1304,31 +1455,42 @@ def execute_connection_plan(plans, config_path, number_of_sessions):
         raise ElasticSanConnectError(
             "Refusing to execute an empty Azure Elastic SAN connection plan"
         )
-    if number_of_sessions != 1 or any(len(plan.nicknames) != 1 for plan in plans):
+    validate_session_count(number_of_sessions)
+    if any(len(plan.nicknames) != number_of_sessions for plan in plans):
         raise ElasticSanConnectError(
-            "Stock FreeBSD supports exactly one session per volume in this PoC"
+            "Every planned volume must have exactly {} session(s)".format(number_of_sessions)
         )
     check_freebsd_mutation_prerequisites()
     _, lock_fd = acquire_config_transaction_lock(config_path)
     try:
         existing_content_bytes, existed, original_stat = read_config_file(config_path)
-        new_managed_block = render_full_managed_block(plans)
-        new_content = compute_new_config_content(existing_content_bytes, new_managed_block)
+        # Reject a malformed managed block before any host change.
+        read_managed_entries(existing_content_bytes)
 
         ensure_iscsid_enabled_and_running()
+        sessions = list_iscsi_sessions()
+        plans_to_connect = [
+            plan for plan in plans if not plan_is_already_connected(plan, sessions)
+        ]
+        if not plans_to_connect:
+            return
+        new_managed_block = render_full_managed_block(plans_to_connect)
+        new_content = compute_new_config_content(existing_content_bytes, new_managed_block)
+
         backup_path = backup_config(config_path, existing_content_bytes, existed)
         write_config_atomically(config_path, new_content, original_stat)
 
         try:
-            for plan in plans:
-                add_sessions_for_volume(plan, config_path, number_of_sessions)
+            for plan in plans_to_connect:
+                add_sessions_for_volume(plan, config_path)
         except (ElasticSanConnectError, OSError) as error:
             restore_config_from_backup(config_path, backup_path, existed, original_stat)
             raise ElasticSanConnectError(
                 "Failed while establishing iSCSI sessions; restored {} to its pre-run state. "
-                "This rollback only restores the config file: an iscsictl add request may already "
-                "have created or may still create a live session, and this script never removes "
-                "sessions. Inspect 'iscsictl -L -v' before retrying. Original error: {}".format(
+                "This rollback only restores the config file: iscsictl add requests may already "
+                "have created or may still create live sessions, and this script never removes "
+                "sessions. Inspect 'iscsictl -L -v', and run disconnect_for_documentation.py for "
+                "the affected volumes before retrying. Original error: {}".format(
                     config_path, error
                 )
             )
@@ -1343,8 +1505,8 @@ def execute_connection_plan(plans, config_path, number_of_sessions):
 def create_argument_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "Connect one or more Azure Elastic SAN volumes with one iSCSI session each on "
-            "stock FreeBSD 13+, using the native iscsid/iscsictl initiator."
+            "Connect one or more Azure Elastic SAN volumes with 1-32 iSCSI sessions each on "
+            "FreeBSD 13+, using the native iscsid/iscsictl initiator."
         )
     )
     parser.add_argument(
@@ -1364,8 +1526,13 @@ def create_argument_parser():
         "-s",
         "--num-of-sessions",
         dest="num_of_sessions",
-        default="1",
-        help="Sessions per volume; stock FreeBSD supports exactly 1 in this PoC (default: 1)",
+        default=str(DEFAULT_SESSIONS_PER_VOLUME),
+        help=(
+            "Sessions per volume, 1-{} (default: {}). Stock FreeBSD allows one session per "
+            "target and portal; see README.md.".format(
+                MAX_SESSIONS_PER_VOLUME, DEFAULT_SESSIONS_PER_VOLUME
+            )
+        ),
     )
     parser.add_argument(
         "--enable-zonal-affinity",
@@ -1373,6 +1540,14 @@ def create_argument_parser():
         help=(
             "Opt in to provisional logical-to-physical availability-zone routing. Requires "
             "Elastic SAN front-end support for parsing the IQN suffix."
+        ),
+    )
+    parser.add_argument(
+        "--enable-vip-distribution",
+        action="store_true",
+        help=(
+            "Distribute original session portals across the target's IPv4 VIPs, "
+            "independently of zonal affinity."
         ),
     )
     parser.add_argument(
@@ -1411,17 +1586,8 @@ def main(argv=None):
     try:
         number_of_sessions = int(args.num_of_sessions)
     except (TypeError, ValueError):
-        raise ElasticSanConnectError(
-            "--num-of-sessions must be exactly 1 for stock FreeBSD (got {!r})".format(
-                args.num_of_sessions
-            )
-        )
-    if number_of_sessions != 1:
-        raise ElasticSanConnectError(
-            "Stock FreeBSD rejects duplicate target-name/portal sessions, so "
-            "--num-of-sessions must be exactly 1 (got {}). NetApp-specific multi-session "
-            "behavior requires separate validation.".format(number_of_sessions)
-        )
+        number_of_sessions = args.num_of_sessions
+    validate_session_count(number_of_sessions)
 
     check_az_cli_available()
 
@@ -1433,7 +1599,10 @@ def main(argv=None):
         volume_names,
         number_of_sessions,
         args.enable_zonal_affinity,
+        args.enable_vip_distribution,
     )
+    if number_of_sessions > 1:
+        print(MULTIPATH_NOTICE)
 
     if args.dry_run:
         print("[dry-run] No mutating commands (sysrc/service/iscsictl) will be run.")

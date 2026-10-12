@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import stat
@@ -100,12 +102,13 @@ class ArgumentParsingTests(unittest.TestCase):
         self.assertTrue(args.enable_zonal_affinity)
         self.assertTrue(args.dry_run)
 
-    def test_dry_run_and_zonal_affinity_default_to_false(self):
+    def test_dry_run_and_opt_ins_default_to_false_and_sessions_to_32(self):
         parser = connect.create_argument_parser()
         args = parser.parse_args(["-g", "rg", "-e", "san", "-v", "vg", "-n", "vol1"])
         self.assertFalse(args.dry_run)
         self.assertFalse(args.enable_zonal_affinity)
-        self.assertEqual("1", args.num_of_sessions)
+        self.assertFalse(args.enable_vip_distribution)
+        self.assertEqual("32", args.num_of_sessions)
 
     def test_missing_required_arguments_raise_before_any_azure_or_freebsd_call(self):
         with mock.patch.object(connect, "check_az_cli_available") as check_az:
@@ -113,29 +116,30 @@ class ArgumentParsingTests(unittest.TestCase):
                 connect.main(["-g", "rg"])
         check_az.assert_not_called()
 
-    def test_any_session_count_other_than_one_is_rejected_before_discovery(self):
-        for value in ("0", "-1", "2", "32", "not-a-number"):
+    def test_session_count_outside_1_to_32_is_rejected_before_discovery(self):
+        for value in ("0", "-1", "33", "not-a-number"):
             with self.subTest(value=value):
                 with mock.patch.object(connect, "check_az_cli_available") as check_az:
                     with self.assertRaisesRegex(
-                        connect.ElasticSanConnectError,
-                        "(must be exactly 1|rejects duplicate target-name/portal sessions)",
+                        connect.ElasticSanConnectError, "must be an integer from 1 to 32"
                     ):
                         connect.main(
-                            [
-                                "-g",
-                                "rg",
-                                "-e",
-                                "san",
-                                "-v",
-                                "vg",
-                                "-n",
-                                "vol1",
-                                "-s",
-                                value,
-                            ]
+                            ["-g", "rg", "-e", "san", "-v", "vg", "-n", "vol1", "-s", value]
                         )
                 check_az.assert_not_called()
+
+    def test_session_counts_1_to_32_reach_planning(self):
+        for value in ("1", "2", "24", "32"):
+            with self.subTest(value=value):
+                with mock.patch.object(connect, "check_az_cli_available"):
+                    with mock.patch.object(
+                        connect, "build_connection_plan", side_effect=RuntimeError("planned")
+                    ) as plan:
+                        with self.assertRaisesRegex(RuntimeError, "planned"):
+                            connect.main(
+                                ["-g", "rg", "-e", "san", "-v", "vg", "-n", "vol1", "-s", value]
+                            )
+                self.assertEqual(int(value), plan.call_args[0][5])
 
 
 class ZonalAffinityTests(unittest.TestCase):
@@ -474,9 +478,16 @@ class NicknameTests(unittest.TestCase):
         second = connect.build_nickname("vg-1", "vol-1", "iqn.example:target", 1)
         self.assertEqual(first, second)
 
-    def test_rejects_session_index_other_than_one(self):
-        with self.assertRaisesRegex(connect.ElasticSanConnectError, "exactly one session"):
-            connect.build_nickname("vg-1", "vol-1", "iqn.example:target", 2)
+    def test_session_index_must_be_1_to_32_and_sets_the_suffix(self):
+        for index in (0, 33, True, "2"):
+            with self.subTest(index=index):
+                with self.assertRaisesRegex(connect.ElasticSanConnectError, "from 1 to 32"):
+                    connect.build_nickname("vg-1", "vol-1", "iqn.example:target", index)
+        first = connect.build_nickname("vg-1", "vol-1", "iqn.example:target", 1)
+        last = connect.build_nickname("vg-1", "vol-1", "iqn.example:target", 32)
+        self.assertRegex(first, r"^esan-vg-1-vol-1-[0-9a-f]{16}-s1$")
+        self.assertRegex(last, r"^esan-vg-1-vol-1-[0-9a-f]{16}-s32$")
+        self.assertNotEqual(first[:-3], last[:-4])
 
     def test_distinct_for_different_volumes(self):
         self.assertNotEqual(
@@ -991,121 +1002,127 @@ class SessionParsingTests(unittest.TestCase):
             connect._parse_iscsictl_verbose_sessions(malformed)
 
 
-class AddSessionsForVolumeTests(unittest.TestCase):
-    def _plan(self):
+def session(target_name, state="Connected", enable="Yes", portal="10.0.0.4:3260"):
+    return {
+        "Target name": target_name,
+        "Target portal": portal,
+        "Session state": state,
+        "Enable": enable,
+    }
+
+
+class ExistingSessionPlanningTests(unittest.TestCase):
+    def _plan(self, target_name="iqn.example:target", volume_iqn=None):
         return connect.VolumeConnectionPlan(
             "vol1",
-            "iqn.example:target",
+            target_name,
             "10.0.0.4:3260",
-            [connect.build_nickname("vg", "vol1", "iqn.example:target", 1)],
+            [connect.build_nickname("vg", "vol1", target_name, 1)],
+            volume_iqn=volume_iqn,
         )
 
-    def test_skips_connected_session_even_when_target_address_was_redirected(self):
+    def test_volume_without_sessions_is_connected(self):
+        self.assertFalse(connect.plan_is_already_connected(self._plan(), []))
+
+    def test_connected_sessions_skip_even_when_redirected_or_more_than_one(self):
         plan = self._plan()
         sessions = [
-            {
-                "Target name": plan.target_name,
-                "Target portal": "redirected.example:3260",
-                "Session state": "Connected",
-                "Enable": "Yes",
-            }
+            session(plan.target_name, portal="redirected.example:3260"),
+            session(plan.target_name, portal="10.0.0.5:3260"),
         ]
-        with mock.patch.object(connect, "list_iscsi_sessions", return_value=sessions):
-            with mock.patch.object(connect, "add_iscsi_session") as add_mock:
-                connect.add_sessions_for_volume(plan, "/etc/iscsi.conf", 1)
-        add_mock.assert_not_called()
+        self.assertTrue(connect.plan_is_already_connected(plan, sessions))
 
-    def test_submits_once_then_polls_only_requested_target_until_connected(self):
+    def test_sessions_of_another_zonal_mode_skip_the_volume(self):
+        plain = self._plan()
+        decorated = self._plan("iqn.example:target:az-eastus-az1", volume_iqn="iqn.example:target")
+        self.assertTrue(
+            connect.plan_is_already_connected(plain, [session("IQN.example:target:AZ-eastus-az3")])
+        )
+        self.assertTrue(
+            connect.plan_is_already_connected(decorated, [session("iqn.example:target")])
+        )
+
+    def test_similar_prefixes_and_nested_suffixes_do_not_match(self):
         plan = self._plan()
-        unrelated = {
-            "Target name": "iqn.example:unrelated",
-            "Target portal": "other:3260",
-            "Session state": "Disconnected",
-            "Enable": "No",
-        }
-        connecting = {
-            "Target name": plan.target_name,
-            "Target portal": "redirected.example:3260",
-            "Session state": "Connecting",
-            "Enable": "Yes",
-        }
-        connected = dict(connecting, **{"Session state": "Connected"})
+        for name in (
+            "iqn.example:target2",
+            "iqn.example:target:az-",
+            "iqn.example:target:az-zone:extra",
+            "iqn.example:targe",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(connect.plan_is_already_connected(plan, [session(name)]))
+
+    def test_not_connected_or_disabled_sessions_stop_without_changes(self):
+        plan = self._plan()
+        for existing, expected in (
+            (session(plan.target_name, state="Disconnected"), "Disconnected"),
+            (session(plan.target_name, enable="No"), "disabled"),
+        ):
+            with self.subTest(expected=expected):
+                with self.assertRaisesRegex(connect.ElasticSanConnectError, expected):
+                    connect.plan_is_already_connected(
+                        plan, [session(plan.target_name), existing]
+                    )
+
+
+class AddSessionsForVolumeTests(unittest.TestCase):
+    def _plan(self, addresses):
+        nicknames = [
+            connect.build_nickname("vg", "vol1", "iqn.example:target", index)
+            for index in range(1, len(addresses) + 1)
+        ]
+        return connect.VolumeConnectionPlan(
+            "vol1", "iqn.example:target", "portal.example:3260", nicknames, addresses
+        )
+
+    def test_adds_every_session_in_order_then_waits_for_all_of_them(self):
+        plan = self._plan(["10.0.0.1:3260", "10.0.0.1:3260", "10.0.0.2:3260"])
+        connecting = session(plan.target_name, state="Connecting")
+        connected = session(plan.target_name)
+        unrelated = session("iqn.example:unrelated", state="Disconnected", enable="No")
         clock = mock.Mock(side_effect=[0, 0, 1])
         with mock.patch.object(
-            connect, "list_iscsi_sessions", side_effect=[[], [unrelated], [unrelated, connecting], [unrelated, connected]]
+            connect,
+            "list_iscsi_sessions",
+            side_effect=[
+                [unrelated, connected, connecting, connecting],
+                [unrelated, connected, connected, connected],
+            ],
         ):
             with mock.patch.object(connect, "add_iscsi_session") as add_mock:
                 with mock.patch.object(connect.time, "monotonic", clock):
                     with mock.patch.object(connect.time, "sleep"):
-                        connect.add_sessions_for_volume(plan, "/etc/iscsi.conf", 1)
-        add_mock.assert_called_once_with(plan.nicknames[0], "/etc/iscsi.conf")
+                        connect.add_sessions_for_volume(plan, "/etc/iscsi.conf")
+        self.assertEqual(
+            [mock.call(nickname, "/etc/iscsi.conf") for nickname in plan.nicknames],
+            add_mock.call_args_list,
+        )
 
-    def test_disconnected_session_fails_without_add_or_remove(self):
-        plan = self._plan()
-        sessions = [
-            {
-                "Target name": plan.target_name,
-                "Target portal": plan.target_address,
-                "Session state": "Disconnected",
-                "Enable": "Yes",
-            }
-        ]
-        with mock.patch.object(connect, "list_iscsi_sessions", return_value=sessions):
-            with mock.patch.object(connect, "add_iscsi_session") as add_mock:
-                with self.assertRaisesRegex(
-                    connect.ElasticSanConnectError, "recover or remove that specific session"
-                ):
-                    connect.add_sessions_for_volume(plan, "/etc/iscsi.conf", 1)
-        add_mock.assert_not_called()
-
-    def test_disabled_session_fails_without_adding_duplicate(self):
-        plan = self._plan()
-        sessions = [
-            {
-                "Target name": plan.target_name,
-                "Target portal": plan.target_address,
-                "Session state": "Connected",
-                "Enable": "No",
-            }
-        ]
-        with mock.patch.object(connect, "list_iscsi_sessions", return_value=sessions):
-            with mock.patch.object(connect, "add_iscsi_session") as add_mock:
-                with self.assertRaisesRegex(connect.ElasticSanConnectError, "disabled"):
-                    connect.add_sessions_for_volume(plan, "/etc/iscsi.conf", 1)
-        add_mock.assert_not_called()
-
-    def test_multiple_matching_sessions_fail_without_adding(self):
-        plan = self._plan()
-        sessions = [
-            {
-                "Target name": plan.target_name,
-                "Session state": "Connected",
-                "Enable": "Yes",
-            },
-            {
-                "Target name": plan.target_name,
-                "Session state": "Connected",
-                "Enable": "Yes",
-            },
-        ]
-        with mock.patch.object(connect, "list_iscsi_sessions", return_value=sessions):
-            with mock.patch.object(connect, "add_iscsi_session") as add_mock:
-                with self.assertRaisesRegex(connect.ElasticSanConnectError, "exactly one"):
-                    connect.add_sessions_for_volume(plan, "/etc/iscsi.conf", 1)
-        add_mock.assert_not_called()
-
-    def test_submission_error_is_preserved(self):
-        plan = self._plan()
-        with mock.patch.object(connect, "list_iscsi_sessions", return_value=[]):
-            with mock.patch.object(
-                connect,
-                "add_iscsi_session",
-                side_effect=connect.ElasticSanConnectError("kernel rejected request"),
+    def test_rejected_second_session_to_one_portal_explains_initiator_limit(self):
+        plan = self._plan(["portal.example:3260", "portal.example:3260"])
+        with mock.patch.object(
+            connect,
+            "add_iscsi_session",
+            side_effect=[None, connect.ElasticSanConnectError("ISCSISADD: Device busy")],
+        ):
+            with self.assertRaisesRegex(
+                connect.ElasticSanConnectError,
+                "Device busy The initiator rejected another session to the same target portal",
             ):
-                with self.assertRaisesRegex(
-                    connect.ElasticSanConnectError, "^kernel rejected request$"
-                ):
-                    connect.add_sessions_for_volume(plan, "/etc/iscsi.conf", 1)
+                connect.add_sessions_for_volume(plan, "/etc/iscsi.conf")
+
+    def test_first_submission_error_is_preserved_without_hint(self):
+        plan = self._plan(["10.0.0.1:3260", "10.0.0.2:3260"])
+        with mock.patch.object(
+            connect,
+            "add_iscsi_session",
+            side_effect=[None, connect.ElasticSanConnectError("kernel rejected request")],
+        ):
+            with self.assertRaisesRegex(
+                connect.ElasticSanConnectError, "^kernel rejected request$"
+            ):
+                connect.add_sessions_for_volume(plan, "/etc/iscsi.conf")
 
 
 class SessionReadinessPollingTests(unittest.TestCase):
@@ -1116,15 +1133,13 @@ class SessionReadinessPollingTests(unittest.TestCase):
             connect,
             "list_iscsi_sessions",
             return_value=[
-                {
-                    "Target name": "iqn.example:other",
-                    "Session state": "Disconnected",
-                    "Enable": "No",
-                }
+                session("iqn.example:other", state="Disconnected", enable="No"),
+                session("iqn.example:target"),
             ],
         ):
             with self.assertRaisesRegex(
-                connect.ElasticSanConnectError, "may still create or leave a live session"
+                connect.ElasticSanConnectError,
+                r"waiting for 2 session\(s\).*\(1 Connected\).*may still create or leave live",
             ):
                 connect.wait_for_connected_session(
                     "iqn.example:target",
@@ -1132,6 +1147,7 @@ class SessionReadinessPollingTests(unittest.TestCase):
                     poll_interval=2,
                     monotonic=lambda: next(times),
                     sleep=sleeps.append,
+                    expected_count=2,
                 )
         self.assertEqual([2, 2], sleeps)
 
@@ -1416,6 +1432,109 @@ class BuildConnectionPlanTests(unittest.TestCase):
                     )
 
 
+def getaddrinfo_answers(*addresses):
+    return [(2, 1, 6, "", (address, 0)) for address in addresses]
+
+
+class VipDistributionTests(unittest.TestCase):
+    def test_without_opt_in_every_session_uses_the_fqdn_and_dns_is_not_queried(self):
+        with mock.patch.object(connect.socket, "getaddrinfo") as getaddrinfo:
+            self.assertEqual(
+                [("portal.example", 32)],
+                connect.resolve_session_portals("portal.example", 32),
+            )
+        getaddrinfo.assert_not_called()
+
+    def test_ipv4_answers_are_deduplicated_sorted_numerically_and_split_11_11_10(self):
+        answers = getaddrinfo_answers("10.0.0.10", "10.0.0.9", "10.0.0.10", "10.0.0.100")
+        with mock.patch.object(connect.socket, "getaddrinfo", return_value=answers) as getaddrinfo:
+            portals = connect.resolve_session_portals("portal.example", 32, True)
+        getaddrinfo.assert_called_once_with(
+            "portal.example", None, connect.socket.AF_INET, connect.socket.SOCK_STREAM
+        )
+        self.assertEqual([("10.0.0.9", 11), ("10.0.0.10", 11), ("10.0.0.100", 10)], portals)
+
+    def test_one_address_keeps_the_fqdn_and_zero_shares_are_dropped(self):
+        with mock.patch.object(
+            connect.socket, "getaddrinfo", return_value=getaddrinfo_answers("10.0.0.1")
+        ):
+            self.assertEqual(
+                [("portal.example", 24)], connect.resolve_session_portals("portal.example", 24, True)
+            )
+        with mock.patch.object(
+            connect.socket,
+            "getaddrinfo",
+            return_value=getaddrinfo_answers("10.0.0.1", "10.0.0.2", "10.0.0.3"),
+        ):
+            self.assertEqual(
+                [("10.0.0.1", 1), ("10.0.0.2", 1)],
+                connect.resolve_session_portals("portal.example", 2, True),
+            )
+
+    def test_dns_failures_stop_with_the_hostname(self):
+        for side_effect, expected in (
+            (OSError("no such host"), "DNS lookup failed for 'portal.example': no such host"),
+            ([], "DNS lookup returned no IPv4 addresses for 'portal.example'"),
+        ):
+            with self.subTest(expected=expected):
+                kwargs = {"side_effect": side_effect} if isinstance(side_effect, Exception) else {
+                    "return_value": side_effect
+                }
+                with mock.patch.object(connect.socket, "getaddrinfo", **kwargs):
+                    with self.assertRaisesRegex(connect.ElasticSanConnectError, expected):
+                        connect.resolve_session_portals("portal.example", 32, True)
+
+    def test_plan_assigns_contiguous_sessions_per_vip_and_resolves_each_fqdn_once(self):
+        answers = getaddrinfo_answers("10.0.0.3", "10.0.0.1", "10.0.0.2")
+        with mock.patch.object(
+            connect,
+            "get_volume_storage_target",
+            side_effect=[
+                ("iqn.example:vol1", "portal.example", 3260),
+                ("iqn.example:vol2", "portal.example", 3260),
+            ],
+        ):
+            with mock.patch.object(connect.socket, "getaddrinfo", return_value=answers) as dns:
+                plans = connect.build_connection_plan(
+                    None, "rg", "san", "vg", ["vol1", "vol2"], 32, enable_vip_distribution=True
+                )
+        dns.assert_called_once()
+        for plan in plans:
+            self.assertEqual("portal.example:3260", plan.target_address)
+            self.assertEqual(
+                ["10.0.0.1:3260"] * 11 + ["10.0.0.2:3260"] * 11 + ["10.0.0.3:3260"] * 10,
+                plan.session_addresses,
+            )
+            self.assertEqual(32, len(set(plan.nicknames)))
+            self.assertTrue(plan.nicknames[31].endswith("-s32"))
+
+    def test_dry_run_prints_the_portal_split_and_multipath_notice(self):
+        argv = [
+            "-g", "rg", "-e", "san", "-v", "vg", "-n", "volume1",
+            "--enable-vip-distribution", "--dry-run",
+        ]
+        output = io.StringIO()
+        with mock.patch.object(connect, "check_az_cli_available"):
+            with mock.patch.object(
+                connect, "get_volume_storage_target",
+                return_value=("iqn.example:volume1", "portal.example", 3260),
+            ):
+                with mock.patch.object(
+                    connect.socket, "getaddrinfo",
+                    return_value=getaddrinfo_answers("10.0.0.1", "10.0.0.2", "10.0.0.3"),
+                ):
+                    with mock.patch.object(connect, "_run_subprocess") as run_subprocess:
+                        with contextlib.redirect_stdout(output):
+                            connect.main(argv)
+        run_subprocess.assert_not_called()
+        text = output.getvalue()
+        self.assertIn(connect.MULTIPATH_NOTICE, text)
+        self.assertIn(
+            "at 10.0.0.1:3260 (11), 10.0.0.2:3260 (11), 10.0.0.3:3260 (10) (32 session(s)", text
+        )
+        self.assertEqual(32, text.count('TargetName    = "iqn.example:volume1"'))
+
+
 class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.mkdtemp(prefix="esan-freebsd-exec-test-")
@@ -1535,13 +1654,54 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
                 connect.execute_connection_plan([], self.config_path, 1)
         preflight.assert_not_called()
 
-    def test_multi_session_plan_is_rejected_before_any_mutation(self):
+    def test_plan_session_count_mismatch_is_rejected_before_any_mutation(self):
         plans = self._plans()
-        plans[0].nicknames.append("esan-vg-vol1-s2")
         with mock.patch.object(connect, "check_freebsd_mutation_prerequisites") as preflight:
-            with self.assertRaisesRegex(connect.ElasticSanConnectError, "exactly one"):
+            with self.assertRaisesRegex(connect.ElasticSanConnectError, "exactly 2 session"):
                 connect.execute_connection_plan(plans, self.config_path, 2)
         preflight.assert_not_called()
+
+    def test_multi_session_vip_plan_writes_one_entry_per_session_and_adds_each(self):
+        addresses = ["10.0.0.1:3260", "10.0.0.1:3260", "10.0.0.2:3260"]
+        nicknames = [
+            connect.build_nickname("vg", "vol1", "iqn.example:vol1", index) for index in (1, 2, 3)
+        ]
+        plan = connect.VolumeConnectionPlan(
+            "vol1", "iqn.example:vol1", "portal.example:3260", nicknames, addresses
+        )
+        connected = [
+            {"Target name": "iqn.example:vol1", "Session state": "Connected", "Enable": "Yes"}
+        ] * 3
+        with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"):
+            with mock.patch.object(connect, "ensure_iscsid_enabled_and_running"):
+                with mock.patch.object(
+                    connect, "list_iscsi_sessions", side_effect=[[], connected]
+                ):
+                    with mock.patch.object(connect, "add_iscsi_session") as add_mock:
+                        connect.execute_connection_plan([plan], self.config_path, 3)
+        self.assertEqual(nicknames, [call.args[0] for call in add_mock.call_args_list])
+        with open(self.config_path, "rb") as handle:
+            entries = connect.read_managed_entries(handle.read())
+        self.assertEqual(
+            sorted(zip(nicknames, addresses)),
+            sorted((entry.nickname, entry.target_address) for entry in entries),
+        )
+
+    def test_volume_connected_with_another_layout_is_skipped_without_conflict(self):
+        existing = connect.render_managed_block(
+            [connect.ManagedConfigEntry("esan-vg-vol1-s1", "iqn.example:vol1", "10.9.9.9:3260")]
+        )
+        with open(self.config_path, "wb") as handle:
+            handle.write(existing)
+        live = [{"Target name": "iqn.example:vol1:az-eastus-az1", "Session state": "Connected"}]
+        with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"):
+            with mock.patch.object(connect, "ensure_iscsid_enabled_and_running"):
+                with mock.patch.object(connect, "list_iscsi_sessions", return_value=live):
+                    with mock.patch.object(connect, "add_iscsi_session") as add_mock:
+                        connect.execute_connection_plan(self._plans(), self.config_path, 1)
+        add_mock.assert_not_called()
+        with open(self.config_path, "rb") as handle:
+            self.assertEqual(existing, handle.read())
 
     def test_malformed_existing_block_is_rejected_before_service_mutation(self):
         with open(self.config_path, "wb") as handle:
@@ -1576,7 +1736,7 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
         session_setup_volumes = []
         errors = []
 
-        def add_sessions(plan, _config_path, _desired_sessions):
+        def add_sessions(plan, _config_path):
             session_setup_volumes.append(plan.volume_name)
             if plan.volume_name == "vol1":
                 first_in_session_setup.set()
@@ -1592,19 +1752,20 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
         with mock.patch.object(connect, "fcntl", blocking_fcntl):
             with mock.patch.object(connect, "check_freebsd_mutation_prerequisites"):
                 with mock.patch.object(connect, "ensure_iscsid_enabled_and_running"):
-                    with mock.patch.object(
-                        connect, "add_sessions_for_volume", side_effect=add_sessions
-                    ):
-                        first = threading.Thread(target=execute, args=(first_plan,))
-                        second = threading.Thread(target=execute, args=(second_plan,))
-                        first.start()
-                        self.assertTrue(first_in_session_setup.wait(5))
-                        second.start()
-                        self.assertTrue(blocking_fcntl.second_acquire_attempted.wait(5))
-                        self.assertEqual(["vol1"], session_setup_volumes)
-                        allow_first_to_finish.set()
-                        first.join(5)
-                        second.join(5)
+                    with mock.patch.object(connect, "list_iscsi_sessions", return_value=[]):
+                        with mock.patch.object(
+                            connect, "add_sessions_for_volume", side_effect=add_sessions
+                        ):
+                            first = threading.Thread(target=execute, args=(first_plan,))
+                            second = threading.Thread(target=execute, args=(second_plan,))
+                            first.start()
+                            self.assertTrue(first_in_session_setup.wait(5))
+                            second.start()
+                            self.assertTrue(blocking_fcntl.second_acquire_attempted.wait(5))
+                            self.assertEqual(["vol1"], session_setup_volumes)
+                            allow_first_to_finish.set()
+                            first.join(5)
+                            second.join(5)
 
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
@@ -1760,16 +1921,22 @@ class EnabledInputPreflightTests(unittest.TestCase):
             self.assertEqual(connect.AZ_CLI_TIMEOUT_SECONDS, call.args[2])
         execute.assert_called_once()
         plans, _, session_count = execute.call_args.args
-        self.assertEqual(1, session_count)
+        self.assertEqual(32, session_count)
         self.assertEqual(
             [target["targetIqn"] + ":az-eastus-az3" for target in targets],
             [plan.target_name for plan in plans],
         )
         self.assertEqual(
+            [target["targetIqn"] for target in targets],
+            [plan.volume_iqn for plan in plans],
+        )
+        self.assertEqual(
             ["first.example:3260", "second.example:3260"],
             [plan.target_address for plan in plans],
         )
-        self.assertTrue(all(len(plan.nicknames) == 1 for plan in plans))
+        for plan in plans:
+            self.assertEqual(32, len(plan.nicknames))
+            self.assertEqual([plan.target_address] * 32, plan.session_addresses)
 
 
 class DryRunTests(unittest.TestCase):
