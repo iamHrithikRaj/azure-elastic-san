@@ -93,10 +93,17 @@ failure can leave some sessions or saved logins in place.
 
 ## Tests and limits
 
-Run from this directory:
+Run from this directory with Windows PowerShell 5.1 and Pester 3.4 (the version
+that ships with Windows). Run each file in its own `Invoke-Pester` call: the
+files define overlapping command stubs, so one multi-file run does not isolate
+them.
 
 ```powershell
-Invoke-Pester -Script .\connect.Tests.ps1, .\connect.Vip.Tests.ps1, .\connect.Hardening.Tests.ps1, .\disconnect.Tests.ps1 -EnableExit
+$failed = 0
+foreach ($file in 'connect.Tests.ps1', 'connect.Vip.Tests.ps1', 'connect.Hardening.Tests.ps1', 'disconnect.Tests.ps1') {
+    $failed += (Invoke-Pester -Script ".\$file" -PassThru).FailedCount
+}
+if ($failed) { throw "$failed Pester test(s) failed" }
 ```
 
 Tests mock Azure, IMDS, DNS and native commands, including a
