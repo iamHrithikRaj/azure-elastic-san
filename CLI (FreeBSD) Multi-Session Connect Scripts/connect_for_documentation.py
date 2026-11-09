@@ -109,14 +109,16 @@ NICKNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 MULTIPATH_NOTICE = (
     "Multipath: each iSCSI session exposes its own disk device; this script does not assemble "
     "multipath devices. Use the host's multipath layer (gmultipath(8) or the initiator's "
-    "multipath support) before using the volumes."
+    "multipath support) before using the volumes. Total sessions per volume must not exceed "
+    "what the initiator allows to one target portal: the service can redirect sessions onto "
+    "the same portal."
 )
 # The kernel rejects a session whose target name and address text both match an existing one
 # unless the initiator permits it, so a second session to one portal is where support shows.
 SAME_PORTAL_REJECTED_HINT = (
-    "The initiator rejected another session to the same target portal; stock FreeBSD allows one "
-    "session per target and portal. Re-run with a --num-of-sessions value the initiator "
-    "supports, or with --enable-vip-distribution."
+    "Total sessions per volume must not exceed what the initiator allows to one target portal, "
+    "because the service can redirect sessions onto the same portal. Stock FreeBSD: -s 1; "
+    "initiators that allow K sessions to one target portal: -s K."
 )
 
 
@@ -1432,22 +1434,69 @@ def plan_is_already_connected(plan, sessions):
 
 
 def add_sessions_for_volume(plan, config_path):
-    """Add every planned session, then wait until all of them are Connected."""
-    added_addresses = set()
+    """Keep accepted, Connected sessions persistent, even when the initiator rejects the rest."""
+    added = []
+    add_error = None
     for nickname, address in zip(plan.nicknames, plan.session_addresses):
         try:
             add_iscsi_session(nickname, config_path)
         except ElasticSanConnectError as error:
-            if address in added_addresses:
-                raise ElasticSanConnectError("{} {}".format(error, SAME_PORTAL_REJECTED_HINT))
-            raise
-        added_addresses.add(address)
-    wait_for_connected_session(plan.target_name, expected_count=len(plan.nicknames))
-    print(
-        "{} [{}]: Connected {} session(s)".format(
-            plan.volume_name, plan.target_name, len(plan.nicknames)
+            add_error = error
+            print("{}: {} {}".format(plan.volume_name, error, SAME_PORTAL_REJECTED_HINT))
+            break
+        added.append(nickname)
+    if not added:
+        raise add_error
+    cleanup_error = None
+    kept = list(added)
+    try:
+        wait_for_connected_session(plan.target_name, expected_count=len(added))
+        connected_count = len(added)
+    except ElasticSanConnectError as error:
+        try:
+            matching = sessions_for_target(list_iscsi_sessions(), plan.target_name)
+        except ElasticSanConnectError as inventory_error:
+            return added, str(inventory_error)
+        connected_count = sum(session_is_connected(item) for item in matching)
+        addresses = dict(zip(plan.nicknames, plan.session_addresses))
+        # Native removal matches target+address, not nickname: never remove a shared healthy tuple.
+        groups = {}
+        for nickname in added:
+            groups.setdefault(addresses[nickname], []).append(nickname)
+        safe = len(matching) == len(added) and all(
+            len([item for item in matching if item.get("Target portal") == address]) == len(nicknames)
+            and len({session_is_connected(item) for item in matching
+                     if item.get("Target portal") == address}) == 1
+            for address, nicknames in groups.items()
         )
-    )
+        if not safe:
+            cleanup_error = (
+                "{}; cannot safely remove non-Connected sessions by nickname: removal matches "
+                "every session at the configured target and portal. Entries are retained; "
+                "quiesce I/O and use the disconnect script before retrying.".format(error)
+            )
+        else:
+            kept = []
+            for address, nicknames in groups.items():
+                if any(session_is_connected(item) for item in matching
+                       if item.get("Target portal") == address):
+                    kept.extend(nicknames)
+                else:
+                    try:
+                        _run_command(["iscsictl", "-R", "-n", nicknames[0], "-c", config_path],
+                                     "iscsictl remove non-Connected sessions", ISCSICTL_COMMAND_TIMEOUT_SECONDS)
+                    except ElasticSanConnectError as removal_error:
+                        cleanup_error = str(removal_error)
+                        kept.extend(nicknames)
+    if connected_count < len(plan.nicknames):
+        print(
+            "{}: {} of {} sessions connected. The initiator accepted {} session(s) to one target "
+            "portal; re-run with -s {} (or the limit your initiator supports) to request that many.".format(
+                plan.volume_name, connected_count, len(plan.nicknames), connected_count, connected_count)
+        )
+    else:
+        print("{} [{}]: Connected {} session(s)".format(plan.volume_name, plan.target_name, connected_count))
+    return kept, cleanup_error
 
 
 def execute_connection_plan(plans, config_path, number_of_sessions):
@@ -1474,26 +1523,39 @@ def execute_connection_plan(plans, config_path, number_of_sessions):
         ]
         if not plans_to_connect:
             return
-        new_managed_block = render_full_managed_block(plans_to_connect)
-        new_content = compute_new_config_content(existing_content_bytes, new_managed_block)
-
+        compute_new_config_content(existing_content_bytes, render_full_managed_block(plans_to_connect))
         backup_path = backup_config(config_path, existing_content_bytes, existed)
-        write_config_atomically(config_path, new_content, original_stat)
-
-        try:
-            for plan in plans_to_connect:
-                add_sessions_for_volume(plan, config_path)
-        except (ElasticSanConnectError, OSError) as error:
-            restore_config_from_backup(config_path, backup_path, existed, original_stat)
-            raise ElasticSanConnectError(
-                "Failed while establishing iSCSI sessions; restored {} to its pre-run state. "
-                "This rollback only restores the config file: iscsictl add requests may already "
-                "have created or may still create live sessions, and this script never removes "
-                "sessions. Inspect 'iscsictl -L -v', and run disconnect_for_documentation.py for "
-                "the affected volumes before retrying. Original error: {}".format(
-                    config_path, error
+        current_content, current_existed = existing_content_bytes, existed
+        incomplete = False
+        for plan in plans_to_connect:
+            new_content = compute_new_config_content(current_content, render_full_managed_block([plan]))
+            write_config_atomically(config_path, new_content, original_stat)
+            try:
+                kept, cleanup_error = add_sessions_for_volume(plan, config_path)
+                if not kept and not cleanup_error:
+                    raise ElasticSanConnectError("No sessions connected for '{}'".format(plan.volume_name))
+            except (ElasticSanConnectError, OSError) as error:
+                if current_content == existing_content_bytes:
+                    restore_config_from_backup(config_path, backup_path, existed, original_stat)
+                elif current_existed:
+                    write_config_atomically(config_path, current_content, original_stat)
+                else:
+                    os.remove(config_path)
+                raise ElasticSanConnectError(
+                    "Failed while establishing iSCSI sessions; restored {} to its state before "
+                    "this volume. Inspect 'iscsictl -L -v' before retrying. Original error: {}".format(
+                        config_path, error)
                 )
-            )
+            if len(kept) != len(plan.nicknames):
+                new_content = compute_new_config_content(
+                    current_content, render_managed_block([entry for entry in plan.entries() if entry.nickname in kept]))
+                write_config_atomically(config_path, new_content, original_stat)
+                incomplete = True
+            current_content, current_existed = new_content, True
+            if cleanup_error:
+                raise ElasticSanConnectError(cleanup_error)
+        if incomplete:
+            raise ElasticSanConnectError("Fewer sessions connected than requested; Connected sessions and their entries were retained")
     finally:
         release_config_transaction_lock(lock_fd)
 

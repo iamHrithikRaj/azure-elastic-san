@@ -1106,18 +1106,18 @@ class AddSessionsForVolumeTests(unittest.TestCase):
             "add_iscsi_session",
             side_effect=[None, connect.ElasticSanConnectError("ISCSISADD: Device busy")],
         ):
-            with self.assertRaisesRegex(
-                connect.ElasticSanConnectError,
-                "Device busy The initiator rejected another session to the same target portal",
-            ):
-                connect.add_sessions_for_volume(plan, "/etc/iscsi.conf")
+            with mock.patch.object(connect, "wait_for_connected_session"), contextlib.redirect_stdout(io.StringIO()) as output:
+                kept, error = connect.add_sessions_for_volume(plan, "/etc/iscsi.conf")
+            self.assertEqual(kept, plan.nicknames[:1])
+            self.assertIsNone(error)
+            self.assertIn("service can redirect sessions onto the same portal", output.getvalue())
 
     def test_first_submission_error_is_preserved_without_hint(self):
         plan = self._plan(["10.0.0.1:3260", "10.0.0.2:3260"])
         with mock.patch.object(
             connect,
             "add_iscsi_session",
-            side_effect=[None, connect.ElasticSanConnectError("kernel rejected request")],
+            side_effect=connect.ElasticSanConnectError("kernel rejected request"),
         ):
             with self.assertRaisesRegex(
                 connect.ElasticSanConnectError, "^kernel rejected request$"
@@ -1280,8 +1280,8 @@ class ExactCommandArgvTests(unittest.TestCase):
         # Look for the actual argv-construction pattern, not the prose
         # description of the constraint that legitimately appears in the
         # module docstring.
-        self.assertNotIn('"iscsictl", "-R"', source)
-        self.assertNotIn("'iscsictl', '-R'", source)
+        self.assertNotIn('"iscsictl", "-R", "-a"', source)
+        self.assertNotIn("'iscsictl', '-R', '-a'", source)
 
 
 class GetVolumeStorageTargetTests(unittest.TestCase):
@@ -1742,6 +1742,7 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
                 first_in_session_setup.set()
                 if not allow_first_to_finish.wait(5):
                     raise AssertionError("test timed out waiting to release first transaction")
+            return plan.nicknames, None
 
         def execute(plan):
             try:
