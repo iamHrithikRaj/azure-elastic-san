@@ -1779,7 +1779,7 @@ def execute_connection_plan(plans, config_path, number_of_sessions):
                     "state before this volume, which removes only that volume's entries.{} This "
                     "rollback only restores the config file: iscsictl add requests may already "
                     "have created or may still create live sessions, and this script never "
-                    "removes sessions. Inspect 'iscsictl -L -v' and run "
+                    "removes pre-existing sessions. Inspect 'iscsictl -L -v' and run "
                     "disconnect_for_documentation.py for '{}' before retrying. Original "
                     "error: {}".format(
                         plan.volume_name, config_path, earlier, plan.volume_name, error
@@ -1908,7 +1908,7 @@ def _validate_volume(report, plan, connected_this_run, sessions, managed_entries
         if not_connected:
             detail += "; not Connected: {}".format(", ".join(not_connected))
         if connected_count > requested:
-            detail += "; this script never removes sessions"
+            detail += "; this script never removes sessions that were already present"
         report.add(status, prefix + " live sessions", detail)
 
         if matching_sessions:

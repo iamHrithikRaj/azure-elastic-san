@@ -2258,7 +2258,7 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(0, failed)
         self.assertIn(
             "[WARN] vol1 [iqn.example:vol1] live sessions: 2 Connected, requested 1; this script "
-            "never removes sessions",
+            "never removes sessions that were already present",
             lines,
         )
 

@@ -9,16 +9,16 @@ from test_connect_for_documentation import connect, RecordingFcntl
 
 
 class PartialConnectionTests(unittest.TestCase):
-    def run_plan(self, addresses, states, reject_at=None):
+    def run_plan(self, addresses, states, reject_at=None, preexisting_entries=False):
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         path = Path(stack.enter_context(tempfile.TemporaryDirectory()), "iscsi.conf")
         original = b"# operator-owned bytes\n"
-        path.write_bytes(original)
         plan = connect.VolumeConnectionPlan(
             "volume", "iqn.test:volume", addresses[0],
             ["esan-volume-s{}".format(i + 1) for i in range(len(addresses))], addresses,
         )
+        path.write_bytes(original + (connect.render_full_managed_block([plan]) if preexisting_entries else b""))
         live = []
         commands = []
 
@@ -71,6 +71,20 @@ class PartialConnectionTests(unittest.TestCase):
         self.assertEqual([entry.nickname for entry in connect.read_managed_entries(path.read_bytes())],
                          plan.nicknames[:1])
         self.assertIn(["iscsictl", "-R", "-n", plan.nicknames[1], "-c", str(path)], commands)
+
+    def test_zero_connected_removes_this_runs_pending_sessions_and_restores_config(self):
+        _plan, path, live, _commands, _output, error = self.run_plan(
+            ["host:3260"] * 2, ["Connecting"] * 2)
+        self.assertEqual(live, [])
+        self.assertEqual(path.read_bytes(), b"# operator-owned bytes\n")
+        self.assertIsNotNone(error)
+
+    def test_partial_connection_never_removes_entries_that_existed_before_the_run(self):
+        plan, path, live, _commands, _output, _error = self.run_plan(
+            ["host:3260"] * 2, ["Connected"] * 2, reject_at=1, preexisting_entries=True)
+        self.assertEqual(len(live), 1)
+        self.assertEqual([entry.nickname for entry in connect.read_managed_entries(path.read_bytes())],
+                         plan.nicknames)
 
     def test_shared_portal_cleanup_fails_closed_instead_of_removing_connected_sessions(self):
         plan, path, live, commands, _output, error = self.run_plan(
