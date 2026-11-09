@@ -24,6 +24,27 @@ def completed_process(stdout="", stderr="", returncode=0):
 
 
 class DisconnectTests(unittest.TestCase):
+    def test_import_needs_no_package_manager(self):
+        module = importlib.util.module_from_spec(SPEC)
+        with mock.patch("os.path.exists", return_value=False), mock.patch("subprocess.Popen") as run:
+            SPEC.loader.exec_module(module)
+        run.assert_not_called()
+
+    def test_azure_cli_on_path_needs_no_package_record(self):
+        with mock.patch("shutil.which", return_value="/opt/azure/bin/az") as which:
+            with mock.patch.object(disconnect.subprocess, "Popen") as run:
+                disconnect.check_azcli()
+        which.assert_called_once_with("az")
+        run.assert_not_called()
+
+    def test_case_insensitive_identity_preserves_original_command_target(self):
+        target = ZONAL_IQN.upper()
+        commands, _ = self.run_disconnect(
+            "10.0.0.1:3260,-1 " + target,
+            "tcp: [1] 10.0.0.1:3260,-1 " + target,
+        )
+        self.assert_target_cleanup(commands, [target])
+
     def run_disconnect(self, nodes="", sessions="", results=None):
         processes = [
             nodes if not isinstance(nodes, str) else completed_process(nodes),
