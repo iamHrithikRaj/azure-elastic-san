@@ -35,6 +35,10 @@ to each of the first `count % N` addresses: 32 over three gives 11/11/10; over t
 16/16. Zero-share addresses are only tried as single-session fallbacks if every
 positive-share portal fails to log in.
 
+With multiple addresses, VIP mode saves literal IP portals. If the SAN's VIPs
+change (account migration), saved IP portals stop working. Quiesce I/O and unmount
+the volumes, run disconnect, then connect again to save the current VIPs.
+
 Client pinning spreads **original saved portals**, not final session placement.
 It complements the front end's ISID-hash redirect: the front end may redirect
 any login, and this script neither controls nor verifies the resulting placement.

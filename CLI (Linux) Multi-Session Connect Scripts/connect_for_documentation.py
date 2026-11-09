@@ -536,20 +536,12 @@ def check_azcli():
 # get iqn info from the ElasticSAN
 def get_iqns(elastic_san_subscription, resource_group_name, elastic_san_name, volume_group_name, volume_name):
     check_azcli()
-    subscription_argument = " --subscription "+elastic_san_subscription if elastic_san_subscription is not None else ""
-    command = "az elastic-san volume show -g {} -e {} -v {} -n {} --query storageTarget{}".format(resource_group_name, elastic_san_name, volume_group_name, volume_name, subscription_argument).split(' ')
-    p = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    # timeout in case the extension is not installed and prompts the user to install
-    timeout = 10
-    while p.poll() is None and timeout > 0:
-     time.sleep(1)
-     timeout -= 1
-    if timeout<=0:
-        raise Exception('Command took longer than 10s')
-    out, err = p.communicate()
-    if "error" in err.decode("utf-8").lower():
-        raise Exception(err)
-    out = out.decode("utf-8")
+    command = ["az", "elastic-san", "volume", "show", "-g", resource_group_name,
+               "-e", elastic_san_name, "-v", volume_group_name, "-n", volume_name,
+               "--query", "storageTarget"]
+    if elastic_san_subscription is not None:
+        command.extend(["--subscription", elastic_san_subscription])
+    out = _run_az_command(command, "Elastic SAN volume lookup")
     storage_target = json.loads(out)
     target_iqn = storage_target["targetIqn"]
     target_portal_hostname = storage_target["targetPortalHostname"]
@@ -976,15 +968,14 @@ def _iscsiadm(arguments, allow_empty=False):
     )
     out, err = process.communicate()
     out, err = _decode_output(out), _decode_output(err).strip()
-    if allow_empty and process.returncode == 21 and (out + "\n" + err).strip() in (
-        "No active sessions.", "iscsiadm: No active sessions.",
-        "No records found", "iscsiadm: No records found",
-    ):
+    if allow_empty and process.returncode == 21:
         return ""
-    if process.returncode != 0 or err:
+    if process.returncode != 0:
         raise RuntimeError("iscsiadm {} failed: {}".format(
             " ".join(arguments), err or "exit code {}".format(process.returncode)
         ))
+    if err:
+        print(err, file=sys.stderr)
     return out
 
 
@@ -1137,14 +1128,16 @@ def connect_volume(volume_name, target_iqn, portals, target_portal_port, recomme
             previous = _session_ids(target_iqn) if count > 1 else set()
             _iscsiadm(node + ["--login"])
             connected = logged_in = True
-            if count > 1:
-                added = _session_ids(target_iqn) - previous
-                if len(added) != 1:
-                    raise RuntimeError("Cannot identify a single new seed SID; no clones were attempted")
-                sid = added.pop()
-                for _ in range(count - 1):
-                    _iscsiadm(["-m", "session", "-r", sid, "--op", "new"])
-            _iscsiadm(node + ["--op", "update", "-n", "node.session.nr_sessions", "-v", str(count)])
+            try:
+                if count > 1:
+                    added = _session_ids(target_iqn) - previous
+                    if len(added) != 1:
+                        raise RuntimeError("Cannot identify a single new seed SID; no clones were attempted")
+                    sid = added.pop()
+                    for _ in range(count - 1):
+                        _iscsiadm(["-m", "session", "-r", sid, "--op", "new"])
+            finally:
+                _iscsiadm(node + ["--op", "update", "-n", "node.session.nr_sessions", "-v", str(count)])
         except (OSError, RuntimeError) as error:
             print("Warning: {} [{}], portal {}:{}: {}. Partial state may remain.".format(
                 volume_name, target_iqn, portal, target_portal_port, error

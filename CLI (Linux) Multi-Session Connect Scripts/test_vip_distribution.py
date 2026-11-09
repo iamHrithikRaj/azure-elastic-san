@@ -259,6 +259,13 @@ class VipConnectionTests(unittest.TestCase):
         self.assertEqual(3, len(self.native.sessions))
         self.assertIn("clone failed", self.stderr.getvalue())
 
+    def test_clone_failure_preserves_requested_count_for_reboot(self):
+        self.native.fail_clones = True
+        self.run_connect()
+        self.assertEqual(["11", "11", "10"], [
+            self.native.nodes[(IQN, host)]["node.session.nr_sessions"] for host in VIPS
+        ])
+
     def test_missing_seed_sid_is_not_guessed_from_a_redirected_endpoint(self):
         self.native.hide_sessions = True
         self.run_connect()
@@ -282,6 +289,23 @@ class VipConnectionTests(unittest.TestCase):
                     self.run_connect(count=count)
         self.legacy.assert_not_called()
         self.popen.assert_not_called()
+
+
+class NativeStatusTests(unittest.TestCase):
+    def test_no_objects_exit_code_is_independent_of_diagnostic_text(self):
+        for diagnostic in ("No records found.", "Keine Datensätze gefunden", ""):
+            process = mock.Mock(returncode=21)
+            process.communicate.return_value = (b"", diagnostic.encode())
+            with self.subTest(diagnostic=diagnostic), mock.patch.object(connect.subprocess, "Popen", return_value=process):
+                self.assertEqual("", connect._iscsiadm(["-m", "node"], allow_empty=True))
+
+    def test_successful_command_retains_stderr_as_diagnostic(self):
+        process = mock.Mock(returncode=0)
+        process.communicate.return_value = (b"native output", b"iscsiadm: warning")
+        with mock.patch.object(connect.subprocess, "Popen", return_value=process):
+            with mock.patch.object(connect.sys, "stderr", new_callable=io.StringIO) as diagnostic:
+                self.assertEqual("native output", connect._iscsiadm(["-m", "node"]))
+        self.assertIn("iscsiadm: warning", diagnostic.getvalue())
 
 
 class ArgumentTests(unittest.TestCase):
