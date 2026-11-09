@@ -477,7 +477,7 @@ def _validate_volume(report, outcome, state, details, paths, requested, apply_re
         digest_status = problem if wrong else "WARN" if live and (not negotiated or any(
             value.upper() != "CRC32C/CRC32C" for value in negotiated)) else "PASS"
         report.add(digest_status, label + "digests", "{}; negotiated header/data: {}".format(
-            "not CRC32C for " + ", ".join(wrong) if wrong else "CRC32C in the node records",
+            "not CRC32C for " + ", ".join(wrong) if wrong else "CRC32C in the node records" if state.records else "no node records",
             ", ".join(negotiated) or "none"))
         if apply_recommended and state.records:
             wrong = [portal for _, portal, settings in state.records

@@ -702,6 +702,13 @@ class FailureAndValidationTests(HardeningTestCase):
             self.run_main()
         self.assertIn("[WARN] volume1 [{}] digests: ".format(iqn("volume1")), self.stdout)
 
+    def test_live_only_digest_warning_does_not_claim_node_records(self):
+        for _ in range(4):
+            self.host.add_session(iqn("volume1"))
+        self.host.negotiated_data_digest = "None"
+        self.run_main()
+        self.assertIn("[WARN] volume1 [{}] digests: no node records;".format(iqn("volume1")), self.stdout)
+
 
 class MultipathTests(HardeningTestCase):
     def test_delayed_disks_are_registered_within_the_readiness_wait(self):
