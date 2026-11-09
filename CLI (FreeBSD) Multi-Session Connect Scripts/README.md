@@ -244,16 +244,13 @@ permissions regardless of the original file's mode, since preserved unrelated
 stanzas may contain CHAP secrets). The backup is **not** deleted automatically;
 it's left behind for manual recovery.
 
-If starting/configuring the requested sessions then fails partway through,
-the script restores `/etc/iscsi.conf` from that backup (or deletes the file
-entirely if it did not exist before this run) before re-raising the error.
-This only ever rolls back the **config file** -- it never disconnects or
-removes any iSCSI session. After `iscsictl -A` has been submitted, a session
-may already be live or may become live after a timeout even though the config
-file was restored. Always inspect `iscsictl -L -v` before retrying a failed run.
-Service enablement/start is not rolled back either. Input preflight is not an
-all-volume transaction: if connecting a later volume fails, earlier volumes
-may remain connected.
+Each volume is a config transaction. Connected sessions and their entries stay
+when later adds fail; safely identifiable unconnected sessions added this run
+are removed (see "Session count"). If none connect, that volume's pre-run config
+is restored, preserving earlier volumes. The backup remains the exact pre-run
+file. Ambiguous cleanup retains entries and stops rather than risk removing a
+healthy session. Always inspect `iscsictl -L -v` before retrying a failed run.
+Service enablement/start is not rolled back.
 
 ## Idempotency and reruns
 
@@ -281,8 +278,8 @@ changes the portal shown by FreeBSD.
 * The script then submits `iscsictl -A -n <nickname> -c /etc/iscsi.conf`
   (without `-w`) for each session in order, and polls `iscsictl -L -v` for up
   to 30 seconds until that target IQN has that many `Connected` sessions.
-  Unrelated disconnected sessions are ignored. A timeout is explicit and does
-  not remove or roll back sessions that may already have been created.
+  Unrelated disconnected sessions are ignored. On timeout, the partial-connection
+  cleanup rule in "Session count" applies.
 
 ## `iscsid` service management
 
