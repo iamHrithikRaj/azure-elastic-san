@@ -429,6 +429,8 @@ function Get-EsanMultipathIOState([string]$Edition) {
     if ($Edition -eq 'Server') {
         $feature = Get-WindowsFeature -Name Multipath-IO -ErrorAction Stop
         if ($null -eq $feature) { return 'Unavailable' }
+        if ("$($feature.InstallState)" -eq 'InstallPending' -or
+            (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending' -ErrorAction Stop)) { return 'RestartPending' }
         if ("$($feature.InstallState)" -eq 'Installed') { return 'Installed' }
         return 'NotInstalled'
     }
@@ -439,12 +441,14 @@ function Get-EsanMultipathIOState([string]$Edition) {
         return 'Unavailable'
     }
     if ($null -eq $feature) { return 'Unavailable' }
+    if ("$($feature.State)" -eq 'EnablePending') { return 'RestartPending' }
     if ("$($feature.State)" -eq 'Enabled') { return 'Installed' }
     'NotInstalled'
 }
 
 function Install-EsanMultipathIO([string]$Edition, [int]$SessionCount) {
     $state = Get-EsanMultipathIOState -Edition $Edition
+    if ($state -eq 'RestartPending') { return [pscustomobject]@{ Available = $true; RestartNeeded = $true } }
     if ($state -eq 'Unavailable') {
         if ($SessionCount -gt 1) {
             throw "Multipath I/O isn't available on this Windows edition, and $SessionCount sessions per volume need it. Use Windows Server, or re-run this script with -NumSession 1. No sessions were added."
@@ -481,6 +485,7 @@ function Enable-EsanMsdsmIscsiClaim {
         throw "MSDSM still doesn't claim iSCSI disks after Enable-MSDSMAutomaticClaim -BusType iSCSI. No sessions were added, because multiple sessions to a volume that MSDSM doesn't claim show up as duplicate disks."
     }
     Write-Host 'Enabled MSDSM automatic claiming of iSCSI disks.' -ForegroundColor Cyan
+    'MSDSM iSCSI automatic claim'
 }
 
 function Get-EsanIscsiRegistryRecommendation {
@@ -589,8 +594,12 @@ function Get-EsanConnectionPlan($Volumes) {
     })
     $inventory = Get-EsanIscsiInventory
     $plan = @(foreach ($volume in $Volumes) {
-        $live = @($inventory.Sessions | Where-Object { $_.TargetNodeAddress -ieq $volume.TargetIQN }).Count
-        $persistent = @($inventory.PersistentLogins | Where-Object { $_.TargetName -ieq $volume.TargetIQN }).Count
+        $live = @($inventory.Sessions | Where-Object {
+            $_.TargetNodeAddress -ieq $volume.TargetIQN -or ([string]$_.TargetNodeAddress).StartsWith($volume.TargetIQN + ':az-', [StringComparison]::OrdinalIgnoreCase)
+        }).Count
+        $persistent = @($inventory.PersistentLogins | Where-Object {
+            $_.TargetName -ieq $volume.TargetIQN -or ([string]$_.TargetName).StartsWith($volume.TargetIQN + ':az-', [StringComparison]::OrdinalIgnoreCase)
+        }).Count
         $action = 'Skip'
         $warning = $null
         if ($live -eq 0 -and $persistent -eq 0) {
@@ -643,7 +652,7 @@ function Get-EsanCountStatus([int]$Actual, [int]$Requested, [string]$Shortfall) 
     $Shortfall
 }
 
-function Test-EsanConnection($Plan, [string]$Edition, [int]$SessionCount, [bool]$CheckRecommendedSettings) {
+function Test-EsanConnection($Plan, [string]$Edition, [int]$SessionCount, [bool]$CheckRecommendedSettings, [bool]$ClaimChanged) {
     # Read-only. Re-reads the machine state instead of trusting what earlier steps reported.
     $pending = New-Object System.Collections.Generic.List[string]
     $results = @(
@@ -661,8 +670,12 @@ function Test-EsanConnection($Plan, [string]$Edition, [int]$SessionCount, [bool]
             New-EsanCheck 'FAIL' 'Multipath I/O' "$mpioState; required for $SessionCount sessions per volume"
         }
         if ($mpioInstalled) {
-            $status = if (Test-EsanMsdsmIscsiClaim) { 'PASS' } else { 'FAIL' }
-            New-EsanCheck $status 'MSDSM iSCSI claim' "automatic claiming of iSCSI disks is $(if ($status -eq 'PASS') { 'enabled' } else { 'disabled' })"
+            if ($ClaimChanged) {
+                New-EsanCheck 'WARN' 'MSDSM iSCSI claim' 'automatic claiming was enabled this run; applies after reboot'
+            } else {
+                $status = if (Test-EsanMsdsmIscsiClaim) { 'PASS' } else { 'FAIL' }
+                New-EsanCheck $status 'MSDSM iSCSI claim' "automatic claiming of iSCSI disks is $(if ($status -eq 'PASS') { 'enabled' } else { 'disabled' })"
+            }
         }
 
         if ($CheckRecommendedSettings) {
@@ -742,14 +755,12 @@ function Initialize-EsanHost([string]$Edition, [int]$SessionCount, [switch]$Skip
     Install-EsanIscsiService
     $mpio = Install-EsanMultipathIO -Edition $Edition -SessionCount $SessionCount
     $mpioActive = $mpio.Available -and -not $mpio.RestartNeeded
-    if ($mpioActive) { Enable-EsanMsdsmIscsiClaim }
-
-    $rebootChanges = @()
+    $rebootChanges = @(if ($mpioActive) { Enable-EsanMsdsmIscsiClaim })
     if (-not $SkipRecommendedSettings) {
-        $rebootChanges = @(Set-EsanRecommendedSettings -MpioActive $mpioActive)
+        $rebootChanges += @(Set-EsanRecommendedSettings -MpioActive $mpioActive)
     }
     if ($mpio.RestartNeeded) {
-        # The feature cmdlet's RestartNeeded is the only signal that blocks connecting.
+        # A pending feature installation must keep blocking on subsequent runs too.
         throw 'Windows needs a restart to finish enabling Multipath I/O. No sessions were added, because sessions added before MPIO is active show up as duplicate disks. Reboot the VM, then re-run this script to finish MSDSM claiming, the MPIO settings and the connections.'
     }
     $rebootChanges
@@ -757,7 +768,7 @@ function Initialize-EsanHost([string]$Edition, [int]$SessionCount, [switch]$Skip
 
 function Complete-EsanConnection($Plan, [string]$Edition, [int]$SessionCount, [switch]$SkipRecommendedSettings, [string[]]$RebootChanges, [switch]$SessionRebootAnnounced) {
     # Validation, reboot notice and the final error, shared by every connect mode.
-    $validation = Test-EsanConnection -Plan $Plan -Edition $Edition -SessionCount $SessionCount -CheckRecommendedSettings (-not $SkipRecommendedSettings)
+    $validation = Test-EsanConnection -Plan $Plan -Edition $Edition -SessionCount $SessionCount -CheckRecommendedSettings (-not $SkipRecommendedSettings) -ClaimChanged ($RebootChanges -contains 'MSDSM iSCSI automatic claim')
     $reasons = @()
     if ($RebootChanges.Count -gt 0) {
         $reasons += "changed $($RebootChanges -join ', '), which take effect only after the VM restarts"

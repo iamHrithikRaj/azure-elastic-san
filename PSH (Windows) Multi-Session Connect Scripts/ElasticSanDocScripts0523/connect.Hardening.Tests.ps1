@@ -70,6 +70,7 @@ function Reset-TestHost {
     $script:service = [pscustomobject]@{ Status = 'Running'; StartType = 'Automatic' }
     $script:serviceStarts = $true
     $script:serverFeature = 'Installed'
+    $script:pendingReboot = $false
     $script:serverRestart = 'No'
     $script:clientFeature = 'Enabled'
     $script:clientFeatureThrows = $false
@@ -200,6 +201,7 @@ Describe 'Hardened default flow' {
         Mock Set-Service { $script:service.StartType = $StartupType }
         Mock Start-Service { if ($script:serviceStarts) { $script:service.Status = 'Running' } }
         Mock Get-WindowsFeature { [pscustomobject]@{ Name = 'Multipath-IO'; InstallState = $script:serverFeature } }
+        Mock Test-Path { $script:pendingReboot } -ParameterFilter { $LiteralPath -eq 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending' }
         Mock Install-WindowsFeature {
             $script:serverFeature = if ($script:serverRestart -eq 'No') { 'Installed' } else { 'InstallPending' }
             [pscustomobject]@{ Success = $true; RestartNeeded = $script:serverRestart; ExitCode = 'Success' }
@@ -225,6 +227,27 @@ Describe 'Hardened default flow' {
     }
 
     Context 'Preconditions' {
+        It 'keeps the reboot gate on a rerun with pending Server MPIO installation' {
+            foreach ($state in 'InstallPending', 'Installed') {
+                Reset-TestHost
+                $script:serverFeature = $state
+                $script:pendingReboot = $state -eq 'Installed'
+                { Invoke-TestConnect } | Should Throw 'Reboot the VM, then re-run this script'
+                $script:nativeCalls.Count | Should Be 0
+            }
+            Assert-MockCalled Install-WindowsFeature -Times 0 -Exactly -Scope It
+            Assert-MockCalled Enable-MSDSMAutomaticClaim -Times 0 -Exactly -Scope It
+            Assert-MockCalled Get-IscsiSession -Times 0 -Exactly -Scope It
+        }
+
+        It 'announces a reboot and warns that claiming applies after reboot when enabled this run' {
+            $script:claim = $false
+            Invoke-TestConnect -SkipRecommendedSettings
+            Get-TestOutput | Should Match '\[WARN\] MSDSM iSCSI claim: .*applies after reboot'
+            Get-TestOutput | Should Not Match '\[PASS\] MSDSM iSCSI claim:'
+            $script:hostLines[-1] | Should Match '^Reboot required: changed MSDSM iSCSI automatic claim,'
+        }
+
         It 'stops before any Azure or host call when the session is not elevated' {
             $script:elevated = $false
             { Invoke-TestConnect } | Should Throw 'elevated PowerShell session'
@@ -376,6 +399,22 @@ Describe 'Hardened default flow' {
     }
 
     Context 'Existing sessions and persistent logins' {
+        It 'skips a default-mode volume with any decorated live or persistent login without matching adjacent IQNs' {
+            $script:volumes = @(
+                New-TestVolume 'live' 'iqn.test:live' 2
+                New-TestVolume 'saved' 'iqn.test:saved' 2
+                New-TestVolume 'new' 'iqn.test:new' 2
+            )
+            Add-TestState 'IQN.TEST:LIVE:AZ-EASTUS-AZ1' 1 0
+            Add-TestState 'IQN.TEST:SAVED:AZ-EASTUS-AZ2' 0 1
+            Add-TestState 'iqn.test:new2:az-eastus-az3' 1 1
+            Invoke-TestConnect
+            @(Get-TestLogins).Count | Should Be 2
+            @(Get-TestLogins | Where-Object { $_[1] -ne 'iqn.test:new' }).Count | Should Be 0
+            Get-TestOutput | Should Match 'live \[iqn.test:live\]: Skipped: already connected'
+            Get-TestOutput | Should Match 'saved \[iqn.test:saved\]: Skipped: persistent configuration exists'
+        }
+
         It 'connects only volumes without sessions or persistent logins and explains every skip' {
             $script:volumes = @(
                 New-TestVolume 'v-new' 'iqn.test:v-new' 4

@@ -30,7 +30,13 @@ iSCSI disks. Unless `-SkipRecommendedSettings` is set, it also applies the
 [recommended client settings](https://learn.microsoft.com/azure/storage/elastic-san/elastic-san-best-practices)
 (round robin, 30-second MPIO disk timeout, iSCSI initiator registry values),
 changing only values that differ. If enabling MPIO needs a restart, the script
-stops before any iSCSI change; reboot and re-run it.
+stops before any iSCSI change; reboot and re-run it. A pending feature install
+or Component-Based Servicing reboot keeps that gate closed on a rerun, even
+when the Server feature already reports `Installed`.
+
+Enabling MSDSM automatic iSCSI claiming also records a reboot reason.
+Validation warns that claiming applies after reboot when enabled in this run;
+the global setting alone is not evidence that existing disks have been claimed.
 
 After connecting, a read-only validation prints `[PASS]`, `[WARN]` or `[FAIL]`
 per check, then `Validation: N passed, N warnings, N failed`. It checks the
@@ -67,9 +73,9 @@ alone skips existing configuration; it does not repair retired VIPs.
 
 ## Existing configuration and failures
 
-With either opt-in, any live session or persistent login for the volume's plain
-IQN or `<plain IQN>:az-*` causes a skip:
-`already configured; run disconnect.ps1 first to change the layout`.
+In every mode, any live session or persistent login for the volume's plain
+IQN or `<plain IQN>:az-*` causes a skip. Run `disconnect.ps1` first to change the
+layout.
 No layout proof, automatic repair, rebalance or disconnect is attempted.
 All selected-volume discovery and DNS checks finish before configuration
 changes. The script also stops before any change if the new logins would take
