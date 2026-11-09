@@ -557,15 +557,14 @@ def _iscsiadm(arguments, allow_empty=False):
     )
     out, err = process.communicate()
     out, err = _decode_output(out), _decode_output(err).strip()
-    if allow_empty and process.returncode == 21 and (out + "\n" + err).strip() in (
-        "No active sessions.", "iscsiadm: No active sessions.",
-        "No records found", "iscsiadm: No records found",
-    ):
+    if allow_empty and process.returncode == 21:
         return ""
-    if process.returncode != 0 or err:
+    if process.returncode != 0:
         raise RuntimeError("iscsiadm {} failed: {}".format(
             " ".join(arguments), err or "exit code {}".format(process.returncode)
         ))
+    if err:
+        print(err, file=sys.stderr)
     return out
 
 
@@ -607,14 +606,16 @@ def connect_volume(volume_name, target_iqn, portals, target_portal_port):
             previous = _session_ids(target_iqn) if count > 1 else set()
             _iscsiadm(node + ["--login"])
             connected = True
-            if count > 1:
-                added = _session_ids(target_iqn) - previous
-                if len(added) != 1:
-                    raise RuntimeError("Cannot identify a single new seed SID; no clones were attempted")
-                sid = added.pop()
-                for _ in range(count - 1):
-                    _iscsiadm(["-m", "session", "-r", sid, "--op", "new"])
-            _iscsiadm(node + ["--op", "update", "-n", "node.session.nr_sessions", "-v", str(count)])
+            try:
+                if count > 1:
+                    added = _session_ids(target_iqn) - previous
+                    if len(added) != 1:
+                        raise RuntimeError("Cannot identify a single new seed SID; no clones were attempted")
+                    sid = added.pop()
+                    for _ in range(count - 1):
+                        _iscsiadm(["-m", "session", "-r", sid, "--op", "new"])
+            finally:
+                _iscsiadm(node + ["--op", "update", "-n", "node.session.nr_sessions", "-v", str(count)])
         except (OSError, RuntimeError) as error:
             print("Warning: {} [{}], portal {}:{}: {}. Partial state may remain.".format(
                 volume_name, target_iqn, portal, target_portal_port, error
