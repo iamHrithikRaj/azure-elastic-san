@@ -32,6 +32,10 @@ class NativeIscsi:
         return sid
 
     def __call__(self, command, **kwargs):
+        if command[:2] == ["sudo", "-n"]:
+            command = ["sudo"] + command[2:]
+        elif command[:1] == ["iscsiadm"]:
+            command = ["sudo"] + command
         assert command[:2] == ["sudo", "iscsiadm"], command
         assert not kwargs.get("shell")
         self.commands.append(command)

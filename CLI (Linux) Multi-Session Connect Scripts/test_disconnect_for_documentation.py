@@ -58,7 +58,15 @@ class DisconnectTests(unittest.TestCase):
         with mock.patch.object(disconnect.subprocess, "Popen", side_effect=popen) as run:
             with mock.patch.object(disconnect.sys, "stdout", new_callable=io.StringIO) as output:
                 disconnect.disconnect_volume("volume", IQN, "portal.example", 3260)
-        return [call.args[0] for call in run.call_args_list], output.getvalue()
+        commands = []
+        for call in run.call_args_list:
+            command = call.args[0]
+            if command[:2] == ["sudo", "-n"]:
+                command = ["sudo"] + command[2:]
+            elif command[:1] == ["iscsiadm"]:
+                command = ["sudo"] + command
+            commands.append(command)
+        return commands, output.getvalue()
 
     def assert_target_cleanup(self, commands, targets):
         expected = [

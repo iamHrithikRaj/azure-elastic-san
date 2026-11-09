@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 from test_connect_for_documentation import SCRIPT_PATH, connect
+from test_disconnect_for_documentation import disconnect
 
 REAL_FIND_TOOL = connect.find_tool
 
@@ -72,11 +73,16 @@ class FakeHost(object):
         self.failed_updates = set()
         self.fail_clones = False
         self.negotiated_data_digest = "CRC32C"
+        self.negotiated_digests = {}
         self.registered = set()
         self.commands = []
+        self.raw_commands = []
 
     def __call__(self, command, **kwargs):
         assert not kwargs.get("shell")
+        self.raw_commands.append(list(command))
+        if command[:2] == ["sudo", "-n"] and command[2:] != ["true"]:
+            command = ["sudo"] + command[2:]
         self.commands.append(list(command))
         host = self
 
@@ -195,9 +201,9 @@ class FakeHost(object):
                 return 21, "", "iscsiadm: No active sessions."
             return 0, "".join(
                 "Target: {} (non-flash)\n\tPersistent Portal: {},-1\n\t\tSID: {}\n"
-                "\t\tHeaderDigest: CRC32C\n\t\tDataDigest: {}\n"
+                "\t\tHeaderDigest: {}\n\t\tDataDigest: {}\n"
                 "\t\t\tAttached scsi disk {}\t\tState: running\n".format(
-                    target, portal, sid, self.negotiated_data_digest, self.disk(sid))
+                    target, portal, sid, *self.negotiated_digests.get(sid, ("CRC32C", self.negotiated_data_digest)), self.disk(sid))
                 for sid, target, portal in self.sessions), ""
         if args == ["-m", "node"]:
             if not self.nodes:
@@ -279,6 +285,29 @@ class HardeningTestCase(unittest.TestCase):
 
 
 class PlatformTests(HardeningTestCase):
+    def test_root_without_sudo_connects_and_validates(self):
+        self.host.tools.discard("sudo")
+        with mock.patch.object(connect.os, "geteuid", create=True, return_value=0):
+            self.run_main()
+        self.assertTrue(self.host.raw_commands)
+        self.assertFalse(any(command[0] == "sudo" for command in self.host.raw_commands))
+        self.assertEqual(4, len(self.host.sessions))
+
+    def test_non_root_native_commands_use_noninteractive_sudo(self):
+        self.run_main()
+        elevated = [command for command in self.host.raw_commands if command[0] == "sudo"]
+        self.assertTrue(elevated)
+        self.assertTrue(all(command[:2] == ["sudo", "-n"] for command in elevated))
+
+    def test_disconnect_uses_root_or_noninteractive_prefix(self):
+        for euid, prefix in ((0, []), (1000, ["sudo", "-n"])):
+            with self.subTest(euid=euid), mock.patch.object(disconnect.os, "geteuid", create=True, return_value=euid):
+                process = mock.Mock(returncode=0)
+                process.communicate.return_value = (b"", b"")
+                with mock.patch.object(disconnect.subprocess, "Popen", return_value=process) as run:
+                    disconnect.run_iscsiadm(["-m", "node"])
+                self.assertEqual(prefix + ["iscsiadm", "-m", "node"], run.call_args.args[0])
+
     def test_missing_privileges_stop_before_any_other_command(self):
         self.host.sudo_allowed = False
         with self.assertRaisesRegex(connect.ConnectScriptError, "passwordless sudo"):
@@ -427,7 +456,7 @@ class ConnectFlowTests(HardeningTestCase):
         first_inventory = self.host.index(lambda c: c[1:] == ["iscsiadm", "-m", "session"])
         first_change = self.host.index(lambda c: c[-2:] == ["--op", "new"])
         registration = self.host.index(lambda c: c[1:3] == ["multipath", "-a"])
-        validation = self.host.index(lambda c: c[1:2] == ["is-active"])
+        validation = self.host.index(lambda c: c[1:4] == ["multipathd", "show", "paths"])
         self.assertEqual(["volume1", "volume2"], self.lookups)
         self.assertLess(first_enable, drop_in)
         self.assertLess(drop_in, first_inventory)
@@ -649,14 +678,58 @@ class FailureAndValidationTests(HardeningTestCase):
         )
         self.assertIn("Validation: 10 passed, 0 warnings, 0 failed", self.stdout)
 
-    def test_digests_are_validated_from_the_node_record(self):
+    def test_non_crc32c_negotiation_warns_despite_correct_node_records(self):
         self.host.negotiated_data_digest = "None"
         self.run_main()
-        self.assertIn("[PASS] volume1 [{}] digests: CRC32C in the node records; negotiated header/data: "
+        self.assertIn("[WARN] volume1 [{}] digests: CRC32C in the node records; negotiated header/data: "
                       "CRC32C/None".format(iqn("volume1")), self.stdout)
+
+    def test_one_session_with_a_different_header_digest_warns(self):
+        self.host.negotiated_digests["2"] = ("None", "CRC32C")
+        self.run_main()
+        self.assertIn("[WARN] volume1 [{}] digests: ".format(iqn("volume1")), self.stdout)
+
+    def test_one_session_with_missing_digest_output_warns(self):
+        original = self.host.iscsiadm
+
+        def missing_digest(args):
+            code, out, err = original(args)
+            if args == ["-m", "session", "-P", "3"]:
+                out = out.replace("\t\tDataDigest: CRC32C\n", "", 1)
+            return code, out, err
+
+        with mock.patch.object(self.host, "iscsiadm", side_effect=missing_digest):
+            self.run_main()
+        self.assertIn("[WARN] volume1 [{}] digests: ".format(iqn("volume1")), self.stdout)
 
 
 class MultipathTests(HardeningTestCase):
+    def test_delayed_disks_are_registered_within_the_readiness_wait(self):
+        self.host.multipath_defaults["find_multipaths"] = "strict"
+        original = self.host.iscsiadm
+        reads = 0
+
+        def delayed(args):
+            nonlocal reads
+            result = original(args)
+            if args == ["-m", "session", "-P", "3"]:
+                reads += 1
+                if reads == 1:
+                    return result[0], "\n".join(line for line in result[1].splitlines()
+                                                if "Attached scsi disk" not in line), result[2]
+            return result
+
+        with mock.patch.object(self.host, "iscsiadm", side_effect=delayed):
+            self.run_main()
+        self.assertIn(iqn("volume1"), self.host.registered)
+        self.assertGreaterEqual(reads, 2)
+        self.assertLessEqual(reads, connect.MULTIPATH_WAIT_ATTEMPTS)
+
+    def test_single_session_requires_an_attached_disk_but_not_a_multipath_map(self):
+        self.assertFalse(connect._multipath_check(iqn("volume1"), 1, {}, None)[0])
+        details = {iqn("volume1"): {"disks": ["sda"], "digests": set()}}
+        self.assertTrue(connect._multipath_check(iqn("volume1"), 1, details, None)[0])
+
     def test_drop_in_is_device_scoped_idempotent_and_uses_config_dir(self):
         self.host.files[connect.MULTIPATH_CONF] = 'defaults {\n    config_dir "/etc/custom/multipath/"\n}\n'
         original = self.host.files[connect.MULTIPATH_CONF]

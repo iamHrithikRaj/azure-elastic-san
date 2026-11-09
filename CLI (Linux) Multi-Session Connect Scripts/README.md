@@ -29,7 +29,7 @@ does not query IMDS or zone mappings. `--subscription` remains an alias.
 VIP distribution resolves the FQDN with IPv4 `socket.getaddrinfo`, deduplicates
 addresses, and sorts them numerically. No IPv4 answers produces a DNS error
 before node creation or login. **One address keeps the original FQDN**, including
-for LRS and private endpoints, so saved configuration remains migration-safe.
+for LRS and private endpoints, retaining hostname-backed node records.
 With **N addresses**, session shares are `count // N`, with one extra assigned
 to each of the first `count % N` addresses: 32 over three gives 11/11/10; over two,
 16/16. Zero-share addresses are only tried as single-session fallbacks if every
@@ -54,7 +54,8 @@ the target appeared, the node record this run created for it is deleted so a
 re-run can connect (it is kept, with a warning, if sessions can't be read). A volume that no portal
 logs in to is reported and the script continues with the next volume. Clone or
 persistence failures also warn, so a usable connection may have fewer sessions
-or incomplete saved settings; validation reports them. Native commands use ordinary `sudo`.
+or incomplete saved settings; validation reports them. Root runs commands directly;
+other users use non-interactive `sudo -n`.
 
 ## Host preparation, recommended settings and validation
 
@@ -73,7 +74,8 @@ node values and writes `azure-elastic-san.conf` into multipath's `config_dir`,
 scoped to vendor `MSFT` / product `Virtual HD`. `/etc/multipath.conf` and global
 defaults are never changed; differing `find_multipaths`, `polling_interval` or
 `user_friendly_names` are reported as warnings. With `find_multipaths strict`,
-only volumes connected in this run have their WWIDs registered.
+only volumes connected in this run have their WWIDs registered, after disks attach
+inside the bounded readiness wait.
 `--skip-recommended-settings` skips the node values, the multipath file and WWID
 registration; prerequisites and CRC32C digests are always configured.
 
@@ -81,10 +83,12 @@ A final validation prints `[PASS]`, `[WARN]` or `[FAIL]` lines for the host
 checks `iscsid service`, `multipathd service`, `iSCSI login unit`,
 `multipath drop-in` and `multipath defaults`, and for each volume as
 `<volume> [<iqn>] <check>`: `live sessions`, `persistent records`
-(`node.startup` and `nr_sessions`), `digests` (from the node record),
+(`node.startup` and `nr_sessions`), `digests` (node records and live negotiation),
 `recommended settings` and `multipath paths`. Problems on volumes connected in this run fail; pre-existing
 state on skipped volumes and counts above the request only warn. Any failure,
 or any stop before connecting, prints one `ERROR:` line and exits with code 1.
+Non-CRC32C or missing negotiated digests warn even when node records request CRC32C.
+A single session requires an attached disk, but not a multipath map.
 
 ## Existing connections and limits
 

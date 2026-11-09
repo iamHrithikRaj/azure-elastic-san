@@ -137,13 +137,13 @@ def _run_required(command, action):
 
 
 def _read_root_file(path):
-    code, out, _ = run_command(["sudo", "cat", path])
+    code, out, _ = run_command(_command_prefix() + ["cat", path])
     return out if code == 0 else None
 
 
 def _write_root_file(path, content):
-    _run_required(["sudo", "mkdir", "-p", path.rsplit("/", 1)[0]], "Creating the directory for " + path)
-    code, _, err = run_command(["sudo", "tee", path], input_text=content)
+    _run_required(_command_prefix() + ["mkdir", "-p", path.rsplit("/", 1)[0]], "Creating the directory for " + path)
+    code, _, err = run_command(_command_prefix() + ["tee", path], input_text=content)
     if code != 0:
         raise ConnectScriptError("Writing {} failed: {}".format(path, err or "exit code {}".format(code)))
 
@@ -155,10 +155,13 @@ def _to_int(value):
         return 0
 
 
-def check_privileges():
-    # Native commands run through sudo, so root or passwordless sudo is required.
+def _command_prefix():
     geteuid = getattr(os, "geteuid", None)
-    if geteuid is not None and geteuid() == 0:
+    return [] if geteuid is not None and geteuid() == 0 else ["sudo", "-n"]
+
+
+def check_privileges():
+    if not _command_prefix():
         return
     _require_tool("sudo", "Run this script as root, or install sudo and configure passwordless sudo.")
     if run_command(["sudo", "-n", "true"])[0] != 0:
@@ -209,12 +212,12 @@ def _package_installed(family, package):
 
 def _install_command(family, packages):
     if family == "debian":
-        return ["sudo", "env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "-q"] + packages
+        return _command_prefix() + ["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", "-q"] + packages
     if family == "rhel":
-        return ["sudo", "dnf" if find_tool("dnf") else "yum", "install", "-y"] + packages
+        return _command_prefix() + ["dnf" if find_tool("dnf") else "yum", "install", "-y"] + packages
     if family == "suse":
-        return ["sudo", "zypper", "--non-interactive", "install"] + packages
-    return ["sudo", "tdnf", "install", "-y"] + packages
+        return _command_prefix() + ["zypper", "--non-interactive", "install"] + packages
+    return _command_prefix() + ["tdnf", "install", "-y"] + packages
 
 
 def find_login_unit():
@@ -232,7 +235,7 @@ def _ensure_initiator_name():
            for line in content.splitlines()):
         return False
     _require_tool("iscsi-iname", "Set InitiatorName= in {} and re-run this script.".format(INITIATOR_NAME_FILE))
-    name = _run_required(["sudo", "iscsi-iname"], "Generating an iSCSI initiator name").strip()
+    name = _run_required(_command_prefix() + ["iscsi-iname"], "Generating an iSCSI initiator name").strip()
     _write_root_file(INITIATOR_NAME_FILE, "InitiatorName={}\n".format(name))
     print("Created {}".format(INITIATOR_NAME_FILE))
     return True
@@ -242,29 +245,29 @@ def ensure_prerequisites(family):
     missing = [package for package in PREREQUISITE_PACKAGES[family] if not _package_installed(family, package)]
     if missing:
         command = _install_command(family, missing)
-        _require_tool("apt-get" if family == "debian" else command[1],
+        _require_tool("apt-get" if family == "debian" else command[len(_command_prefix())],
                       "Install {} with the distro's package manager and re-run this script.".format(" ".join(missing)))
         print("Installing missing packages: {}".format(" ".join(missing)))
         if family == "debian":
-            _run_required(["sudo", "apt-get", "update", "-q"], "Refreshing package lists")
+            _run_required(_command_prefix() + ["apt-get", "update", "-q"], "Refreshing package lists")
         _run_required(command, "Installing " + " ".join(missing))
     created_initiator_name = _ensure_initiator_name()
-    _run_required(["sudo", "systemctl", "enable", "--now", "iscsid"], "Enabling iscsid")
+    _run_required(_command_prefix() + ["systemctl", "enable", "--now", "iscsid"], "Enabling iscsid")
     if created_initiator_name:
         # iscsid reads the initiator name only when it starts.
-        _run_required(["sudo", "systemctl", "restart", "iscsid"], "Restarting iscsid")
+        _run_required(_command_prefix() + ["systemctl", "restart", "iscsid"], "Restarting iscsid")
     login_unit = find_login_unit()
     if login_unit:
         # Enable only. Starting it runs --loginall=automatic, which could log in
         # targets that are not part of this run's plan.
-        _run_required(["sudo", "systemctl", "enable", login_unit], "Enabling " + login_unit)
+        _run_required(_command_prefix() + ["systemctl", "enable", login_unit], "Enabling " + login_unit)
     if family == "rhel" and _read_root_file(MULTIPATH_CONF) is None:
         # RHEL's multipathd does not start without a configuration file;
         # mpathconf writes the distro's standard minimal one.
         _require_tool("mpathconf", "Create {} (for example with 'mpathconf --enable') and re-run this script.".format(
             MULTIPATH_CONF))
-        _run_required(["sudo", "mpathconf", "--enable", "--with_multipathd", "y"], "Creating " + MULTIPATH_CONF)
-    _run_required(["sudo", "systemctl", "enable", "--now", "multipathd"], "Enabling multipathd")
+        _run_required(_command_prefix() + ["mpathconf", "--enable", "--with_multipathd", "y"], "Creating " + MULTIPATH_CONF)
+    _run_required(_command_prefix() + ["systemctl", "enable", "--now", "multipathd"], "Enabling multipathd")
 
 
 def multipath_drop_in_path():
@@ -281,7 +284,7 @@ def configure_multipath():
     if _read_root_file(path) == MULTIPATH_DROP_IN:
         return
     _write_root_file(path, MULTIPATH_DROP_IN)
-    _run_required(["sudo", "multipathd", "reconfigure"], "Reloading multipathd")
+    _run_required(_command_prefix() + ["multipathd", "reconfigure"], "Reloading multipathd")
     print("Wrote Elastic SAN multipath device settings to {}".format(path))
 
 
@@ -292,7 +295,7 @@ def prepare_iscsi_host(family, apply_recommended):
 
 
 def get_multipath_defaults():
-    code, out, _ = run_command(["sudo", "multipathd", "show", "config"])
+    code, out, _ = run_command(_command_prefix() + ["multipathd", "show", "config"])
     if code != 0:
         return None
     values, in_defaults = {}, False
@@ -313,13 +316,17 @@ def get_session_details():
     for line in _iscsiadm(["-m", "session", "-P", "3"], allow_empty=True).splitlines():
         words = line.split()
         if words[:1] == ["Target:"] and len(words) > 1:
-            current = details.setdefault(words[1].lower(), {"disks": [], "digests": set()})
+            current = details.setdefault(words[1].lower(), {"disks": [], "digests": []})
         elif current is None:
             continue
+        elif words[:1] == ["SID:"]:
+            header_digest = None
+            current["digests"].append("None/None")
         elif words[:1] == ["HeaderDigest:"] and len(words) > 1:
             header_digest = words[1]
+            current["digests"][-1] = "{}/None".format(header_digest)
         elif words[:1] == ["DataDigest:"] and len(words) > 1:
-            current["digests"].add("{}/{}".format(header_digest, words[1]))
+            current["digests"][-1] = "{}/{}".format(header_digest, words[1])
         elif words[:3] == ["Attached", "scsi", "disk"] and len(words) > 3:
             current["disks"].append(words[3])
     return details
@@ -336,36 +343,35 @@ def _volume_session_details(details, volume_iqn):
 
 def get_multipath_paths():
     """Maps each path device to (map name, dm state, checker state), or None if multipathd is unavailable."""
-    code, out, _ = run_command(["sudo", "multipathd", "show", "paths", "raw", "format", "%d %m %t %T"])
+    code, out, _ = run_command(_command_prefix() + ["multipathd", "show", "paths", "raw", "format", "%d %m %t %T"])
     if code != 0:
         return None
     return {words[0]: words[1:] for words in (line.split() for line in out.splitlines()) if len(words) == 4}
 
 
-def register_multipath_devices(outcomes):
+def register_multipath_devices(outcomes, details):
     # find_multipaths "strict" only builds maps for known WWIDs. Register just the
     # volumes this run connected instead of changing the host-wide policy.
-    details = get_session_details()
     for outcome in outcomes:
         disks = _volume_session_details(details, outcome.volume_iqn)[0]
         if not disks:
             continue
-        code, _, err = run_command(["sudo", "multipath", "-a", "/dev/" + disks[0]])
+        code, _, err = run_command(_command_prefix() + ["multipath", "-a", "/dev/" + disks[0]])
         if code != 0:
             print("Warning: {} [{}]: could not register the multipath WWID: {}".format(
                 outcome.volume_name, outcome.target_iqn, err or "exit code {}".format(code)
             ), file=sys.stderr)
-    code, _, err = run_command(["sudo", "multipathd", "reconfigure"])
+    code, _, err = run_command(_command_prefix() + ["multipathd", "reconfigure"])
     if code != 0:
         print("Warning: multipathd reconfigure failed: {}".format(err or "exit code {}".format(code)), file=sys.stderr)
 
 
 def _multipath_check(volume_iqn, live, details, paths):
-    if live < 2:
-        return True, "single session; no multipath map required"
     disks = _volume_session_details(details, volume_iqn)[0]
     if not disks:
         return False, "no SCSI disks are attached to the {} sessions".format(live)
+    if live < 2:
+        return True, "single session with an attached disk; no multipath map required"
     if paths is None:
         return False, "could not read paths from multipathd"
     maps = sorted({paths[disk][0] for disk in disks if disk in paths and not paths[disk][0].startswith("[")})
@@ -464,15 +470,16 @@ def _validate_volume(report, outcome, state, details, paths, requested, apply_re
     report.add(status, label + "persistent records", detail)
     if not state:
         return
-    if state.records:
-        # The node record is authoritative; some kernels do not negotiate DataDigest.
+    if state.records or live:
         negotiated = _volume_session_details(details, outcome.volume_iqn)[1]
         wrong = [portal for _, portal, settings in state.records
                  if any(settings.get(key, "").upper() != value for key, value in DIGEST_SETTINGS)]
-        report.add(problem if wrong else "PASS", label + "digests", "{}; negotiated header/data: {}".format(
+        digest_status = problem if wrong else "WARN" if live and (not negotiated or any(
+            value.upper() != "CRC32C/CRC32C" for value in negotiated)) else "PASS"
+        report.add(digest_status, label + "digests", "{}; negotiated header/data: {}".format(
             "not CRC32C for " + ", ".join(wrong) if wrong else "CRC32C in the node records",
             ", ".join(negotiated) or "none"))
-        if apply_recommended:
+        if apply_recommended and state.records:
             wrong = [portal for _, portal, settings in state.records
                      if any(settings.get(key, "").lower() != value.lower() for key, value in RECOMMENDED_NODE_SETTINGS)]
             report.add(problem if wrong else "PASS", label + "recommended settings",
@@ -488,9 +495,14 @@ def validate_connections(outcomes, requested, apply_recommended):
     states = [check_connection(outcome.target_iqn, None, None, volume_iqn=outcome.volume_iqn)
               for outcome in outcomes]
     connected = [(outcome, state) for outcome, state in zip(outcomes, states) if outcome.connected_this_run]
+    register_wwids = apply_recommended and bool(connected) and (
+        get_multipath_defaults() or {}).get("find_multipaths", "").lower() == "strict"
     # multipathd adds paths asynchronously after login; give new volumes a short, bounded wait.
     for attempt in range(MULTIPATH_WAIT_ATTEMPTS if connected else 1):
-        details, paths = get_session_details(), get_multipath_paths()
+        details = get_session_details()
+        if register_wwids:
+            register_multipath_devices([outcome for outcome, _ in connected if not outcome.failed], details)
+        paths = get_multipath_paths()
         if all(_multipath_check(outcome.volume_iqn, len(state.sessions), details, paths)[0]
                for outcome, state in connected if state):
             break
@@ -508,9 +520,7 @@ def finish_connections(outcomes, requested, apply_recommended):
     connected = [outcome for outcome in outcomes if outcome.connected_this_run and not outcome.failed]
     if connected:
         # Disks appear asynchronously after login; wait for udev before reading them.
-        run_command(["sudo", "udevadm", "settle"])
-        if apply_recommended and (get_multipath_defaults() or {}).get("find_multipaths", "").lower() == "strict":
-            register_multipath_devices(connected)
+        run_command(_command_prefix() + ["udevadm", "settle"])
     failures = validate_connections(outcomes, requested, apply_recommended)
     changed = [outcome.volume_name for outcome in outcomes if outcome.settings_changed_while_live]
     if changed:
@@ -964,7 +974,7 @@ def get_portals(hostname, number_of_sessions, enable_vip_distribution=False):
 
 def _iscsiadm(arguments, allow_empty=False):
     process = subprocess.Popen(
-        ["sudo", "iscsiadm"] + arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        _command_prefix() + ["iscsiadm"] + arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
     out, err = process.communicate()
     out, err = _decode_output(out), _decode_output(err).strip()

@@ -897,6 +897,10 @@ class ConnectorRegressionTests(unittest.TestCase):
                 commands = []
 
                 def launch(command, **kwargs):
+                    if command[:2] == ["sudo", "-n"]:
+                        command = ["sudo"] + command[2:]
+                    elif command[:1] == ["iscsiadm"]:
+                        command = ["sudo"] + command
                     commands.append(command)
                     process = mock.Mock(returncode=0)
                     output = (b"tcp: [17] 192.0.2.50:3260,7 iqn.original\n"

@@ -37,7 +37,9 @@ ISCSI_ERR_NO_OBJS_FOUND = 21
 
 
 def run_iscsiadm(arguments):
-    command = ["sudo", "iscsiadm"] + arguments
+    geteuid = getattr(os, "geteuid", None)
+    prefix = [] if geteuid is not None and geteuid() == 0 else ["sudo", "-n"]
+    command = prefix + ["iscsiadm"] + arguments
     p = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out, err = p.communicate()
     if p.returncode == ISCSI_ERR_NO_OBJS_FOUND:
