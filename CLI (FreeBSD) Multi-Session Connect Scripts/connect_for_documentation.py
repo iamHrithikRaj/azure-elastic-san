@@ -25,7 +25,7 @@ Prerequisites (see README.md in this directory for full detail):
 
 This script intentionally does NOT:
     * call iscsiadm, systemd, or any Linux package manager;
-    * call 'iscsictl -R -a' or otherwise remove/tear down sessions (use
+    * call 'iscsictl -R -a' or remove pre-existing sessions (use
       disconnect_for_documentation.py for the selected volumes);
     * restart the iscsid service or touch sessions it did not create;
     * assemble gmultipath devices (session creation is not multipath device

@@ -282,24 +282,13 @@ holds the pre-run config; it is **not** deleted automatically and is left
 behind for manual recovery. When every selected volume is skipped, the file is
 neither written nor backed up.
 
-Each volume that the pre-mutation plan selects for connection is then its own
-config transaction: the script keeps the current config bytes in memory
-(including entries added for volumes connected earlier in this run), adds that
-volume's managed entries, and establishes its sessions. If establishing them
-fails, it restores those in-memory bytes through the same atomic write
-(or deletes the file if it did not exist before this run and this was the
-first volume), which removes only the failed volume's entries. It then stops
-with an error that names the failed volume and any volumes connected earlier
-in this run; those keep their sessions and managed entries, so they stay
-persistent. Validation is not run in that case.
-This only ever rolls back the **config file** -- it never disconnects or
-removes any iSCSI session. After `iscsictl -A` has been submitted, sessions
-may already be live or may become live after a timeout even though the config
-file was restored. Always inspect `iscsictl -L -v` and run
-`disconnect_for_documentation.py` for the failed volume before retrying.
-Host prerequisite changes (kernel module, `iscsid`, `iscsictl_enable`) are not
-rolled back either. A rerun after fixing the cause skips the volumes that are
-already connected and connects the rest.
+Each volume is a config transaction. Connected sessions and their entries stay
+when later adds fail; safely identifiable unconnected sessions added this run
+are removed (see "Session count"). If none connect, that volume's pre-run config
+is restored, preserving earlier volumes. The backup remains the exact pre-run
+file. Ambiguous cleanup retains entries and stops rather than risk removing a
+healthy session. Always inspect `iscsictl -L -v` before retrying a failed run.
+Service enablement/start is not rolled back.
 
 ## Existing connections and reruns
 
@@ -345,8 +334,9 @@ sessions; if one appeared since the inventory, the volume is skipped
 `iscsictl -A -n <nickname> -c /etc/iscsi.conf` (without `-w`) for each session
 in order, and polls `iscsictl -L -v` for up to 30 seconds until that target IQN
 has that many `Connected` sessions. Unrelated disconnected sessions are
-ignored. A timeout is explicit and does not remove or roll back sessions that
-may already have been created.
+ignored. On timeout, the partial-connection cleanup rule in "Session count"
+applies. A session appearing at the recheck is skipped and that volume's exact
+pre-run config is restored; it is not reported as connected by this run.
 
 ## Host prerequisites
 
