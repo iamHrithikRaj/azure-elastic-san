@@ -49,6 +49,33 @@ def locations_list(region_name="eastus", mappings=None):
 
 
 class ZonalAffinityTests(unittest.TestCase):
+    def test_default_target_lookup_uses_bounded_runner_and_argument_boundaries(self):
+        target = {"targetIqn": "iqn.example:volume", "targetPortalHostname": "portal.example", "targetPortalPort": 3260}
+        process = mock.Mock()
+        process.poll.return_value = 0
+        process.communicate.return_value = (json.dumps(target).encode("utf-8"), b"")
+        with mock.patch.object(connect, "check_azcli"), mock.patch.object(connect.subprocess, "Popen", return_value=process):
+            with mock.patch.object(connect, "_run_az_command", return_value=json.dumps(target)) as run:
+                self.assertEqual(("iqn.example:volume", "portal.example", 3260),
+                                 connect.get_iqns("sub", "resource group", "san", "vg", "volume"))
+        run.assert_called_once_with(
+            ["az", "elastic-san", "volume", "show", "-g", "resource group", "-e", "san",
+             "-v", "vg", "-n", "volume", "--query", "storageTarget", "--subscription", "sub"],
+            "Elastic SAN volume lookup",
+        )
+
+    def test_default_target_lookup_timeout_kills_and_reaps_process(self):
+        process = mock.Mock(pid=1234)
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("az", 30), -9]
+        with mock.patch.object(connect, "check_azcli"), mock.patch.object(connect.time, "sleep"):
+            with mock.patch.object(connect.subprocess, "Popen", return_value=process):
+                with mock.patch.object(connect.os, "name", "nt"):
+                    with self.assertRaisesRegex(Exception, "timed out"):
+                        connect.get_iqns(None, "rg", "san", "vg", "volume")
+        process.kill.assert_called_once_with()
+        self.assertEqual([mock.call(timeout=30), mock.call(timeout=30)], process.wait.call_args_list)
+
     def test_imds_query_bypasses_proxy_uses_metadata_header_and_timeout(self):
         response = mock.Mock()
         response.read.return_value = json.dumps(

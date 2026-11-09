@@ -1,36 +1,11 @@
-import subprocess, sys, os, argparse, json, time, re
+import subprocess, sys, os, argparse, json, time, re, shutil
 # for compatibility between python2 and python3 
 if hasattr(__builtins__, 'raw_input'):
       input = raw_input
 
-# determine os and package manager type
-package_manager = ''
-if os.path.exists('/usr/bin/apt-get'):
-    package_manager = 'apt'
-elif os.path.exists('/usr/bin/yum'):
-    package_manager = 'yum'
-elif os.path.exists('/usr/bin/zypper'):
-    package_manager = 'zypper'
-else:
-    raise OSError("cannot find a usable package manager")
-
 # check if azure cli is installed
 def check_azcli():
-    # check for each type of package manager
-    if package_manager == 'apt':
-        command = "dpkg -l azure-cli".split(' ')
-    elif package_manager == 'yum':
-        command = "rpm -q azure-cli".split(' ')
-    elif package_manager == 'zypper':
-        command = "zypper search -i azure-cli".split(' ')
-    else:
-        raise OSError("cannot find a usable package manager")
-    p = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out, _ = p.communicate()
-    out = out.decode("utf-8")
-    
-    # if not found/installed, exit
-    if (package_manager == "apt" and "ii  azure-cli" not in out) or (package_manager == 'yum' and "azure-cli is not installed" in out) or (package_manager == 'zypper' and "azure-cli" not in out):
+    if shutil.which("az") is None:
         print("\033[93mWarning: Azure CLI is not installed or enabled. It is required for successful execution of this connect script. \n You need to install by following `https://learn.microsoft.com/en-us/cli/azure/install-azure-cli-linux` and run:\n `az extension add -n elastic-san`\n `az login`\033[00m")
         sys.exit(1)
     
@@ -89,7 +64,7 @@ def get_matching_targets(target_iqn):
             if match is None:
                 raise Exception("Cannot parse iscsiadm {} inventory: {!r}".format(mode, line))
             name = match.group(1)
-            if name == target_iqn or name.startswith(target_iqn + ":az-"):
+            if name.lower() == target_iqn.lower() or name.lower().startswith(target_iqn.lower() + ":az-"):
                 targets.add(name)
     return sorted(targets)
 

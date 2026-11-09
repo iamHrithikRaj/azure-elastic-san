@@ -124,20 +124,12 @@ def check_azcli():
 # get iqn info from the ElasticSAN
 def get_iqns(elastic_san_subscription, resource_group_name, elastic_san_name, volume_group_name, volume_name):
     check_azcli()
-    subscription_argument = " --subscription "+elastic_san_subscription if elastic_san_subscription is not None else ""
-    command = "az elastic-san volume show -g {} -e {} -v {} -n {} --query storageTarget{}".format(resource_group_name, elastic_san_name, volume_group_name, volume_name, subscription_argument).split(' ')
-    p = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    # timeout in case the extension is not installed and prompts the user to install
-    timeout = 10
-    while p.poll() is None and timeout > 0:
-     time.sleep(1)
-     timeout -= 1
-    if timeout<=0:
-        raise Exception('Command took longer than 10s')
-    out, err = p.communicate()
-    if "error" in err.decode("utf-8").lower():
-        raise Exception(err)
-    out = out.decode("utf-8")
+    command = ["az", "elastic-san", "volume", "show", "-g", resource_group_name,
+               "-e", elastic_san_name, "-v", volume_group_name, "-n", volume_name,
+               "--query", "storageTarget"]
+    if elastic_san_subscription is not None:
+        command.extend(["--subscription", elastic_san_subscription])
+    out = _run_az_command(command, "Elastic SAN volume lookup")
     storage_target = json.loads(out)
     target_iqn = storage_target["targetIqn"]
     target_portal_hostname = storage_target["targetPortalHostname"]
