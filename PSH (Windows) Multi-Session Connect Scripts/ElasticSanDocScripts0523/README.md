@@ -40,6 +40,11 @@ do not all depend on a single zone's portal. It complements the front end's
 ISID-hash redirect; the front end may redirect after login. Original portal
 distribution is not a guarantee or verification of final session placement.
 
+VIP mode saves literal IP portals. If the SAN's VIPs change (for example, during
+account migration), those saved portals stop working. Run `disconnect.ps1`,
+then run `connect.ps1` again to resolve and save the current portals. A rerun
+alone skips existing configuration; it does not repair retired VIPs.
+
 ## Existing configuration and failures
 
 With either opt-in, any live session or persistent login for the volume's plain
