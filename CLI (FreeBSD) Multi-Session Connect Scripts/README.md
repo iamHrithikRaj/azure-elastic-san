@@ -447,6 +447,17 @@ is reported as one `[FAIL]` line and the dependent per-volume checks are
 omitted. Any `[FAIL]` makes the script exit with status 1 and an
 `ERROR: Validation reported N failed check(s)` line on stderr.
 
+## Hosts with their own session manager
+
+Use `--dry-run` rather than a mutating run. It prints the exact managed
+`iscsi.conf` block and shell-quoted `iscsictl` add commands. Apply those through
+your own component, which must own configuration, session recovery and multipath
+assembly; coordinate a single writer for each volume.
+
+A normal run enables `iscsictl_enable=YES`. At boot the stock rc.d service runs
+`iscsictl -Aa`, which processes every configured stanza, including unmanaged
+ones. Do not run that boot/session manager alongside a host-owned manager.
+
 ## Session count
 
 `-s`/`--num-of-sessions` accepts 1 through 32 and defaults to 32, like the
@@ -456,19 +467,28 @@ mutation; they are never silently capped.
 The FreeBSD kernel rejects a new session whose configured target name **and**
 target address text both match an existing session (`EBUSY`, reported by
 `iscsictl -A` as `Device busy`). Stock FreeBSD therefore supports one session
-per target portal; initiators that lift that restriction support more. Pick a
-count the initiator supports:
+per target portal; initiators that lift that restriction support more. **Total
+sessions per volume must not exceed what the initiator allows to one target
+portal**, with or without VIP distribution: the service can redirect sessions
+onto the same portal. On FreeBSD a redirect rewrites the session's address and
+the kernel rejects a duplicate target+address, including during that rewrite.
 
-| Initiator | Without VIP distribution | With `--enable-vip-distribution` (N VIPs) |
-| --- | --- | --- |
-| Stock FreeBSD | `-s 1` | `-s` up to N (one session per VIP) |
-| Allows K sessions per target portal | `-s` up to K | `-s` up to K x N (for example `-s 24` for 8/8/8) |
+| Initiator | Total sessions per volume, with or without VIP distribution |
+| --- | --- |
+| Stock FreeBSD | `-s 1` |
+| Allows K sessions to one target portal | `-s K` |
 
-When the initiator rejects another session to a portal this run already used,
-the error says so and suggests a smaller `--num-of-sessions` or
-`--enable-vip-distribution`. The config is then rolled back (see "Atomic write,
-backup, and rollback"); sessions already added stay up until you remove them
-with `disconnect_for_documentation.py`.
+VIP distribution with `-s 1` adds nothing over FQDN mode. It saves a literal IP
+instead of the service name when DNS returns multiple VIPs.
+
+After a synchronous add rejection, no further sessions are added for that volume.
+The bounded readiness wait still runs. Connected sessions and their entries stay;
+unconnected sessions are removed only when their configured target+portal can be
+removed without touching a Connected session. Native `iscsictl -R -n` selects
+every session with that target+portal, not an individual nickname. Ambiguous
+cleanup fails closed, retains the entries and requires quiescing I/O and using
+the disconnect script. A partial connection is reported as fewer than requested;
+re-run with the connected count (or the initiator's supported limit).
 
 ## VIP distribution (`--enable-vip-distribution`)
 
@@ -488,13 +508,16 @@ depending on one zone. It complements the front end's ISID-hash redirect: the
 front end may redirect any login, and this script neither controls nor verifies
 the resulting placement.
 
+If the SAN's VIPs change (account migration), saved IP portals stop working.
+Run disconnect, then connect again.
+
 ## Multipath
 
 Each session exposes its own disk device. The script does not assemble
 multipath devices; with more than one session it prints:
 
 ```
-Multipath: each iSCSI session exposes its own disk device; this script does not assemble multipath devices. Use the host's multipath layer (gmultipath(8) or the initiator's multipath support) before using the volumes.
+Multipath: each iSCSI session exposes its own disk device; this script does not assemble multipath devices. Use the host's multipath layer (gmultipath(8) or the initiator's multipath support) before using the volumes. Total sessions per volume must not exceed what the initiator allows to one target portal: the service can redirect sessions onto the same portal.
 ```
 
 Use `gmultipath(8)` or the initiator's own multipath support so one volume's
