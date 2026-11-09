@@ -12,7 +12,7 @@ class PartialConnectionTests(unittest.TestCase):
     def run_plan(self, addresses, states, reject_at=None, preexisting_entries=False):
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
-        path = Path(stack.enter_context(tempfile.TemporaryDirectory()), "iscsi.conf")
+        path = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=".")), "iscsi.conf")
         original = b"# operator-owned bytes\n"
         plan = connect.VolumeConnectionPlan(
             "volume", "iqn.test:volume", addresses[0],

@@ -24,7 +24,7 @@ class RecheckRaceTests(unittest.TestCase):
         plan = connect.VolumeConnectionPlan("volume", "iqn.test:volume", "host:3260", ["esan-volume-s1"])
         for original in [None, b"# operator\n", connect.render_full_managed_block([plan])]:
             with self.subTest(original=original), contextlib.ExitStack() as stack:
-                path = Path(stack.enter_context(tempfile.TemporaryDirectory()), "iscsi.conf")
+                path = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=".")), "iscsi.conf")
                 if original is not None:
                     path.write_bytes(original)
                 stack.enter_context(mock.patch.object(connect, "fcntl", RecordingFcntl()))
