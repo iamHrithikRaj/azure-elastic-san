@@ -9,7 +9,7 @@ independent rather than sharing a code path.
 Prerequisites (see README.md in this directory for full detail):
     * FreeBSD 13 or later with the native iSCSI initiator
       (iscsi(4)/iscsid(8)/iscsictl(8)). A mutating run loads the iscsi
-      kernel module when it is missing and persists it in /boot/loader.conf.
+      kernel module when it is missing; rc.d/iscsid loads it at boot.
     * Python 3.
     * Azure CLI ('az') with the 'elastic-san' extension. On FreeBSD, Azure
       CLI is provided by the FreeBSD Ports Collection / community packages
@@ -19,7 +19,7 @@ Prerequisites (see README.md in this directory for full detail):
       This script verifies the 'elastic-san' extension is present but cannot
       verify upstream compatibility beyond that -- validate it yourself.
     * Root privileges for any mutating action (writing /etc/iscsi.conf,
-      loading/persisting the iscsi kernel module, enabling/starting iscsid,
+      loading the iscsi kernel module, enabling/starting iscsid,
       enabling boot-time session re-login, adding iSCSI sessions). --dry-run
       does not require root and performs no mutation.
 
@@ -85,9 +85,8 @@ SUBSCRIPTION_ID_PATTERN = re.compile(
 DEFAULT_ISCSI_CONF_PATH = "/etc/iscsi.conf"
 CONFIG_LOCK_FILENAME = ".azure-elastic-san.lock"
 ISCSI_DEVICE_NODE = "/dev/iscsi"
-REQUIRED_FREEBSD_TOOLS = ("iscsictl", "service", "sysrc", "kldstat", "kldload", "freebsd-version")
+REQUIRED_FREEBSD_TOOLS = ("iscsictl", "service", "sysrc", "kldload", "freebsd-version")
 MIN_FREEBSD_MAJOR_VERSION = 13
-LOADER_CONF_PATH = "/boot/loader.conf"
 # rc.d/iscsictl runs "iscsictl ${iscsictl_flags}" at boot; the stock flags re-add every
 # configured session. Customized flags are the operator's policy and are left alone.
 STOCK_ISCSICTL_FLAGS = "-Aa"
@@ -1113,16 +1112,13 @@ def ensure_iscsid_enabled_and_running():
         )
 
 
-def _query_sysrc(variable, config_file=None):
+def _query_sysrc(variable):
     """Return a variable's value, or None when sysrc reports it undefined (non-zero exit).
 
     sysrc also reads /etc/defaults/rc.conf, so a variable that has a stock
     default is never undefined; an explicitly empty value is returned as "".
     """
-    command = ["sysrc"]
-    if config_file is not None:
-        command.extend(["-f", config_file])
-    command.extend(["-n", variable])
+    command = ["sysrc", "-n", variable]
     returncode, value, _ = _run_subprocess(
         command, "sysrc {} query".format(variable), SHORT_COMMAND_TIMEOUT_SECONDS
     )
@@ -1139,54 +1135,22 @@ def iscsictl_flags_are_stock(flags):
 # iSCSI kernel driver and boot-time session re-login
 # ---------------------------------------------------------------------------
 
-def get_iscsi_driver_state():
-    """Return "module", "compiled-in" or "missing" for the iscsi(4) initiator driver.
-
-    The loadable module is detected by file name (iscsi.ko) because
-    'kldstat -m iscsi' also matches a driver compiled into the kernel, and
-    persisting iscsi_load for a compiled-in driver would make the loader try to
-    load a duplicate module at boot. /dev/iscsi exists only while the driver
-    is present, so the device node without iscsi.ko means compiled in.
-    """
-    returncode, _, _ = _run_subprocess(
-        ["kldstat", "-q", "-n", "iscsi"], "kldstat -q -n iscsi", SHORT_COMMAND_TIMEOUT_SECONDS
-    )
-    if returncode == 0:
-        return "module"
-    if os.path.exists(ISCSI_DEVICE_NODE):
-        return "compiled-in"
-    return "missing"
-
-
 def ensure_iscsi_kernel_driver():
-    """Load the iscsi module if needed and persist it in /boot/loader.conf.
-
-    rc.d/iscsid also loads the module at boot (required_modules="iscsi"), but
-    persisting it in the loader keeps the driver available even if iscsid is
-    started later or by hand.
-    """
-    driver_state = get_iscsi_driver_state()
-    if driver_state == "compiled-in":
+    """rc.d/iscsid loads the module at boot; only ensure availability for this run."""
+    if os.path.exists(ISCSI_DEVICE_NODE):
         return
-    if driver_state == "missing":
-        try:
-            _run_command(["kldload", "iscsi"], "kldload iscsi", SHORT_COMMAND_TIMEOUT_SECONDS)
-        except ElasticSanConnectError as error:
-            raise ElasticSanConnectError(
-                "The FreeBSD iSCSI initiator driver is not loaded and could not be loaded: {}. "
-                "Load it manually ('kldload iscsi', or build 'device iscsi' into the kernel) "
-                "and re-run.".format(error)
-            )
-        if not os.path.exists(ISCSI_DEVICE_NODE):
-            raise ElasticSanConnectError(
-                "'kldload iscsi' succeeded but {} does not exist; inspect 'kldstat' and dmesg "
-                "before retrying.".format(ISCSI_DEVICE_NODE)
-            )
-    if (_query_sysrc("iscsi_load", LOADER_CONF_PATH) or "").upper() != "YES":
-        _run_command(
-            ["sysrc", "-f", LOADER_CONF_PATH, "iscsi_load=YES"],
-            "sysrc -f {} iscsi_load=YES".format(LOADER_CONF_PATH),
-            SHORT_COMMAND_TIMEOUT_SECONDS,
+    try:
+        _run_command(["kldload", "iscsi"], "kldload iscsi", SHORT_COMMAND_TIMEOUT_SECONDS)
+    except ElasticSanConnectError as error:
+        raise ElasticSanConnectError(
+            "The FreeBSD iSCSI initiator driver is not loaded and could not be loaded: {}. "
+            "Load it manually ('kldload iscsi', or build 'device iscsi' into the kernel) "
+            "and re-run.".format(error)
+        )
+    if not os.path.exists(ISCSI_DEVICE_NODE):
+        raise ElasticSanConnectError(
+            "'kldload iscsi' succeeded but {} does not exist; inspect dmesg before retrying.".format(
+                ISCSI_DEVICE_NODE)
         )
 
 
@@ -1840,25 +1804,8 @@ def _validate_host(report):
             ),
         )
 
-    driver_state = get_iscsi_driver_state()
-    if driver_state == "compiled-in":
-        report.add("PASS", "iSCSI kernel driver", "compiled into the kernel")
-    elif driver_state == "module":
-        iscsi_load = _query_sysrc("iscsi_load", LOADER_CONF_PATH) or ""
-        if iscsi_load.upper() == "YES":
-            report.add(
-                "PASS",
-                "iSCSI kernel driver",
-                'iscsi.ko loaded; iscsi_load="YES" in {}'.format(LOADER_CONF_PATH),
-            )
-        else:
-            report.add(
-                "FAIL",
-                "iSCSI kernel driver",
-                "iscsi.ko loaded but iscsi_load is {} in {}".format(
-                    iscsi_load or "<unset>", LOADER_CONF_PATH
-                ),
-            )
+    if os.path.exists(ISCSI_DEVICE_NODE):
+        report.add("PASS", "iSCSI kernel driver", "/dev/iscsi is available")
     else:
         report.add(
             "FAIL", "iSCSI kernel driver", "not loaded ({} is missing)".format(ISCSI_DEVICE_NODE)

@@ -264,9 +264,9 @@ changes the portal shown by FreeBSD.
 
 The config is parsed before driver or service changes. Privilege, platform,
 tools and FreeBSD userland release are checked before discovery.
-Driver setup detects loadable modules with `kldstat -q -n iscsi`, persists
-`iscsi_load=YES` in `/boot/loader.conf` for them, and loads a missing driver.
-A compiled-in driver needs no loader entry.
+Driver setup checks `/dev/iscsi`, loads `iscsi` if absent, then verifies the node.
+It does not classify modules or write `/boot/loader.conf`: `rc.d/iscsid` loads
+the module at boot through `required_modules="iscsi"`.
 `iscsid_enable=YES` is written only if needed; `service iscsid start` runs only
 when `service iscsid onestatus` says it is stopped. The service is never restarted.
 
@@ -285,7 +285,7 @@ The settings step prints one notice and changes no tuning. The
 Header and data digests remain CRC32C. Nothing requires an immediate reboot.
 
 After connecting, read-only validation prints PASS/WARN/FAIL checks and totals.
-Host checks require `/dev/iscsi`, enabled/running-service configuration and
+Host checks require `/dev/iscsi`, enabled-service configuration and
 stock boot-login configuration; customized boot flags WARN rather than change policy.
 For volumes connected this run, fewer live sessions or managed entries than
 requested and non-CRC32C digests FAIL. These problems only WARN for skipped
