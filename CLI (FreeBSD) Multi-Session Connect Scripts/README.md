@@ -17,14 +17,8 @@ The script has no dependency on a
 Linux script; `disconnect_for_documentation.py` imports helpers from this file,
 so keep both files in the same directory.
 
-This is a **separate implementation** from
-[`CLI (Linux) Multi-Session Connect Scripts`](../CLI%20(Linux)%20Multi-Session%20Connect%20Scripts/connect_for_documentation.py).
-FreeBSD's iSCSI stack (`iscsid`/`iscsictl`, `/etc/iscsi.conf`, `sysrc`/`service`)
-is fundamentally different from Linux's (`open-iscsi`/`iscsiadm`, distro
-package managers), so the two scripts intentionally do not share a code path.
-The zonal-affinity resolution logic (IMDS lookup, subscription/region checks,
-ARM Locations mapping, IQN decoration) is kept semantically identical between
-the two scripts.
+The FreeBSD implementation is independent of the Linux and Windows scripts.
+The tools share the zonal suffix and VIP allocation contracts, not host tooling.
 
 ## Prerequisites
 
@@ -113,14 +107,10 @@ python3 connect_for_documentation.py --subscription <sub-id-or-name> ...
 
 ## `--dry-run`
 
-`--dry-run` performs every read-only step -- Azure CLI/extension check, IMDS
-and Azure Resource Manager zonal lookups (if `--enable-zonal-affinity` is
-set), the per-volume storage-target lookup, the IPv4 DNS lookup (if
-`--enable-vip-distribution` is set), and nickname/config-block computation --
-and prints the plan (resolved targets, each portal's session count, nicknames,
-and the selected entries that would be merged into the managed block). It does **not**
-run `sysrc`, `service`, or `iscsictl`, and does **not** write
-`/etc/iscsi.conf`. It does not require root.
+`--dry-run` checks Azure CLI/extension availability, reads volume targets, and
+performs the enabled zonal and IPv4 DNS lookups. It prints resolved targets,
+portal counts, nicknames and the selected managed entries. It requires no root
+and never runs native tools, acquires a config lock or writes `/etc/iscsi.conf`.
 
 Subprocess output is captured in temporary files, including during dry-run,
 so inherited output handles cannot make timeout cleanup wait indefinitely.
@@ -128,32 +118,22 @@ Each command has an execution timeout plus at most five seconds for post-kill
 reaping. Only the direct child is terminated on timeout; deliberately started
 services and other descendants are not killed as a process group.
 
-Because inspecting existing sessions requires opening `/dev/iscsi` (which
-generally requires root), `--dry-run` does not inspect current session state
-and plans every requested session. The real run checks existing sessions before
-writing anything -- see "Idempotency and reruns" below.
-Native inspection is not inherently read-only:
-[`iscsictl` startup](https://github.com/freebsd/freebsd-src/blob/25985322095d073354d31431da34da1e6871cca5/usr.bin/iscsictl/iscsictl.c#L881-L891)
-can load the kernel module when `/dev/iscsi` is missing. Dry-run avoids all
-`iscsictl` calls, not just session-add commands. A mutating run requires the
-device node to exist, but does not provide a globally read-only native-state
-preflight guarantee.
-Because the existing config is intentionally not opened in unprivileged
-dry-run mode, retained managed entries for unselected volumes are not included
-in the preview.
+The preview assumes no existing sessions and does not read the current config;
+retained entries for unselected volumes are therefore absent. Real execution
+checks existing state before writing. Native inspection is not zero-effect:
+`iscsictl` can load the kernel module when `/dev/iscsi` is missing, so dry-run
+avoids every `iscsictl` call, including inventory.
 
 ## What gets written to `/etc/iscsi.conf`
 
 For every volume the script generates a deterministic nickname with this exact
 cross-tool contract (the Azure portal generator must use the same algorithm):
 
-1. Build the identity as a compact JSON array with no spaces:
+1. Serialize a compact JSON array with no spaces:
    `[rawVolumeGroupName,rawVolumeName,rawTargetName,sessionIndex]`, where
    `rawTargetName` is the resolved, unsanitized IQN written as `TargetName`
-   (including the zonal-affinity suffix when enabled). Python uses
-   `json.dumps(..., ensure_ascii=False, separators=(",", ":"))`; the portal
-   equivalent is `JSON.stringify([...])`. SHA-256 hashes the UTF-8 bytes of this
-   JSON. The first 16 lowercase hexadecimal characters are the digest.
+   (including a zonal suffix). SHA-256 hashes its UTF-8 bytes; the first
+   16 lowercase hexadecimal characters are the digest.
 2. Trim and lowercase the group and volume independently, replace each run of
    characters outside `[a-z0-9]` with `-`, and trim leading/trailing `-`.
    Form the readable base `esan-<sanitized-group>-<sanitized-volume>`.
@@ -161,12 +141,9 @@ cross-tool contract (the Azure portal generator must use the same algorithm):
    Truncate the readable base to the first `128 - len(suffix)` characters,
    trim trailing `-` from that prefix, and append the suffix.
 
-Every nickname includes the digest, even when the readable base is short. This
-keeps names stable and distinguishes raw identities that sanitize to the same
-text, different group/volume boundaries, and different target IQNs while
-remaining within 128 characters and `[a-z0-9][a-z0-9_-]*`. Each session of a
-volume gets its own stanza with the same `TargetName`; `TargetAddress` is that
-session's portal (the FQDN, or a VIP with `--enable-vip-distribution`):
+Every nickname includes the digest to disambiguate raw names, group/volume
+boundaries and IQNs. It fits within 128 characters and `[a-z0-9][a-z0-9_-]*`.
+Each session has a stanza with its target IQN and FQDN or selected VIP:
 
 ```
 esan-my-volume-group-volume1-<16-hex-digest>-s1 {
@@ -186,10 +163,8 @@ All of this lives inside a clearly delimited managed block:
 # END AZURE ELASTIC SAN FREEBSD MANAGED BLOCK
 ```
 
-This marker pair is intentionally origin-neutral (no "generated by ..." text)
-and is byte-for-byte identical to the one the Azure portal's generated
-FreeBSD connect script uses. Both tools write to the same `/etc/iscsi.conf`,
-so each must recognize the other's managed block.
+The neutral markers and nickname contract are identical in the standalone
+and Portal scripts, so each recognizes and preserves the other's entries.
 
 Anything outside that block -- your own stanzas, comments, CHAP secrets for
 other targets, etc. -- is preserved **byte-for-byte**. If `/etc/iscsi.conf`
@@ -204,12 +179,9 @@ then B or B then A converges to the same bytes. If the file has only one marker,
 duplicate markers, or non-standalone marker text, the script refuses to touch it
 rather than guessing.
 
-`TargetName`/`TargetAddress` values are validated before they are written:
-anything containing a quote, brace, `#`, `;`, or a control character
-(including newlines) is rejected outright rather than escaped, since
-`iscsi.conf(5)`'s grammar has no documented escape sequence for those
-characters -- allowing them through could let a malformed API response inject
-a second statement or stanza into the file.
+`TargetName`/`TargetAddress` values containing a quote, brace, `#`, `;`, or a
+control character are rejected, not escaped: the config grammar has no
+documented escape for these statement-breaking characters.
 Before formatting `TargetAddress`, the raw portal hostname must be a nonempty
 ASCII hostname with valid DNS labels, and the raw port must be an integer from
 1 through 65535 (not a Boolean or string). Port 3260 is omitted because it is
@@ -227,15 +199,11 @@ managed block, so they survive reruns.
 
 ### Atomic write, backup, and rollback
 
-Mutating runs are serialized with an exclusive `fcntl.flock` on the separate
-`/etc/.azure-elastic-san.lock` file. The separate inode is required because
-`/etc/iscsi.conf` itself is atomically replaced. The lock is securely opened
-without following symlinks where the platform supports `O_NOFOLLOW`, must be a
-regular non-symlink file, and is created with mode `0600`. It is acquired before
-reading or merging the config and held through backup, atomic write, `iscsid`
-setup, session setup, and any rollback. This prevents concurrent standalone or
-portal-generated runs that honor the same lock contract from losing each
-other's updates. `--dry-run` neither creates nor acquires the lock.
+Mutating runs hold an exclusive `fcntl.flock` on `/etc/.azure-elastic-san.lock`
+from the config read through host/session work and rollback. This separate inode
+survives config replacement. The lock must be a regular non-symlink file, is
+created `0600`, and uses `O_NOFOLLOW` where available. Both tools honor it;
+external writers must coordinate. Dry-run neither creates nor acquires it.
 
 While holding that lock, every write to `/etc/iscsi.conf` goes through: write a
 temp file in the same directory → `fsync` → preserve the original file's
@@ -352,14 +320,8 @@ Run disconnect, then connect again.
 
 ## Multipath
 
-Each session exposes its own disk device. The script does not assemble
-multipath devices; with more than one session it prints:
-
-```
-Multipath: each iSCSI session exposes its own disk device; this script does not assemble multipath devices. Use the host's multipath layer (gmultipath(8) or the initiator's multipath support) before using the volumes. Total sessions per volume must not exceed what the initiator allows to one target portal: the service can redirect sessions onto the same portal.
-```
-
-Use `gmultipath(8)` or the initiator's own multipath support so one volume's
+Each session exposes its own disk device; a runtime notice reminds you that
+the script does not assemble multipath. Use the host's multipath layer so one volume's
 devices are used as a single device. Do not put a file system on an individual
 `/dev/da*` path of a multi-session volume.
 
@@ -397,36 +359,21 @@ it removes plain and zonal sessions and entries alike.
 
 ## Known limitations / external validation gates
 
-These are things this PoC does not verify and that you must validate
-yourself before depending on it in production:
+Validate these limits against your exact initiator and backend before production:
 
-1. **Azure CLI on FreeBSD is community-maintained, not Microsoft-supported.**
-   The script only confirms `az` is present and the `elastic-san` extension
-   is installed; it cannot verify that the FreeBSD build of Azure CLI behaves
-   identically to the officially supported Linux/Windows/macOS builds.
-2. **iSCSI login-redirect (status-class 1) compatibility is unverified.**
-   Upstream FreeBSD `iscsid` implements RFC 3720/7143 login redirects
-   (a target returning a status-class-1 response with a new `TargetAddress`,
-   commonly used for portal-group load balancing / failover). Whether Elastic
-   SAN's backend issues such redirects, and whether FreeBSD's `iscsid`
-   handles them correctly against that specific backend/firmware version
-   (or a customized initiator or target stack), is **not validated by this
-   script**. Confirm this against the exact Elastic SAN backend version/fork
-   you are pointed at -- this is a hard gate before production use, since a
-   redirect FreeBSD's `iscsid` mishandles would surface as session churn or
-   silent connectivity loss, not a clean error from this script. The
-   readiness check accounts for a successful redirect by correlating by target
-   IQN instead of requiring the original portal.
-3. **`gmultipath` assembly is not automated** (see "Multipath") -- session
-   creation is not multipath device assembly.
-4. **Multi-session support depends on the initiator.** Stock FreeBSD allows
-   one session per target portal (see "Session count"). Initiators that permit
-   more need their own interoperability and failure-mode validation against the
-   target/backend version before production use.
-5. **Native and end-to-end qualification is outstanding.** Unit tests do not
-   establish suffix parsing/routing support, native login or redirect behavior,
-   reboot recovery, dual-stack operation, zone-failure recovery, or an
-   approximately 30-second recovery-time objective.
+1. **Azure CLI on FreeBSD is community-maintained.** Presence of `az` and the
+   extension does not establish API/packaging compatibility or first-class support.
+2. **Login redirects are not qualified.** Upstream `iscsid` implements
+   RFC 3720/7143 status-class-1 redirects, but target-specific interoperability
+   must be verified. Failures can cause session churn or silent connectivity loss.
+   Readiness follows target IQNs, not original portals, to permit valid redirects.
+3. **Multipath assembly is not automated.** Multiple sessions are separate disks,
+   not proof of working MPIO or final zone placement.
+4. **Multi-session limits depend on the initiator.** Stock FreeBSD allows one;
+   K-session initiators need their own interoperability/failure testing.
+5. **Native and E2E qualification remains required.** Unit tests do not establish
+   suffix parsing/routing, native login/redirect behavior, reboot recovery,
+   dual-stack operation, zone-failure recovery or a 30-second recovery objective.
 
 ## Disconnect
 
