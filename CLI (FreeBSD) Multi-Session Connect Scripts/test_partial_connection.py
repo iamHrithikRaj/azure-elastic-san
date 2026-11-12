@@ -74,11 +74,14 @@ class PartialConnectionTests(unittest.TestCase):
         self.assertIn(["iscsictl", "-R", "-n", plan.nicknames[1], "-c", str(path)], commands)
 
     def test_zero_connected_removes_this_runs_pending_sessions_and_restores_config(self):
-        _plan, path, live, _commands, _output, error = self.run_plan(
+        _plan, path, live, _commands, output, error = self.run_plan(
             ["host:3260"] * 2, ["Connecting"] * 2)
         self.assertEqual(live, [])
         self.assertEqual(path.read_bytes(), b"# operator-owned bytes\n")
         self.assertIsNotNone(error)
+        self.assertIn("0 of 2 sessions connected.", output)
+        self.assertIn("Inspect 'iscsictl -L -v'", output)
+        self.assertNotIn("re-run with -s 0", output)
 
     def test_partial_connection_never_removes_entries_that_existed_before_the_run(self):
         plan, path, live, _commands, _output, _error = self.run_plan(
