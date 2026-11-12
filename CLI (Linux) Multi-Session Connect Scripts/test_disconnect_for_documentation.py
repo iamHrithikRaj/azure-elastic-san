@@ -1,6 +1,8 @@
 import importlib.util
 import io
+import json
 import os
+import subprocess
 import unittest
 from unittest import mock
 
@@ -24,6 +26,56 @@ def completed_process(stdout="", stderr="", returncode=0):
 
 
 class DisconnectTests(unittest.TestCase):
+    def lookup(self, result=None, error=None):
+        payload = json.dumps({
+            "targetIqn": IQN, "targetPortalHostname": "portal.example", "targetPortalPort": 3260,
+        }).encode("utf-8")
+        result = result or subprocess.CompletedProcess([], 0, payload, b"")
+        process = completed_process(result.stdout.decode("utf-8"), result.stderr.decode("utf-8"), result.returncode)
+        process.poll.return_value = result.returncode
+        with mock.patch.object(disconnect, "check_azcli"), mock.patch.object(
+            disconnect.subprocess, "Popen", return_value=process,
+        ):
+            with mock.patch.object(disconnect.subprocess, "run", return_value=result, side_effect=error) as run:
+                value = disconnect.get_iqns("subscription with spaces", "rg", "san", "vg", "volume")
+        return value, run
+
+    def test_lookup_preserves_subscription_boundary_and_bounds_execution(self):
+        value, run = self.lookup()
+        self.assertEqual((IQN, "portal.example", 3260), value)
+        run.assert_called_once_with(
+            ["az", "elastic-san", "volume", "show", "-g", "rg", "-e", "san", "-v", "vg",
+             "-n", "volume", "--query", "storageTarget", "--subscription", "subscription with spaces"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+        )
+
+    def test_lookup_nonzero_exit_without_english_error_fails(self):
+        with self.assertRaisesRegex(Exception, "denied"):
+            self.lookup(subprocess.CompletedProcess([], 4, b"{}", b"denied"))
+
+    def test_lookup_successful_stderr_is_diagnostic(self):
+        payload = json.dumps({
+            "targetIqn": IQN, "targetPortalHostname": "portal.example", "targetPortalPort": 3260,
+        }).encode("utf-8")
+        value, _ = self.lookup(subprocess.CompletedProcess([], 0, payload, b"error diagnostic only"))
+        self.assertEqual((IQN, "portal.example", 3260), value)
+
+    def test_lookup_timeout_kills_and_reaps_cli(self):
+        process = mock.MagicMock()
+        process.__enter__.return_value = process
+        process.__exit__.side_effect = lambda *args: (process.wait(), False)[1]
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(["az"], 10), (b"", b""),
+        ]
+        process.poll.return_value = None
+        with mock.patch.object(disconnect, "check_azcli"), mock.patch.object(disconnect.time, "sleep"), mock.patch.object(
+            disconnect.subprocess, "Popen", return_value=process,
+        ):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                disconnect.get_iqns(None, "rg", "san", "vg", "volume")
+        process.kill.assert_called_once_with()
+        process.wait.assert_called()
+
     def test_import_needs_no_package_manager(self):
         module = importlib.util.module_from_spec(SPEC)
         with mock.patch("os.path.exists", return_value=False), mock.patch("subprocess.Popen") as run:
