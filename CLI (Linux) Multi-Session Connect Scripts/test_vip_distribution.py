@@ -136,6 +136,12 @@ class VipConnectionTests(unittest.TestCase):
     def run_connect(self, count=32, zonal=False, vip=True):
         connect.connect_volumes(None, "rg", "san", "vg", ["volume"], count, zonal, vip)
 
+    def test_session_snapshot_matches_case_insensitively_but_not_target_family(self):
+        selected = self.native.add_session(IQN.upper(), HOST)
+        self.native.add_session(IQN + ":az-eastus-az3", HOST)
+        self.native.add_session(IQN + "-other", HOST)
+        self.assertEqual({selected}, connect._session_ids(IQN))
+
     def test_original_portal_counts_and_seed_specific_clones(self):
         self.run_connect()
         self.assertEqual(VIPS, self.native.logins)
