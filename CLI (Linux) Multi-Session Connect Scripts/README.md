@@ -51,6 +51,11 @@ other portals to proceed; the volume fails only if none logs in. Clone or
 persistence failures also warn, so a usable connection may have fewer sessions
 or incomplete saved settings. Native commands use ordinary `sudo`.
 
+If the DataDigest update returns exit 7 (`ISCSI_ERR_INVAL`, `Invalid param name`),
+the initiator does not support data digests. The script warns once per volume
+and continues with HeaderDigest=CRC32C only. A volume group enforcing CRC protection
+will reject the logins. Every other setting failure still fails that portal attempt.
+
 ## Existing connections and limits
 
 Any session or node record for the plain IQN or its `:az-*` variants skips the

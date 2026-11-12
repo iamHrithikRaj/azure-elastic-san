@@ -532,6 +532,7 @@ def get_portals(hostname, number_of_sessions, enable_vip_distribution=False):
 
 
 def _iscsiadm(arguments, allow_empty=False):
+    """Returns None only when the initiator rejects the DataDigest setter as unsupported."""
     process = subprocess.Popen(
         ["sudo", "iscsiadm"] + arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
@@ -539,6 +540,10 @@ def _iscsiadm(arguments, allow_empty=False):
     out, err = _decode_output(out), _decode_output(err).strip()
     if allow_empty and process.returncode == 21:
         return ""
+    if process.returncode == 7 and arguments[-6:] == [
+        "--op", "update", "-n", "node.conn[0].iscsi.DataDigest", "-v", "CRC32C",
+    ]:
+        return None
     if process.returncode != 0:
         raise RuntimeError("iscsiadm {} failed: {}".format(
             " ".join(arguments), err or "exit code {}".format(process.returncode)
@@ -567,6 +572,7 @@ def _session_ids(target_iqn):
 def connect_volume(volume_name, target_iqn, portals, target_portal_port):
     print("{} [{}]: Connecting to this volume".format(volume_name, target_iqn))
     connected = False
+    data_digest_unsupported = False
     for portal, count in portals:
         if not count:
             if connected:
@@ -582,7 +588,12 @@ def connect_volume(volume_name, target_iqn, portals, target_portal_port):
                 ("node.conn[0].iscsi.HeaderDigest", "CRC32C"),
                 ("node.conn[0].iscsi.DataDigest", "CRC32C"),
             ):
-                _iscsiadm(node + ["--op", "update", "-n", key, "-v", value])
+                if _iscsiadm(node + ["--op", "update", "-n", key, "-v", value]) is None:
+                    if not data_digest_unsupported:
+                        print("[WARN] {} [{}]: initiator does not support iSCSI data digests; "
+                              "continuing with header digest only. A volume group enforcing CRC protection "
+                              "will reject the logins.".format(volume_name, target_iqn), file=sys.stderr)
+                    data_digest_unsupported = True
             previous = _session_ids(target_iqn) if count > 1 else set()
             _iscsiadm(node + ["--login"])
             connected = True
@@ -602,6 +613,7 @@ def connect_volume(volume_name, target_iqn, portals, target_portal_port):
             ), file=sys.stderr)
     if not connected:
         raise RuntimeError("{} [{}]: Login failed through every target portal".format(volume_name, target_iqn))
+    return data_digest_unsupported
 
 
 def connect_volumes(
