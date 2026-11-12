@@ -78,6 +78,7 @@ function Reset-TestHost {
     $script:claim = $true
     $script:claimSticks = $true
     $script:policy = 'RR'
+    $script:providerHresult = $null
     $script:diskTimeout = 30
     $script:initiatorKeys = @('Microsoft.PowerShell.Core\Registry::HKEY_LOCAL_MACHINE\TEST\Class\0004')
     $script:registry = @{
@@ -203,7 +204,7 @@ Describe 'Hardened default flow' {
         Mock Get-WindowsFeature { [pscustomobject]@{ Name = 'Multipath-IO'; InstallState = $script:serverFeature } }
         Mock Test-Path { $script:pendingReboot } -ParameterFilter { $LiteralPath -eq 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending' }
         Mock Install-WindowsFeature {
-            $script:serverFeature = if ($script:serverRestart -eq 'No') { 'Installed' } else { 'InstallPending' }
+            $script:serverFeature = 'Installed'
             [pscustomobject]@{ Success = $true; RestartNeeded = $script:serverRestart; ExitCode = 'Success' }
         }
         Mock Get-WindowsOptionalFeature {
@@ -211,12 +212,20 @@ Describe 'Hardened default flow' {
             if ($script:clientFeature) { [pscustomobject]@{ FeatureName = 'MultiPathIO'; State = $script:clientFeature } }
         }
         Mock Enable-WindowsOptionalFeature {
-            $script:clientFeature = if ($script:clientRestart) { 'EnablePending' } else { 'Enabled' }
+            $script:clientFeature = 'Enabled'
             [pscustomobject]@{ RestartNeeded = $script:clientRestart }
         }
         Mock Get-MSDSMAutomaticClaimSettings { @{ iSCSI = $script:claim; SAS = $false } }
         Mock Enable-MSDSMAutomaticClaim { if ($script:claimSticks) { $script:claim = $true } }
-        Mock Get-MSDSMGlobalDefaultLoadBalancePolicy { $script:policy }
+        Mock Get-MSDSMGlobalDefaultLoadBalancePolicy {
+            if ($null -ne $script:providerHresult) {
+                throw [System.Management.Automation.ErrorRecord]::new(
+                    [System.Runtime.InteropServices.COMException]::new('Invalid class', $script:providerHresult),
+                    ('HRESULT 0x{0:X8},Microsoft.Management.Infrastructure.CimCmdlets.GetCimInstanceCommand' -f $script:providerHresult),
+                    [System.Management.Automation.ErrorCategory]::MetadataError, 'root\wmi:MSDSM_DEFAULT_LOAD_BALANCE_POLICY')
+            }
+            $script:policy
+        }
         Mock Set-MSDSMGlobalDefaultLoadBalancePolicy { $script:policy = $Policy }
         Mock Get-MPIOSetting { [pscustomobject]@{ DiskTimeoutValue = $script:diskTimeout } }
         Mock Set-MPIOSetting { $script:diskTimeout = $NewDiskTimeout }
@@ -228,16 +237,50 @@ Describe 'Hardened default flow' {
 
     Context 'Preconditions' {
         It 'keeps the reboot gate on a rerun with pending Server MPIO installation' {
-            foreach ($state in 'InstallPending', 'Installed') {
+            foreach ($state in 'InstallPending') {
                 Reset-TestHost
                 $script:serverFeature = $state
-                $script:pendingReboot = $state -eq 'Installed'
-                { Invoke-TestConnect } | Should Throw 'Reboot the VM, then re-run this script'
+                { Invoke-TestConnect } | Should Throw 'Restart, then rerun'
                 $script:nativeCalls.Count | Should Be 0
             }
             Assert-MockCalled Install-WindowsFeature -Times 0 -Exactly -Scope It
             Assert-MockCalled Enable-MSDSMAutomaticClaim -Times 0 -Exactly -Scope It
             Assert-MockCalled Get-IscsiSession -Times 0 -Exactly -Scope It
+        }
+
+        It 'stops first runs and pre-reboot reruns with Installed MPIO and an unavailable MSDSM provider on Server and clients' {
+                foreach ($product in 3, 1) {
+                    foreach ($firstRun in $true, $false) {
+                        Reset-TestHost
+                        $script:productType = $product
+                        $script:providerHresult = -2147217392
+                        if ($firstRun) { $script:serverFeature = 'Available'; $script:clientFeature = 'Disabled' }
+                        { Invoke-TestConnect -SkipRecommendedSettings } | Should Throw 'Multipath I/O is installed but Windows must restart before it can be used. No sessions were added. Restart, then rerun.'
+                        $script:nativeCalls.Count | Should Be 0
+                    }
+                }
+                Assert-MockCalled Enable-MSDSMAutomaticClaim -Times 0 -Exactly -Scope It
+                Assert-MockCalled Get-IscsiSession -Times 0 -Exactly -Scope It
+        }
+
+        It 'does not block healthy MPIO on an unrelated CBS reboot' {
+                $script:pendingReboot = $true
+                Invoke-TestConnect
+                @(Get-TestLogins).Count | Should Be 32
+        }
+
+        It 'does not mistake another provider failure for a restart requirement' {
+                $script:providerHresult = -2147024891
+                { Invoke-TestConnect } | Should Throw 'Invalid class'
+                $script:nativeCalls.Count | Should Be 0
+        }
+
+        It 'keeps the client EnablePending reboot gate without reinstalling' {
+                $script:productType = 1
+                $script:clientFeature = 'EnablePending'
+                { Invoke-TestConnect } | Should Throw 'Restart, then rerun'
+                Assert-MockCalled Enable-WindowsOptionalFeature -Times 0 -Exactly -Scope It
+                $script:nativeCalls.Count | Should Be 0
         }
 
         It 'announces a reboot and warns that claiming applies after reboot when enabled this run' {
@@ -295,7 +338,7 @@ Describe 'Hardened default flow' {
                 }
                 $script:claim = $false
                 $script:registry.MaxTransferLength = 65536
-                { Invoke-TestConnect } | Should Throw 'Reboot the VM, then re-run this script'
+                { Invoke-TestConnect } | Should Throw 'Restart, then rerun'
                 $script:nativeCalls.Count | Should Be 0
                 $script:claim | Should Be $false
                 $script:registry.MaxTransferLength | Should Be 262144
