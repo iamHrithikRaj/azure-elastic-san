@@ -596,6 +596,43 @@ class ExistingStateTests(HardeningTestCase):
 
 
 class FailureAndValidationTests(HardeningTestCase):
+    def test_unsupported_data_digest_continues_with_header_only_and_validation_warning(self):
+        original = self.host.iscsiadm
+        self.host.negotiated_data_digest = "None"
+
+        def unsupported(args):
+            if "update" in args and "node.conn[0].iscsi.DataDigest" in args:
+                return 7, "", "iscsiadm: Cannot modify node.conn[0].iscsi.DataDigest. Invalid param name."
+            return original(args)
+
+        with mock.patch.object(self.host, "iscsiadm", side_effect=unsupported):
+            self.run_main()
+        self.assertEqual(4, len(self.host.sessions))
+        record = self.host.nodes[(iqn("volume1"), PORTAL)]
+        self.assertEqual("CRC32C", record["node.conn[0].iscsi.HeaderDigest"])
+        self.assertEqual("None", record["node.conn[0].iscsi.DataDigest"])
+        self.assertEqual(1, self.stderr.count("initiator does not support iSCSI data digests"))
+        self.assertIn("volume group enforcing CRC protection will reject the logins", self.stderr)
+        self.assertIn("[WARN] volume1 [{}] digests: ".format(iqn("volume1")), self.stdout)
+        self.assertIn("negotiated header/data: CRC32C/None", self.stdout)
+        self.assertNotIn("[FAIL]", self.stdout)
+
+    def test_only_exit_seven_for_the_data_digest_update_is_tolerated(self):
+        for key, code in (("node.conn[0].iscsi.DataDigest", 1), ("node.conn[0].iscsi.DataDigest", 8),
+                          ("node.conn[0].iscsi.HeaderDigest", 7), ("node.startup", 7)):
+            with self.subTest(key=key, code=code):
+                self.setUp()
+                original = self.host.iscsiadm
+
+                def failure(args):
+                    return (code, "", "Invalid param name") if "update" in args and key in args else original(args)
+
+                with mock.patch.object(self.host, "iscsiadm", side_effect=failure):
+                    with self.assertRaisesRegex(RuntimeError, "Login failed"):
+                        connect.connect_volume("volume1", iqn("volume1"), [(HOST, 4)], 3260)
+                self.assertEqual([], self.host.sessions)
+                self.assertNotIn("initiator does not support", self.stderr)
+
     def test_unknown_initial_snapshot_keeps_record_before_any_setting_update(self):
         original = self.host.iscsiadm
 

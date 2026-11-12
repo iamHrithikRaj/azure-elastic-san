@@ -472,12 +472,14 @@ def _validate_volume(report, outcome, state, details, paths, requested, apply_re
         return
     if state.records or live:
         negotiated = _volume_session_details(details, outcome.volume_iqn)[1]
+        required_digests = DIGEST_SETTINGS[:1] if outcome.data_digest_unsupported else DIGEST_SETTINGS
         wrong = [portal for _, portal, settings in state.records
-                 if any(settings.get(key, "").upper() != value for key, value in DIGEST_SETTINGS)]
-        digest_status = problem if wrong else "WARN" if live and (not negotiated or any(
+                 if any(settings.get(key, "").upper() != value for key, value in required_digests)]
+        digest_status = problem if wrong else "WARN" if outcome.data_digest_unsupported or live and (not negotiated or any(
             value.upper() != "CRC32C/CRC32C" for value in negotiated)) else "PASS"
         report.add(digest_status, label + "digests", "{}; negotiated header/data: {}".format(
-            "not CRC32C for " + ", ".join(wrong) if wrong else "CRC32C in the node records" if state.records else "no node records",
+            "not CRC32C for " + ", ".join(wrong) if wrong else "header CRC32C; data digests unsupported"
+            if outcome.data_digest_unsupported else "CRC32C in the node records" if state.records else "no node records",
             ", ".join(negotiated) or "none"))
         if apply_recommended and state.records:
             wrong = [portal for _, portal, settings in state.records
@@ -973,6 +975,7 @@ def get_portals(hostname, number_of_sessions, enable_vip_distribution=False):
 
 
 def _iscsiadm(arguments, allow_empty=False):
+    """Returns None only when the initiator rejects the DataDigest setter as unsupported."""
     process = subprocess.Popen(
         _command_prefix() + ["iscsiadm"] + arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
@@ -980,6 +983,10 @@ def _iscsiadm(arguments, allow_empty=False):
     out, err = _decode_output(out), _decode_output(err).strip()
     if allow_empty and process.returncode == 21:
         return ""
+    if process.returncode == 7 and arguments[-6:] == [
+        "--op", "update", "-n", "node.conn[0].iscsi.DataDigest", "-v", "CRC32C",
+    ]:
+        return None
     if process.returncode != 0:
         raise RuntimeError("iscsiadm {} failed: {}".format(
             " ".join(arguments), err or "exit code {}".format(process.returncode)
@@ -1115,6 +1122,7 @@ def _delete_created_node(volume_name, target_iqn, node, sessions_before):
 def connect_volume(volume_name, target_iqn, portals, target_portal_port, recommended_settings=()):
     print("{} [{}]: Connecting to this volume".format(volume_name, target_iqn))
     connected = False
+    data_digest_unsupported = False
     for portal, count in portals:
         if not count:
             if connected:
@@ -1134,7 +1142,12 @@ def connect_volume(volume_name, target_iqn, portals, target_portal_port, recomme
                 ("node.conn[0].iscsi.HeaderDigest", "CRC32C"),
                 ("node.conn[0].iscsi.DataDigest", "CRC32C"),
             ) + tuple(recommended_settings):
-                _iscsiadm(node + ["--op", "update", "-n", key, "-v", value])
+                if _iscsiadm(node + ["--op", "update", "-n", key, "-v", value]) is None:
+                    if not data_digest_unsupported:
+                        print("[WARN] {} [{}]: initiator does not support iSCSI data digests; "
+                              "continuing with header digest only. A volume group enforcing CRC protection "
+                              "will reject the logins.".format(volume_name, target_iqn), file=sys.stderr)
+                    data_digest_unsupported = True
             previous = _session_ids(target_iqn) if count > 1 else set()
             _iscsiadm(node + ["--login"])
             connected = logged_in = True
@@ -1156,6 +1169,7 @@ def connect_volume(volume_name, target_iqn, portals, target_portal_port, recomme
                 _delete_created_node(volume_name, target_iqn, node, sessions_before)
     if not connected:
         raise RuntimeError("{} [{}]: Login failed through every target portal".format(volume_name, target_iqn))
+    return data_digest_unsupported
 
 
 class VolumeOutcome(object):
@@ -1168,6 +1182,7 @@ class VolumeOutcome(object):
         self.connected_this_run = connected_this_run
         self.failed = False
         self.settings_changed_while_live = False
+        self.data_digest_unsupported = False
 
 
 def _lookup_volume(elastic_san_subscription, resource_group_name, elastic_san_name, volume_group_name, volume_name):
@@ -1242,7 +1257,8 @@ def connect_volumes(
                 outcome.settings_changed_while_live = update_recommended_settings(
                     volume_name, target_iqn, existing, recommended_settings)
             else:
-                connect_volume(volume_name, target_iqn, portals, target_port, recommended_settings)
+                outcome.data_digest_unsupported = connect_volume(
+                    volume_name, target_iqn, portals, target_port, recommended_settings)
         except (OSError, RuntimeError) as error:
             # Report and continue; validation decides PASS/WARN/FAIL.
             print("{} [{}]: Failed: {}".format(volume_name, target_iqn, error), file=sys.stderr)

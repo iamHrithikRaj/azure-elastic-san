@@ -77,7 +77,14 @@ defaults are never changed; differing `find_multipaths`, `polling_interval` or
 only volumes connected in this run have their WWIDs registered, after disks attach
 inside the bounded readiness wait.
 `--skip-recommended-settings` skips the node values, the multipath file and WWID
-registration; prerequisites and CRC32C digests are always configured.
+registration; prerequisites and CRC32C digests are always requested.
+
+Some initiators (including RHEL-family builds) reject the DataDigest node
+parameter with exit 7 (`ISCSI_ERR_INVAL`, `Invalid param name`). Only that setter
+failure is tolerated: the script warns once per volume and continues with
+HeaderDigest=CRC32C and no data digest. A volume group enforcing CRC protection
+will reject the logins. Validation reports the negotiated data digest as WARN,
+not PASS. All other setting failures still fail the portal attempt.
 
 A final validation prints `[PASS]`, `[WARN]` or `[FAIL]` lines for the host
 checks `iscsid service`, `multipathd service`, `iSCSI login unit`,
