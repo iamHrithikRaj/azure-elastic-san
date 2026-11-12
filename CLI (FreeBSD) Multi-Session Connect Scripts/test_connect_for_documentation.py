@@ -446,6 +446,37 @@ class FreeBsdMutationPreflightTests(unittest.TestCase):
 
 
 class ConfigValueValidationTests(unittest.TestCase):
+    def test_native_address_omits_default_port_and_checks_46_byte_limit(self):
+        hostname = "es-mmgbuai3da50.z13.blob.storage.azure.net"
+        self.assertEqual(hostname, connect.format_target_address(hostname, 3260, "vol"))
+        self.assertEqual("a" * 46, connect.format_target_address("a" * 46, 3260, "vol"))
+        self.assertEqual("a" * 41 + ":3261", connect.format_target_address("a" * 41, 3261, "vol"))
+        for host, port in (("a" * 47, 3260), ("a" * 42, 3261)):
+            with self.subTest(host=host, port=port):
+                with self.assertRaisesRegex(connect.ElasticSanConnectError, "46 bytes"):
+                    connect.format_target_address(host, port, "vol")
+
+    def test_default_port_spelling_converges_in_config_inventory_and_plan(self):
+        entry = connect.ManagedConfigEntry("esan-vg-vol-s1", "iqn.test:vol", "portal.example:3260")
+        block = connect.render_managed_block([entry])
+        self.assertIn(b'TargetAddress = "portal.example"', block)
+        old_block = block.replace(b'"portal.example"', b'"portal.example:3260"')
+        self.assertEqual(block, connect.compute_new_config_content(old_block, block))
+        sessions = connect._parse_iscsictl_verbose_sessions(
+            verbose_session_block("iqn.test:vol", "portal.example:3260"))
+        plan = connect.VolumeConnectionPlan("vol", "iqn.test:vol", "portal.example:3260", [entry.nickname])
+        self.assertEqual([entry.target_address], plan.session_addresses)
+        self.assertEqual(entry.target_address, sessions[0]["Target portal"])
+
+    def test_overlong_later_address_stops_before_any_host_change(self):
+        with mock.patch.object(connect, "get_volume_storage_target", side_effect=[
+            ("iqn.test:first", "portal.example", 3260), ("iqn.test:second", "a" * 47, 3260)
+        ]), mock.patch.object(connect, "check_freebsd_mutation_prerequisites") as mutation:
+            with self.assertRaisesRegex(connect.ElasticSanConnectError, "46 bytes"):
+                plans = connect.build_connection_plan(None, "rg", "san", "vg", ["first", "second"], 1)
+                connect.execute_connection_plan(plans, "unused", 1)
+        mutation.assert_not_called()
+
     def test_rejects_quotes_braces_hash_semicolon(self):
         for bad_value in ['bad"value', "bad{value", "bad}value", "bad#value", "bad;value"]:
             with self.subTest(bad_value=bad_value):
