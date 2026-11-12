@@ -446,6 +446,14 @@ class FreeBsdMutationPreflightTests(unittest.TestCase):
 
 
 class ConfigValueValidationTests(unittest.TestCase):
+    def test_readme_limits_total_sessions_and_preserves_pre_existing_sessions(self):
+        with open(os.path.join(os.path.dirname(__file__), "README.md"), encoding="utf-8") as handle:
+            readme = handle.read()
+        for unsafe in ("at most one session\nper resolved VIP", "any count up to 32", "8 per VIP", "-s 24",
+                       "(or otherwise disconnect/remove sessions)"):
+            self.assertNotIn(unsafe, readme)
+        self.assertIn("never removes sessions that existed before the run", readme)
+
     def test_native_address_omits_default_port_and_checks_46_byte_limit(self):
         hostname = "es-mmgbuai3da50.z13.blob.storage.azure.net"
         self.assertEqual(hostname, connect.format_target_address(hostname, 3260, "vol"))
