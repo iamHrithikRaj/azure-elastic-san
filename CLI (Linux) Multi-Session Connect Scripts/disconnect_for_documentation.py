@@ -12,21 +12,18 @@ def check_azcli():
 # get iqn info from the ElasticSAN
 def get_iqns(subscription, resource_group_name, elastic_san_name, volume_group_name, volume_name):
     check_azcli()
-    subscription = " --subscription "+subscription if subscription is not None else ""
-    command = "az elastic-san volume show -g {} -e {} -v {} -n {} --query storageTarget{}".format(resource_group_name, elastic_san_name, volume_group_name, volume_name, subscription).split(' ')
-    p = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    # timeout in case the extension is not installed and prompts the user to install
-    timeout = 10
-    while p.poll() is None and timeout > 0:
-     time.sleep(1)
-     timeout -= 1
-    if timeout<=0:
-        raise Exception('Command took longer than 10s')
-    out, err = p.communicate()
-    if "error" in err.decode("utf-8").lower():
-        raise Exception(err)
-    out = out.decode("utf-8")
-    storage_target = json.loads(out)
+    command = [
+        "az", "elastic-san", "volume", "show", "-g", resource_group_name,
+        "-e", elastic_san_name, "-v", volume_group_name, "-n", volume_name,
+        "--query", "storageTarget",
+    ]
+    if subscription is not None:
+        command.extend(["--subscription", subscription])
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8").strip() or result.stdout.decode("utf-8").strip()
+        raise Exception("Azure CLI failed: {}".format(detail or "exit code {}".format(result.returncode)))
+    storage_target = json.loads(result.stdout.decode("utf-8"))
     target_iqn = storage_target["targetIqn"]
     target_portal_hostname = storage_target["targetPortalHostname"]
     target_portal_port = storage_target["targetPortalPort"]
