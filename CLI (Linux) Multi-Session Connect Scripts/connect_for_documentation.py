@@ -581,7 +581,7 @@ def _session_ids(target_iqn):
     output = _iscsiadm(["-m", "session"], allow_empty=True)
     return {sid for sid, iqn in re.findall(
         r"^\s*\S+:\s+\[([0-9]+)\]\s+\S+\s+(\S+)", output, re.M
-    ) if iqn == target_iqn}
+    ) if iqn.lower() == target_iqn.lower()}
 
 
 def connect_volume(volume_name, target_iqn, portals, target_portal_port):
