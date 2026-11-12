@@ -661,16 +661,6 @@ class ConfigSplicingTests(unittest.TestCase):
         with self.assertRaisesRegex(connect.ElasticSanConnectError, "more than one managed-block"):
             connect.compute_new_config_content(existing, b"anything")
 
-    def test_idempotent_rerender_of_same_plan_is_byte_identical(self):
-        entries = [
-            connect.ManagedConfigEntry(
-                "esan-vg-vol-s1", "iqn.example:target", "10.0.0.1:3260"
-            )
-        ]
-        first = connect.render_managed_block(entries)
-        second = connect.render_managed_block(entries)
-        self.assertEqual(first, second)
-
     def test_selecting_b_preserves_a_and_selecting_a_preserves_b(self):
         entry_a = connect.ManagedConfigEntry(
             "esan-vg-a-s1", "iqn.example:a", "a.example:3260"

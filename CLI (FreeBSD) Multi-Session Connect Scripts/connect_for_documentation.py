@@ -49,16 +49,8 @@ try:
 except ImportError:  # pragma: no cover - tests also run on non-POSIX developer machines
     fcntl = None
 
-try:
-    from urllib.request import ProxyHandler, Request, build_opener
-    from urllib.error import HTTPError, URLError
-except ImportError:  # pragma: no cover - py2 fallback retained for parity with the Linux script
-    from urllib2 import HTTPError, ProxyHandler, Request, URLError, build_opener
-
-try:
-    string_types = (basestring,)  # noqa: F821 - py2 fallback
-except NameError:
-    string_types = (str,)
+from urllib.request import ProxyHandler, Request, build_opener
+from urllib.error import HTTPError, URLError
 
 
 # ---------------------------------------------------------------------------
@@ -292,7 +284,7 @@ def get_vm_compute_metadata():
 
 def _required_metadata_value(compute, field_name):
     value = compute.get(field_name)
-    if not isinstance(value, string_types) or not value.strip():
+    if not isinstance(value, str) or not value.strip():
         raise ElasticSanConnectError(
             "IMDS compute metadata is missing a valid '{}' value".format(field_name)
         )
@@ -300,7 +292,7 @@ def _required_metadata_value(compute, field_name):
 
 
 def canonicalize_subscription_id(subscription_id, source):
-    if not isinstance(subscription_id, string_types):
+    if not isinstance(subscription_id, str):
         raise ElasticSanConnectError("{} subscription ID must be a GUID".format(source))
     canonical_subscription_id = subscription_id.strip().lower()
     if SUBSCRIPTION_ID_PATTERN.match(canonical_subscription_id) is None:
@@ -377,7 +369,7 @@ def map_logical_to_physical_zone(locations, location_name, logical_zone):
             raise ElasticSanConnectError("Azure location REST response contains a malformed region entry")
         candidate_name = candidate.get("name")
         if (
-            isinstance(candidate_name, string_types)
+            isinstance(candidate_name, str)
             and candidate_name.strip().lower() == normalized_location
         ):
             if region is not None:
@@ -414,9 +406,9 @@ def map_logical_to_physical_zone(locations, location_name, logical_zone):
         mapped_logical_zone = mapping.get("logicalZone")
         mapped_physical_zone = mapping.get("physicalZone")
         if (
-            not isinstance(mapped_logical_zone, string_types)
+            not isinstance(mapped_logical_zone, str)
             or not mapped_logical_zone.strip()
-            or not isinstance(mapped_physical_zone, string_types)
+            or not isinstance(mapped_physical_zone, str)
             or not mapped_physical_zone.strip()
         ):
             raise ElasticSanConnectError("availabilityZoneMappings contains a malformed entry")
@@ -443,7 +435,7 @@ def resolve_physical_zone(elastic_san_subscription, resource_group_name, elastic
     """Return (physical zone, canonical subscription ID) for scoped volume discovery."""
     compute = get_vm_compute_metadata()
     logical_zone = compute.get("zone")
-    if not isinstance(logical_zone, string_types) or not logical_zone.strip():
+    if not isinstance(logical_zone, str) or not logical_zone.strip():
         raise ElasticSanConnectError(
             "VM is not availability-zone pinned; IMDS compute.zone is empty or missing"
         )
@@ -475,7 +467,7 @@ def resolve_physical_zone(elastic_san_subscription, resource_group_name, elastic
 
 
 def decorate_target_iqn(target_iqn, physical_zone):
-    if not isinstance(target_iqn, string_types) or not target_iqn:
+    if not isinstance(target_iqn, str) or not target_iqn:
         raise ElasticSanConnectError("Target IQN must be a non-empty string")
 
     normalized_physical_zone = physical_zone.strip().lower()
@@ -569,7 +561,7 @@ def validate_config_scalar(value, field_name):
     iscsi.conf(5) (quotes, braces, comment/statement separators, or control
     characters including newlines) rather than attempting to escape it --
     the format has no documented escape sequence for these characters."""
-    if not isinstance(value, string_types) or not value:
+    if not isinstance(value, str) or not value:
         raise ElasticSanConnectError("{} must be a non-empty string".format(field_name))
     if any(ord(character) < 0x20 for character in value):
         raise ElasticSanConnectError(
@@ -587,13 +579,13 @@ def validate_config_scalar(value, field_name):
 
 def format_target_address(hostname, port=..., volume_name="target"):
     """Use iscsid's default port to stay within the kernel's 46-byte address field."""
-    if port is Ellipsis and isinstance(hostname, string_types):
+    if port is Ellipsis and isinstance(hostname, str):
         hostname, separator, port_text = hostname.partition(":")
         if separator and not re.fullmatch(r"[0-9]+", port_text):
             raise ElasticSanConnectError("Target portal port must be an integer from 1 to 65535")
         port = int(port_text) if separator else 3260
     if (
-        not isinstance(hostname, string_types)
+        not isinstance(hostname, str)
         or not hostname
         or len(hostname.rstrip(".")) > 253
         or PORTAL_HOSTNAME_PATTERN.fullmatch(hostname) is None
@@ -647,7 +639,7 @@ def resolve_session_portals(hostname, number_of_sessions, enable_vip_distributio
 
 
 def sanitize_identity_component(value, field_name):
-    if not isinstance(value, string_types) or not value.strip():
+    if not isinstance(value, str) or not value.strip():
         raise ElasticSanConnectError("{} must be a non-empty string".format(field_name))
     lowered = value.strip().lower()
     sanitized = re.sub(r"[^a-z0-9]+", "-", lowered).strip("-")
@@ -671,7 +663,7 @@ def build_nickname(volume_group_name, volume_name, target_name, session_index):
     """
     sanitized_group = sanitize_identity_component(volume_group_name, "Volume group name")
     sanitized_volume = sanitize_identity_component(volume_name, "Volume name")
-    if not isinstance(target_name, string_types) or not target_name:
+    if not isinstance(target_name, str) or not target_name:
         raise ElasticSanConnectError("Target IQN must be a non-empty string")
     if (
         isinstance(session_index, bool)
@@ -691,14 +683,7 @@ def build_nickname(volume_group_name, volume_name, target_name, session_index):
     identity_hash = hashlib.sha256(identity_json.encode("utf-8")).hexdigest()[:16]
     suffix = "-{}-s{}".format(identity_hash, session_index)
     readable_prefix = readable_base[: 128 - len(suffix)].rstrip("-")
-    nickname = readable_prefix + suffix
-
-    if len(nickname) > 128 or NICKNAME_PATTERN.match(nickname) is None:
-        raise ElasticSanConnectError(
-            "Generated nickname '{}' is not a safe iscsi.conf identifier (volume group/volume "
-            "names may resolve to no usable characters)".format(nickname)
-        )
-    return nickname
+    return readable_prefix + suffix
 
 
 class ManagedConfigEntry(object):
@@ -1357,18 +1342,7 @@ def build_connection_plan(
 
 
 def render_full_managed_block(plans):
-    entries = []
-    seen_nicknames = set()
-    for plan in plans:
-        for entry in plan.entries():
-            if entry.nickname in seen_nicknames:
-                raise ElasticSanConnectError(
-                    "Connection plan contains duplicate nickname '{}'; refusing to render it".format(
-                        entry.nickname
-                    )
-                )
-            seen_nicknames.add(entry.nickname)
-            entries.append(entry)
+    entries = [entry for plan in plans for entry in plan.entries()]
     if not entries:
         raise ElasticSanConnectError(
             "Refusing to render an empty Azure Elastic SAN connection plan"
@@ -1426,9 +1400,9 @@ def plan_is_already_connected(plan, sessions):
             )
         )
         raise ElasticSanConnectError(
-            "{} [{}]: found existing session(s) that are not Connected (state: {}). This "
-            "script will not add, remove or modify them. Inspect 'iscsictl -L -v', recover them "
-            "manually or run disconnect_for_documentation.py for this volume, then re-run.".format(
+            "{} [{}]: found existing session(s) that are not Connected (state: {}). "
+            "Inspect 'iscsictl -L -v'; recover them or run disconnect_for_documentation.py "
+            "for this volume before retrying.".format(
                 plan.volume_name, plan.target_name, ", ".join(states)
             )
         )
