@@ -17,7 +17,7 @@ function iscsicli {
     $global:LASTEXITCODE = 0
     if ($args[0] -eq $script:failedCommand) {
         $global:LASTEXITCODE = $script:nativeExit
-        'The operation failed.'
+        $script:nativeOutput
     } elseif ($args[0] -eq 'ListPersistentTargets') {
         $script:listing
     } else {
@@ -45,6 +45,7 @@ Describe 'Target-scoped Windows disconnect' {
         $script:nativeCalls = New-Object 'System.Collections.Generic.List[object]'
         $script:failedCommand = ''
         $script:nativeExit = 0
+        $script:nativeOutput = 'The operation failed.'
         $script:sessions = @()
         $script:listing = @(New-TestPersistentListing @())
         $volumesToDisconnect = @([pscustomobject]@{
@@ -178,7 +179,39 @@ Describe 'Target-scoped Windows disconnect' {
         { . $disconnectBlock } | Should Throw 'ListPersistentTargets'
         $script:nativeCalls.Count | Should Be 1
     }
-    It 'stops on native removal failure instead of claiming cleanup succeeded' {
+    It 'tolerates an absent static target after reboot and cleans the next volume' {
+        $volumesToDisconnect += [pscustomobject]@{ VolumeName = 'two'; TargetIQN = 'iqn.test:two' }
+        $script:listing = @(New-TestPersistentListing @(
+            @{ Name = 'iqn.test:one'; Address = '10.0.0.1'; Port = 3260 },
+            @{ Name = 'iqn.test:two'; Address = '10.0.0.2'; Port = 3260 }
+        ))
+        $script:failedCommand = 'RemoveTarget'
+        $script:nativeExit = -268500951
+        $script:nativeOutput = 'The target name is not found or is marked as hidden from login.'
+        . $disconnectBlock
+        @($script:nativeCalls | Where-Object { $_[0] -eq 'RemovePersistentTarget' }).Count | Should Be 2
+        @($script:nativeCalls | Where-Object { $_[0] -eq 'RemoveTarget' }).Count | Should Be 2
+    }
+    It 'attempts later volumes and reports an aggregate error for a real cleanup failure' {
+        $volumesToDisconnect += [pscustomobject]@{ VolumeName = 'two'; TargetIQN = 'iqn.test:two' }
+        $script:listing = @(New-TestPersistentListing @(
+            @{ Name = 'iqn.test:one'; Address = '10.0.0.1'; Port = 3260 },
+            @{ Name = 'iqn.test:two'; Address = '10.0.0.2'; Port = 3260 }
+        ))
+        $script:failedCommand = 'RemoveTarget'
+        $script:nativeExit = 5
+        $failure = $null
+        try { . $disconnectBlock } catch { $failure = $_.Exception.Message }
+        $failure | Should Match 'exit 5'
+        @($script:nativeCalls | Where-Object { $_[0] -eq 'RemovePersistentTarget' }).Count | Should Be 2
+    }
+    It 'does not tolerate the absent-target code for persistent removal' {
+        $script:listing = @(New-TestPersistentListing @(@{ Name = 'iqn.test:one'; Address = '10.0.0.1'; Port = 3260 }))
+        $script:failedCommand = 'RemovePersistentTarget'
+        $script:nativeExit = -268500951
+        { . $disconnectBlock } | Should Throw 'RemovePersistentTarget'
+    }
+    It 'reports native removal failure instead of claiming cleanup succeeded' {
         $script:listing = @(New-TestPersistentListing @(@{ Name = 'iqn.test:one'; Address = '10.0.0.1'; Port = 3260 }))
         $script:failedCommand = 'RemovePersistentTarget'
         $script:nativeExit = 5
