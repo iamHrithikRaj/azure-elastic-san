@@ -68,7 +68,7 @@ class DisconnectTests(unittest.TestCase):
             subprocess.TimeoutExpired(["az"], 10), (b"", b""),
         ]
         process.poll.return_value = None
-        with mock.patch.object(disconnect, "check_azcli"), mock.patch.object(disconnect.time, "sleep"), mock.patch.object(
+        with mock.patch.object(disconnect, "check_azcli"), mock.patch("time.sleep"), mock.patch.object(
             disconnect.subprocess, "Popen", return_value=process,
         ):
             with self.assertRaises(subprocess.TimeoutExpired):
