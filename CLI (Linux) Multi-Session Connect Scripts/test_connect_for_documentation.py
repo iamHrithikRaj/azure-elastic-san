@@ -122,7 +122,7 @@ class ZonalAffinityTests(unittest.TestCase):
                 connect.subprocess, "Popen",
                 side_effect=lambda command, **kwargs: processes.pop(0)(command, **kwargs),
             ) as popen:
-                physical_zone = connect.resolve_physical_zone(None, "rg", "san")
+                physical_zone = connect.resolve_zonal_affinity_context(None, "rg", "san")[1]
 
         self.assertEqual("eastus-az3", physical_zone)
         self.assertEqual(
@@ -183,9 +183,9 @@ class ZonalAffinityTests(unittest.TestCase):
                     connect.ZonalAffinityError,
                     "Elastic SAN subscription .* does not match VM subscription",
                 ):
-                    connect.resolve_physical_zone(
+                    connect.resolve_zonal_affinity_context(
                         "production-subscription", "rg", "san"
-                    )
+                    )[1]
 
         self.assertEqual(
             [
@@ -212,7 +212,7 @@ class ZonalAffinityTests(unittest.TestCase):
 
         with mock.patch.object(connect, "get_vm_compute_metadata", return_value=compute):
             with self.assertRaisesRegex(connect.ZonalAffinityError, "not availability-zone pinned"):
-                connect.resolve_physical_zone(None, "rg", "san")
+                connect.resolve_zonal_affinity_context(None, "rg", "san")[1]
 
     def test_imds_failure_is_explicit(self):
         opener = mock.Mock()
@@ -235,7 +235,7 @@ class ZonalAffinityTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     connect.ZonalAffinityError, "Please run 'az login'"
                 ):
-                    connect.resolve_physical_zone(None, "rg", "san")
+                    connect.resolve_zonal_affinity_context(None, "rg", "san")[1]
 
     def test_invalid_cli_subscription_guid_is_rejected_before_url_construction(self):
         with mock.patch.object(
@@ -267,7 +267,7 @@ class ZonalAffinityTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     connect.ZonalAffinityError, "IMDS subscription ID must be a GUID"
                 ):
-                    connect.resolve_physical_zone(None, "rg", "san")
+                    connect.resolve_zonal_affinity_context(None, "rg", "san")[1]
 
         popen.assert_not_called()
 
@@ -355,7 +355,7 @@ class ZonalAffinityTests(unittest.TestCase):
                     connect.ZonalAffinityError,
                     r"^The VM and Elastic SAN must be in the same region\.$",
                 ):
-                    connect.resolve_physical_zone(None, "rg", "san")
+                    connect.resolve_zonal_affinity_context(None, "rg", "san")[1]
 
         self.assertEqual(2, popen.call_count)
 

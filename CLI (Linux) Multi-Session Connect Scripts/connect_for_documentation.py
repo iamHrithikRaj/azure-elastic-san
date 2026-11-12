@@ -10,16 +10,8 @@ import sys
 import tempfile
 import time
 
-try:
-    from urllib.request import ProxyHandler, Request, build_opener
-    from urllib.error import HTTPError, URLError
-except ImportError:
-    from urllib2 import HTTPError, ProxyHandler, Request, URLError, build_opener
-
-try:
-    string_types = (basestring,)
-except NameError:
-    string_types = (str,)
+from urllib.request import ProxyHandler, Request, build_opener
+from urllib.error import HTTPError, URLError
 
 IMDS_COMPUTE_URL = "http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01"
 IMDS_TIMEOUT_SECONDS = 5
@@ -661,7 +653,7 @@ def get_vm_compute_metadata():
 
 def _required_metadata_value(compute, field_name):
     value = compute.get(field_name)
-    if not isinstance(value, string_types) or not value.strip():
+    if not isinstance(value, str) or not value.strip():
         raise ZonalAffinityError(
             "IMDS compute metadata is missing a valid '{}' value".format(field_name)
         )
@@ -669,7 +661,7 @@ def _required_metadata_value(compute, field_name):
 
 
 def canonicalize_subscription_id(subscription_id, source):
-    if not isinstance(subscription_id, string_types):
+    if not isinstance(subscription_id, str):
         raise ZonalAffinityError("{} subscription ID must be a GUID".format(source))
     canonical_subscription_id = subscription_id.strip().lower()
     if SUBSCRIPTION_ID_PATTERN.match(canonical_subscription_id) is None:
@@ -756,7 +748,7 @@ def map_logical_to_physical_zone(locations, location_name, logical_zone):
         if not isinstance(candidate, dict):
             raise ZonalAffinityError("Azure location REST response contains a malformed region entry")
         candidate_name = candidate.get("name")
-        if not isinstance(candidate_name, string_types) or not candidate_name.strip():
+        if not isinstance(candidate_name, str) or not candidate_name.strip():
             raise ZonalAffinityError("Azure location REST response contains a malformed region entry")
         if candidate_name.strip().lower() == normalized_location:
             if region is not None:
@@ -793,9 +785,9 @@ def map_logical_to_physical_zone(locations, location_name, logical_zone):
         mapped_logical_zone = mapping.get("logicalZone")
         mapped_physical_zone = mapping.get("physicalZone")
         if (
-            not isinstance(mapped_logical_zone, string_types)
+            not isinstance(mapped_logical_zone, str)
             or not mapped_logical_zone.strip()
-            or not isinstance(mapped_physical_zone, string_types)
+            or not isinstance(mapped_physical_zone, str)
             or not mapped_physical_zone.strip()
         ):
             raise ZonalAffinityError("availabilityZoneMappings contains a malformed entry")
@@ -823,7 +815,7 @@ def resolve_zonal_affinity_context(
 ):
     compute = get_vm_compute_metadata()
     logical_zone = compute.get("zone")
-    if not isinstance(logical_zone, string_types) or not logical_zone.strip():
+    if not isinstance(logical_zone, str) or not logical_zone.strip():
         raise ZonalAffinityError(
             "VM is not availability-zone pinned; IMDS compute.zone is empty or missing"
         )
@@ -858,16 +850,8 @@ def resolve_zonal_affinity_context(
     return elastic_san_subscription_id, physical_zone
 
 
-def resolve_physical_zone(
-    elastic_san_subscription, resource_group_name, elastic_san_name
-):
-    return resolve_zonal_affinity_context(
-        elastic_san_subscription, resource_group_name, elastic_san_name
-    )[1]
-
-
 def normalize_physical_zone(physical_zone):
-    if not isinstance(physical_zone, string_types):
+    if not isinstance(physical_zone, str):
         raise ZonalAffinityError("Physical zone must be a nonempty string")
     normalized_physical_zone = physical_zone.strip().lower()
     if (
@@ -884,7 +868,7 @@ def normalize_physical_zone(physical_zone):
 
 def decorate_target_iqn(target_iqn, physical_zone):
     normalized_physical_zone = normalize_physical_zone(physical_zone)
-    if not isinstance(target_iqn, string_types) or not target_iqn:
+    if not isinstance(target_iqn, str) or not target_iqn:
         raise ZonalAffinityError("Target IQN must be a nonempty string")
     # Provisional contract: the Elastic SAN front end must parse and strip this suffix
     # before zonal-affinity routing can be used in production.
@@ -928,7 +912,7 @@ def get_mapped_volume_target(
     if not isinstance(target, dict):
         raise ZonalAffinityError("Volume '{}' storageTarget must be a JSON object".format(volume_name))
     for field in ("targetIqn", "targetPortalHostname"):
-        if not isinstance(target.get(field), string_types) or not target[field]:
+        if not isinstance(target.get(field), str) or not target[field]:
             raise ZonalAffinityError(
                 "Volume '{}' storageTarget is missing a valid '{}'".format(volume_name, field)
             )
