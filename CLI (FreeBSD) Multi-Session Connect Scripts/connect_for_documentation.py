@@ -1507,17 +1507,10 @@ def describe_plan(plans, number_of_sessions):
 # ---------------------------------------------------------------------------
 
 def plan_volume_action(plan, managed_entries, sessions, config_path):
-    """Apply the existing-state policy to one volume before anything is mutated.
+    """Return None to connect, otherwise why the volume is left unchanged.
 
-    Returns None when the volume should be connected, otherwise the reason it
-    is skipped. Sessions and managed entries belong to the volume when their
-    target is its IQN or that IQN with one ':az-<zone>' suffix, on any portal.
-    A volume is connected only when it has no session and either no managed
-    entry or exactly its own planned entries (re-establishing them). Reruns
-    therefore never add a second set of entries or sessions for a volume, even
-    when a later run uses another layout, zonal mode or name casing.
-    A volume selected more than once in the same run is planned once by
-    build_connection_plan.
+    Only absent sessions with absent or exactly planned entries can be established.
+    Plain and zonal IQNs share ownership, so a rerun never adds another layout.
     """
     live_sessions = sessions_for_volume(sessions, plan.volume_iqn)
     persistent_entries = [
@@ -1525,9 +1518,9 @@ def plan_volume_action(plan, managed_entries, sessions, config_path):
     ]
     if any(not session_is_connected(session) for session in live_sessions):
         return (
-            "pre-existing session anomaly ({} session(s): {}); this script never adds, removes "
-            "or modifies these sessions. Inspect 'iscsictl -L -v', recover them manually or run "
-            "disconnect_for_documentation.py for this volume, then re-run".format(
+            "pre-existing session anomaly ({} session(s): {}); left unchanged. Inspect "
+            "'iscsictl -L -v'; recover them or run disconnect_for_documentation.py "
+            "for this volume before retrying".format(
                 len(live_sessions),
                 ", ".join(describe_session_state(session) for session in live_sessions),
             )
@@ -1538,9 +1531,9 @@ def plan_volume_action(plan, managed_entries, sessions, config_path):
         )
         if not persistent_entries:
             reason += (
-                "; the sessions are not persistent because {} has no managed entry for them. To "
-                "make them persistent, run disconnect_for_documentation.py for this volume during "
-                "a maintenance window and re-run".format(config_path)
+                "; the sessions are not persistent: no managed entry in {}. Run "
+                "disconnect_for_documentation.py for this volume during a maintenance "
+                "window, then reconnect".format(config_path)
             )
         return reason
     if not persistent_entries:
@@ -1553,8 +1546,7 @@ def plan_volume_action(plan, managed_entries, sessions, config_path):
         return None
     nicknames = [entry.nickname for entry in persistent_entries]
     return (
-        "persistent configuration exists but no live sessions (managed {} {}); this script "
-        "will not add a second set of entries for the same volume. Establish them with "
+        "persistent configuration exists but no live sessions (managed {} {}); no new layout added. Use "
         "'iscsictl -A -n <nickname>' for each entry, or run disconnect_for_documentation.py "
         "for this volume and re-run".format(
             "entry" if len(nicknames) == 1 else "entries",
@@ -1564,11 +1556,7 @@ def plan_volume_action(plan, managed_entries, sessions, config_path):
 
 
 def add_sessions_for_volume(plan, config_path):
-    """Add every planned session, then wait until all of them are Connected.
-
-    The volume's sessions are listed again just before submitting, so a session
-    that appeared after the pre-mutation inventory is never duplicated.
-    """
+    """Recheck sessions before adding so a newly observed session is never adopted."""
     matching_sessions = sessions_for_volume(list_iscsi_sessions(), plan.volume_iqn)
     unhealthy_sessions = [
         session for session in matching_sessions if not session_is_connected(session)
@@ -1577,8 +1565,8 @@ def add_sessions_for_volume(plan, config_path):
         states = sorted(set(describe_session_state(session) for session in unhealthy_sessions))
         raise ElasticSanConnectError(
             "{}: found an existing non-connected session for target '{}' (state: {}). "
-            "The script will not add a duplicate or remove the stale session. Inspect "
-            "'iscsictl -L -v', recover or remove that specific session manually, and retry.".format(
+            "Inspect 'iscsictl -L -v'; recover or remove that specific session manually "
+            "before retrying.".format(
                 plan.volume_name, plan.target_name, ", ".join(states)
             )
         )
@@ -1731,9 +1719,8 @@ def execute_connection_plan(plans, config_path, number_of_sessions):
                 raise ElasticSanConnectError(
                     "Failed while establishing the iSCSI sessions for '{}'; restored {} to its "
                     "state before this volume, which removes only that volume's entries.{} This "
-                    "rollback only restores the config file: iscsictl add requests may already "
-                    "have created or may still create live sessions, and this script never "
-                    "removes pre-existing sessions. Inspect 'iscsictl -L -v' and run "
+                    "rollback only restores the config file, not live sessions. Inspect "
+                    "'iscsictl -L -v' and run "
                     "disconnect_for_documentation.py for '{}' before retrying. Original "
                     "error: {}".format(
                         plan.volume_name, config_path, earlier, plan.volume_name, error
