@@ -136,6 +136,42 @@ class VipConnectionTests(unittest.TestCase):
     def run_connect(self, count=32, zonal=False, vip=True):
         connect.connect_volumes(None, "rg", "san", "vg", ["volume"], count, zonal, vip)
 
+    def test_unsupported_data_digest_connects_all_vips_with_one_warning(self):
+        def native(command, **kwargs):
+            if "update" in command and "node.conn[0].iscsi.DataDigest" in command:
+                process = mock.Mock(returncode=7)
+                process.communicate.return_value = (b"", b"Invalid param name")
+                return process
+            return self.native(command, **kwargs)
+
+        self.popen.side_effect = native
+        self.run_connect()
+        self.assertEqual(32, len(self.native.sessions))
+        self.assertEqual(1, self.stderr.getvalue().count("initiator does not support iSCSI data digests"))
+        self.assertIn("volume group enforcing CRC protection will reject the logins", self.stderr.getvalue())
+        for settings in self.native.nodes.values():
+            self.assertEqual("CRC32C", settings["node.conn[0].iscsi.HeaderDigest"])
+            self.assertNotIn("node.conn[0].iscsi.DataDigest", settings)
+
+    def test_other_digest_failures_still_prevent_vip_login(self):
+        for key, code in (("node.conn[0].iscsi.DataDigest", 1), ("node.conn[0].iscsi.DataDigest", 8),
+                          ("node.conn[0].iscsi.HeaderDigest", 7)):
+            with self.subTest(key=key, code=code):
+                self.native.nodes.clear()
+                self.native.sessions.clear()
+
+                def native(command, **kwargs):
+                    if "update" in command and key in command:
+                        process = mock.Mock(returncode=code)
+                        process.communicate.return_value = (b"", b"Invalid param name")
+                        return process
+                    return self.native(command, **kwargs)
+
+                self.popen.side_effect = native
+                outcomes = connect.connect_volumes(None, "rg", "san", "vg", ["volume"], 32, False, True)
+                self.assertTrue(outcomes[0].failed)
+                self.assertEqual({}, self.native.sessions)
+
     def test_session_snapshot_matches_case_insensitively_but_not_target_family(self):
         selected = self.native.add_session(IQN.upper(), HOST)
         self.native.add_session(IQN + ":az-eastus-az3", HOST)
