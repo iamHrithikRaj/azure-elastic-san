@@ -429,21 +429,27 @@ function Get-EsanMultipathIOState([string]$Edition) {
     if ($Edition -eq 'Server') {
         $feature = Get-WindowsFeature -Name Multipath-IO -ErrorAction Stop
         if ($null -eq $feature) { return 'Unavailable' }
-        if ("$($feature.InstallState)" -eq 'InstallPending' -or
-            (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending' -ErrorAction Stop)) { return 'RestartPending' }
-        if ("$($feature.InstallState)" -eq 'Installed') { return 'Installed' }
-        return 'NotInstalled'
+        if ("$($feature.InstallState)" -eq 'InstallPending') { return 'RestartPending' }
+        if ("$($feature.InstallState)" -ne 'Installed') { return 'NotInstalled' }
+    } else {
+        try {
+            $feature = Get-WindowsOptionalFeature -Online -FeatureName MultiPathIO -ErrorAction Stop
+        } catch {
+            # Some client editions don't include the MultiPathIO feature, and DISM reports it as unknown.
+            return 'Unavailable'
+        }
+        if ($null -eq $feature) { return 'Unavailable' }
+        if ("$($feature.State)" -eq 'EnablePending') { return 'RestartPending' }
+        if ("$($feature.State)" -ne 'Enabled') { return 'NotInstalled' }
     }
     try {
-        $feature = Get-WindowsOptionalFeature -Online -FeatureName MultiPathIO -ErrorAction Stop
+        $null = Get-MSDSMGlobalDefaultLoadBalancePolicy -ErrorAction Stop
     } catch {
-        # Some client editions don't include the MultiPathIO feature, and DISM reports it as unknown.
-        return 'Unavailable'
+        # Installed MPIO can lack its MSDSM WMI class until Windows restarts.
+        if ($_.FullyQualifiedErrorId -like '*0x80041010*' -or $_.Exception.HResult -eq -2147217392) { return 'RestartPending' }
+        throw
     }
-    if ($null -eq $feature) { return 'Unavailable' }
-    if ("$($feature.State)" -eq 'EnablePending') { return 'RestartPending' }
-    if ("$($feature.State)" -eq 'Enabled') { return 'Installed' }
-    'NotInstalled'
+    'Installed'
 }
 
 function Install-EsanMultipathIO([string]$Edition, [int]$SessionCount) {
@@ -470,6 +476,7 @@ function Install-EsanMultipathIO([string]$Edition, [int]$SessionCount) {
             $restartNeeded = [bool]$result.RestartNeeded
         }
         Write-Host 'Enabled Multipath I/O.' -ForegroundColor Cyan
+        $restartNeeded = $restartNeeded -or (Get-EsanMultipathIOState -Edition $Edition) -eq 'RestartPending'
     }
     [pscustomobject]@{ Available = $true; RestartNeeded = $restartNeeded }
 }
@@ -760,8 +767,7 @@ function Initialize-EsanHost([string]$Edition, [int]$SessionCount, [switch]$Skip
         $rebootChanges += @(Set-EsanRecommendedSettings -MpioActive $mpioActive)
     }
     if ($mpio.RestartNeeded) {
-        # A pending feature installation must keep blocking on subsequent runs too.
-        throw 'Windows needs a restart to finish enabling Multipath I/O. No sessions were added, because sessions added before MPIO is active show up as duplicate disks. Reboot the VM, then re-run this script to finish MSDSM claiming, the MPIO settings and the connections.'
+        throw 'Multipath I/O is installed but Windows must restart before it can be used. No sessions were added. Restart, then rerun.'
     }
     $rebootChanges
 }
