@@ -271,8 +271,8 @@ foreach ($mode in @(
             $logins[0][1] | Should Be $mode.Iqn
             $logins[0][3] | Should Be $mode.Portal
             # Shared validation checks the target this mode actually connected.
-            "$($script:validatedPlan[0].Volume.TargetIQN)/$($script:validatedPlan[0].Volume.NumSession)/$($script:validatedPlan[0].Action)" |
-                Should Be "$($mode.Iqn)/$expectedCount/Connect"
+            "$($script:validatedPlan[0].Iqn)/$($script:validatedPlan[0].NumSession)/$($script:validatedPlan[0].Skip)" |
+                Should Be "$($mode.Iqn)/$expectedCount/False"
             Assert-MockCalled Get-ZonalComputeMetadata -Scope It -Times ([int]$mode.Zonal) -Exactly
             Assert-MockCalled Get-VipHostAddresses -Scope It -Times ([int]$mode.Vip) -Exactly
             @($script:requests | Where-Object { $_.Command -in @('Get-AzElasticSan','Invoke-AzRestMethod') }).Count | Should Be (2 * [int]$mode.Zonal)

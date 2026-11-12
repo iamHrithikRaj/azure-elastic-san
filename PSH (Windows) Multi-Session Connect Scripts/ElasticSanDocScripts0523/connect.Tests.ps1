@@ -4,7 +4,7 @@ $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($connectPath, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
 foreach ($definition in $ast.FindAll({ param($node)
-    ($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($node.Name -like '*-Zonal*' -or $node.Name -like '*-Esan*')) -or
+    ($node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($node.Name -like '*-Zonal*' -or $node.Name -like '*-Esan*' -or $node.Name -eq 'Get-VolumeConnectionPlan')) -or
     $node -is [System.Management.Automation.Language.TypeDefinitionAst] }, $false)) {
     . ([scriptblock]::Create($definition.Extent.Text))
 }
@@ -194,7 +194,7 @@ Describe 'Default mode through the hardened entry point and golden commands' {
         $sha = [Security.Cryptography.SHA256]::Create()
         try {
             [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($legacy))).Replace('-', '').ToLowerInvariant() |
-                Should Be '7ed5a2c8e0e6b4fb7301b2c5c16dd895b7b839dc5027aeb3c4df0ff6a727b64b'
+                Should Be '2e687e1f2e1453b1d767796c52c9672041d054398dba4c1cdb8c94a70e95f4c5'
         } finally { $sha.Dispose() }
     }
     It 'retains the default count, FQDN casing and literal native argv with neither switch' {

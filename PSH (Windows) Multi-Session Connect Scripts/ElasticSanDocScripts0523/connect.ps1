@@ -378,11 +378,11 @@ function Connect-ElasticSanVolumes([string]$ResourceGroup, [string]$SanName, [st
         LiveTargets = @((Get-IscsiSession -ErrorAction Stop).TargetNodeAddress)
         PersistentTargets = $persistentTargets
     }
-    $plans = @(Get-VolumeConnectionPlan $plans $inventory)
+    $plans = @(Get-EsanConnectionPlan $plans $inventory)
     foreach ($plan in $plans) {
         if (!$plan.Skip -and $VipDistribution) { $plan.Portals = @(Resolve-VipPortals $plan.HostName) }
     }
-    Assert-EsanSessionLimit -Existing $persistentTargets.Count -New ($SessionCount * @($plans | Where-Object { !$_.Skip }).Count)
+    Assert-EsanSessionLimit -Existing $inventory.PersistentTargets.Count -Plan $plans
 
     if ($ZonalAffinity) { Write-Host 'Zonal IQN routing requires front-end suffix support.' -ForegroundColor Yellow }
     foreach ($plan in $plans) {
@@ -592,7 +592,10 @@ function Get-EsanVolumeData([string]$ResourceGroupName, [string]$ElasticSanName,
         # Terminate the script if any of the input volumes are invalid
         Write-Error "Invalid volumes: $($invalidVolumes -Join ",")" -ErrorAction Stop
     }
-    $volumesToConnect
+    foreach ($volume in $volumesToConnect) {
+        [pscustomobject]@{ Name = $volume.VolumeName; RawIqn = $volume.TargetIQN; Iqn = $volume.TargetIQN
+            HostName = $volume.TargetHostName; Port = $volume.TargetPort; NumSession = $volume.NumSession }
+    }
 }
 
 ############################### CONNECT VOLUMES ############################
@@ -609,25 +612,14 @@ function Get-EsanIscsiInventory {
     [pscustomobject]@{ Sessions = $sessions; PersistentLogins = $persistentLogins }
 }
 
-function Get-EsanConnectionPlan($Volumes) {
+function Get-EsanConnectionPlan($Volumes, $Inventory) {
     # Decide for every volume before connecting any, so a stop never leaves a half-connected batch.
     # A volume selected more than once (same IQN, any case) is planned and connected once.
-    $seen = @{}
-    $Volumes = @(foreach ($volume in $Volumes) {
-        if (-not $seen.ContainsKey($volume.TargetIQN)) { $seen[$volume.TargetIQN] = $true; $volume }
-    })
-    $inventory = Get-EsanIscsiInventory
-    $plan = @(foreach ($volume in $Volumes) {
-        $live = @($inventory.Sessions | Where-Object {
-            $_.TargetNodeAddress -ieq $volume.TargetIQN -or ([string]$_.TargetNodeAddress).StartsWith($volume.TargetIQN + ':az-', [StringComparison]::OrdinalIgnoreCase)
-        }).Count
-        $persistent = @($inventory.PersistentLogins | Where-Object {
-            $_.TargetName -ieq $volume.TargetIQN -or ([string]$_.TargetName).StartsWith($volume.TargetIQN + ':az-', [StringComparison]::OrdinalIgnoreCase)
-        }).Count
-        $action = 'Skip'
+    $plan = @(foreach ($volume in (Get-VolumeConnectionPlan $Volumes $Inventory)) {
+        $live = $volume.LiveCount
+        $persistent = $volume.PersistentCount
         $warning = $null
         if ($live -eq 0 -and $persistent -eq 0) {
-            $action = 'Connect'
             $message = 'Connecting to this volume'
         } elseif ($live -eq 0) {
             $message = "Skipped: persistent configuration exists but no live sessions (0 live / $persistent persistent)"
@@ -638,30 +630,30 @@ function Get-EsanConnectionPlan($Volumes) {
                 $warning = "the live sessions are not persistent and won't reconnect after a reboot. To make them persistent, run disconnect.ps1 for this volume and re-run this script."
             }
         }
-        [pscustomobject]@{ Volume = $volume; Action = $action; Message = $message; Warning = $warning }
+        $volume | Add-Member -NotePropertyMembers @{ Message = $message; Warning = $warning } -Force
+        $volume
     })
 
-    $newSessions = 0
-    foreach ($item in $plan) {
-        if ($item.Action -eq 'Connect') { $newSessions += $item.Volume.NumSession }
-    }
-    Assert-EsanSessionLimit -Existing $inventory.PersistentLogins.Count -New $newSessions
     $plan
 }
 
-function Assert-EsanSessionLimit([int]$Existing, [int]$New) {
+function Assert-EsanSessionLimit([int]$Existing, $Plan) {
+    $New = 0
+    foreach ($item in $Plan) {
+        if (-not $item.Skip) { $New += $item.NumSession }
+    }
     if ($Existing + $New -gt 256) {
         throw "Connecting would bring this machine to $($Existing + $New) persistent iSCSI logins ($Existing existing + $New new), above the Windows limit of 256. Re-run with a lower -NumSession or fewer volumes. No sessions were added."
     }
 }
 
 function Connect-EsanVolume($Volume) {
-    iscsicli AddTarget $Volume.TargetIQN * $Volume.TargetHostName $Volume.TargetPort * 0 * * * * * * * * * 0
+    iscsicli AddTarget $Volume.Iqn * $Volume.HostName $Volume.Port * 0 * * * * * * * * * 0
     # Keep the existing command lines: one PersistentLoginTarget per session and no separate LoginTarget,
     # which could double the sessions.
     $LoginOptions = '0x00000002'
     for ($i = 0; $i -lt $Volume.NumSession; $i++) {
-        iscsicli PersistentLoginTarget $Volume.TargetIQN.ToLower() t $Volume.TargetHostname.ToLower() $Volume.TargetPort Root\ISCSIPRT\0000_0 -1 * $LoginOptions 1 1 * * * * * * * 0
+        iscsicli PersistentLoginTarget $Volume.Iqn.ToLower() t $Volume.HostName.ToLower() $Volume.Port Root\ISCSIPRT\0000_0 -1 * $LoginOptions 1 1 * * * * * * * 0
     }
 }
 
@@ -729,19 +721,18 @@ function Test-EsanConnection($Plan, [string]$Edition, [int]$SessionCount, [bool]
         }
 
         $inventory = Get-EsanIscsiInventory
-        foreach ($item in $Plan) {
-            $volume = $item.Volume
-            $label = "$($volume.VolumeName) [$($volume.TargetIQN)]"
+        foreach ($volume in $Plan) {
+            $label = "$($volume.Name) [$($volume.Iqn)]"
             # This script never disconnects, so problems on volumes it skipped are pre-existing and only
             # warnings. Problems on volumes it connected in this run are failures.
-            $shortfall = if ($item.Action -eq 'Connect') { 'FAIL' } else { 'WARN' }
-            $sessions = @($inventory.Sessions | Where-Object { $_.TargetNodeAddress -ieq $volume.TargetIQN })
-            $persistent = @($inventory.PersistentLogins | Where-Object { $_.TargetName -ieq $volume.TargetIQN }).Count
-            if ($item.Action -eq 'Connect' -and $sessions.Count -lt $volume.NumSession) {
+            $shortfall = if (-not $volume.Skip) { 'FAIL' } else { 'WARN' }
+            $sessions = @($inventory.Sessions | Where-Object { $_.TargetNodeAddress -ieq $volume.Iqn })
+            $persistent = @($inventory.PersistentLogins | Where-Object { $_.TargetName -ieq $volume.Iqn }).Count
+            if (-not $volume.Skip -and $sessions.Count -lt $volume.NumSession) {
                 # Windows may establish saved persistent logins only at boot, so missing live sessions on a
                 # volume connected in this run are expected until the reboot. Its persistent logins are
                 # the result this run is accountable for.
-                $pending.Add($volume.VolumeName)
+                $pending.Add($volume.Name)
                 New-EsanCheck 'WARN' "$label live sessions" "$($sessions.Count) of $($volume.NumSession) requested; the saved persistent logins establish the rest at boot"
             } else {
                 New-EsanCheck (Get-EsanCountStatus $sessions.Count $volume.NumSession $shortfall) "$label live sessions" "$($sessions.Count) of $($volume.NumSession) requested"
@@ -836,13 +827,7 @@ function Invoke-EsanConnect {
         $result = Connect-ElasticSanVolumes $ResourceGroupName $ElasticSanName $VolumeGroupName $VolumeName $sessionCount -ZonalAffinity:$EnableZonalAffinity -VipDistribution:$EnableVipDistribution -Edition $edition -SkipRecommendedSettings:$SkipRecommendedSettings |
             Select-Object -Last 1
         # Validate the target each mode actually connected: the decorated IQN when zonal.
-        $plan = @(foreach ($item in $result.Plans) {
-            [pscustomobject]@{
-                Volume = [pscustomobject]@{ VolumeName = $item.Name; TargetIQN = $item.Iqn; NumSession = $sessionCount }
-                Action = if ($item.Skip) { 'Skip' } else { 'Connect' }
-            }
-        })
-        Complete-EsanConnection -Plan $plan -Edition $edition -SessionCount $sessionCount -SkipRecommendedSettings:$SkipRecommendedSettings -RebootChanges $result.RebootChanges -SessionRebootAnnounced
+        Complete-EsanConnection -Plan $result.Plans -Edition $edition -SessionCount $sessionCount -SkipRecommendedSettings:$SkipRecommendedSettings -RebootChanges $result.RebootChanges -SessionRebootAnnounced
         return
     }
 
@@ -850,12 +835,17 @@ function Invoke-EsanConnect {
     $sessionCount = [int]($volumes | Measure-Object -Property NumSession -Maximum).Maximum
     $rebootChanges = @(Initialize-EsanHost -Edition $edition -SessionCount $sessionCount -SkipRecommendedSettings:$SkipRecommendedSettings)
 
-    $plan = @(Get-EsanConnectionPlan -Volumes $volumes)
+    $inventory = Get-EsanIscsiInventory
+    $plan = @(Get-EsanConnectionPlan $volumes ([pscustomobject]@{
+        LiveTargets = @($inventory.Sessions | ForEach-Object { $_.TargetNodeAddress })
+        PersistentTargets = @($inventory.PersistentLogins | ForEach-Object { $_.TargetName })
+    }))
+    Assert-EsanSessionLimit -Existing $inventory.PersistentLogins.Count -Plan $plan
     foreach ($item in $plan) {
-        $label = "$($item.Volume.VolumeName) [$($item.Volume.TargetIQN)]"
-        if ($item.Action -eq 'Connect') {
+        $label = "$($item.Name) [$($item.Iqn)]"
+        if (-not $item.Skip) {
             Write-Host "${label}: $($item.Message)" -ForegroundColor Cyan
-            Connect-EsanVolume -Volume $item.Volume
+            Connect-EsanVolume -Volume $item
         } else {
             Write-Host "${label}: $($item.Message)" -ForegroundColor Magenta
             if ($item.Warning) { Write-Host "${label}: Warning: $($item.Warning)" -ForegroundColor Yellow }

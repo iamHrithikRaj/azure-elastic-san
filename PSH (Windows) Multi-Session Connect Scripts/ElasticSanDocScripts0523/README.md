@@ -77,6 +77,8 @@ alone skips existing configuration; it does not repair retired VIPs.
 In every mode, any live session or persistent login for the volume's plain
 IQN or `<plain IQN>:az-*` causes a skip. Run `disconnect.ps1` first to change the
 layout.
+One ownership/count planner feeds execution and fresh validation. Default
+inventory remains WMI-based; mapped/VIP inventory keeps its strict CLI parser.
 No layout proof, automatic repair, rebalance or disconnect is attempted.
 All selected-volume discovery and DNS checks finish before configuration
 changes. The script also stops before any change if the new logins would take

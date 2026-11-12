@@ -48,7 +48,7 @@ function iscsicli {
 }
 
 function New-TestVolume([string]$Name, [string]$Iqn, [int]$Sessions = 32, [string]$HostName = 'es-test.z1.blob.storage.azure.net', $Port = 3260) {
-    [pscustomobject]@{ VolumeName = $Name; TargetIQN = $Iqn; TargetHostName = $HostName; TargetPort = $Port; NumSession = $Sessions }
+    [pscustomobject]@{ Name = $Name; RawIqn = $Iqn; Iqn = $Iqn; HostName = $HostName; Port = "$Port"; NumSession = $Sessions }
 }
 
 function New-TestSession([string]$Iqn, [bool]$Digest = $true, [bool]$Persistent = $true) {
@@ -95,7 +95,7 @@ function Reset-TestHost {
 }
 
 function Invoke-TestConnect([switch]$SkipRecommendedSettings) {
-    Invoke-EsanConnect -ResourceGroupName 'rg' -ElasticSanName 'san' -VolumeGroupName 'vg' -VolumeName @($script:volumes | ForEach-Object { $_.VolumeName }) -SkipRecommendedSettings:$SkipRecommendedSettings
+    Invoke-EsanConnect -ResourceGroupName 'rg' -ElasticSanName 'san' -VolumeGroupName 'vg' -VolumeName @($script:volumes | ForEach-Object { $_.Name }) -SkipRecommendedSettings:$SkipRecommendedSettings
 }
 
 function Get-TestOutput { $script:hostLines -join "`n" }
@@ -249,38 +249,38 @@ Describe 'Hardened default flow' {
         }
 
         It 'stops first runs and pre-reboot reruns with Installed MPIO and an unavailable MSDSM provider on Server and clients' {
-                foreach ($product in 3, 1) {
-                    foreach ($firstRun in $true, $false) {
-                        Reset-TestHost
-                        $script:productType = $product
-                        $script:providerHresult = -2147217392
-                        if ($firstRun) { $script:serverFeature = 'Available'; $script:clientFeature = 'Disabled' }
-                        { Invoke-TestConnect -SkipRecommendedSettings } | Should Throw 'Multipath I/O is installed but Windows must restart before it can be used. No sessions were added. Restart, then rerun.'
-                        $script:nativeCalls.Count | Should Be 0
-                    }
+            foreach ($product in 3, 1) {
+                foreach ($firstRun in $true, $false) {
+                    Reset-TestHost
+                    $script:productType = $product
+                    $script:providerHresult = -2147217392
+                    if ($firstRun) { $script:serverFeature = 'Available'; $script:clientFeature = 'Disabled' }
+                    { Invoke-TestConnect -SkipRecommendedSettings } | Should Throw 'Multipath I/O is installed but Windows must restart before it can be used. No sessions were added. Restart, then rerun.'
+                    $script:nativeCalls.Count | Should Be 0
                 }
-                Assert-MockCalled Enable-MSDSMAutomaticClaim -Times 0 -Exactly -Scope It
-                Assert-MockCalled Get-IscsiSession -Times 0 -Exactly -Scope It
+            }
+            Assert-MockCalled Enable-MSDSMAutomaticClaim -Times 0 -Exactly -Scope It
+            Assert-MockCalled Get-IscsiSession -Times 0 -Exactly -Scope It
         }
 
         It 'does not block healthy MPIO on an unrelated CBS reboot' {
-                $script:pendingReboot = $true
-                Invoke-TestConnect
-                @(Get-TestLogins).Count | Should Be 32
+            $script:pendingReboot = $true
+            Invoke-TestConnect
+            @(Get-TestLogins).Count | Should Be 32
         }
 
         It 'does not mistake another provider failure for a restart requirement' {
-                $script:providerHresult = -2147024891
-                { Invoke-TestConnect } | Should Throw 'Invalid class'
-                $script:nativeCalls.Count | Should Be 0
+            $script:providerHresult = -2147024891
+            { Invoke-TestConnect } | Should Throw 'Invalid class'
+            $script:nativeCalls.Count | Should Be 0
         }
 
         It 'keeps the client EnablePending reboot gate without reinstalling' {
-                $script:productType = 1
-                $script:clientFeature = 'EnablePending'
-                { Invoke-TestConnect } | Should Throw 'Restart, then rerun'
-                Assert-MockCalled Enable-WindowsOptionalFeature -Times 0 -Exactly -Scope It
-                $script:nativeCalls.Count | Should Be 0
+            $script:productType = 1
+            $script:clientFeature = 'EnablePending'
+            { Invoke-TestConnect } | Should Throw 'Restart, then rerun'
+            Assert-MockCalled Enable-WindowsOptionalFeature -Times 0 -Exactly -Scope It
+            $script:nativeCalls.Count | Should Be 0
         }
 
         It 'announces a reboot and warns that claiming applies after reboot when enabled this run' {
@@ -584,7 +584,7 @@ Describe 'Hardened default flow' {
                 $script:modeCalls.Add([pscustomobject]@{ Count = $SessionCount; Zonal = [bool]$ZonalAffinity; Vip = [bool]$VipDistribution; Edition = $Edition; Skip = [bool]$SkipRecommendedSettings })
                 $iqn = if ($ZonalAffinity) { 'iqn.test:one:az-eastus-az3' } else { 'iqn.test:one' }
                 Add-TestState $iqn 0 $SessionCount
-                [pscustomobject]@{ Plans = @([pscustomobject]@{ Name = 'one'; Iqn = $iqn; Skip = $false }); RebootChanges = @(if (!$SkipRecommendedSettings) { 'MaxTransferLength' }) }
+                [pscustomobject]@{ Plans = @([pscustomobject]@{ Name = 'one'; Iqn = $iqn; NumSession = $SessionCount; Skip = $false }); RebootChanges = @(if (!$SkipRecommendedSettings) { 'MaxTransferLength' }) }
             }
             Invoke-EsanConnect -ResourceGroupName 'rg' -ElasticSanName 'san' -VolumeGroupName 'vg' -VolumeName 'one' -EnableZonalAffinity -EnableVipDistribution -SkipRecommendedSettings
             Invoke-EsanConnect -ResourceGroupName 'rg' -ElasticSanName 'san' -VolumeGroupName 'vg' -VolumeName 'one' -EnableVipDistribution -NumSession 4
