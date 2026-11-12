@@ -1498,7 +1498,13 @@ def add_sessions_for_volume(plan, config_path):
                     except ElasticSanConnectError as removal_error:
                         cleanup_error = str(removal_error)
                         kept.extend(nicknames)
-    if connected_count < len(plan.nicknames):
+    if connected_count == 0:
+        print(
+            "{}: 0 of {} sessions connected. Inspect 'iscsictl -L -v' and check target "
+            "reachability and initiator support before retrying.".format(
+                plan.volume_name, len(plan.nicknames))
+        )
+    elif connected_count < len(plan.nicknames):
         print(
             "{}: {} of {} sessions connected. The initiator accepted {} session(s) to one target "
             "portal; re-run with -s {} (or the limit your initiator supports) to request that many.".format(
