@@ -577,6 +577,45 @@ class BootPersistenceTests(unittest.TestCase):
 
 
 class ConfigValueValidationTests(unittest.TestCase):
+    def test_readme_limits_total_sessions_and_preserves_pre_existing_sessions(self):
+        with open(os.path.join(os.path.dirname(__file__), "README.md"), encoding="utf-8") as handle:
+            readme = handle.read()
+        for unsafe in ("at most one session\nper resolved VIP", "any count up to 32", "8 per VIP", "-s 24",
+                       "(or otherwise disconnect/remove sessions)"):
+            self.assertNotIn(unsafe, readme)
+        self.assertIn("never removes sessions that existed before the run", readme)
+
+    def test_native_address_omits_default_port_and_checks_46_byte_limit(self):
+        hostname = "es-mmgbuai3da50.z13.blob.storage.azure.net"
+        self.assertEqual(hostname, connect.format_target_address(hostname, 3260, "vol"))
+        self.assertEqual("a" * 46, connect.format_target_address("a" * 46, 3260, "vol"))
+        self.assertEqual("a" * 41 + ":3261", connect.format_target_address("a" * 41, 3261, "vol"))
+        for host, port in (("a" * 47, 3260), ("a" * 42, 3261)):
+            with self.subTest(host=host, port=port):
+                with self.assertRaisesRegex(connect.ElasticSanConnectError, "46 bytes"):
+                    connect.format_target_address(host, port, "vol")
+
+    def test_default_port_spelling_converges_in_config_inventory_and_plan(self):
+        entry = connect.ManagedConfigEntry("esan-vg-vol-s1", "iqn.test:vol", "portal.example:3260")
+        block = connect.render_managed_block([entry])
+        self.assertIn(b'TargetAddress = "portal.example"', block)
+        old_block = block.replace(b'"portal.example"', b'"portal.example:3260"')
+        self.assertEqual(block, connect.compute_new_config_content(old_block, block))
+        sessions = connect._parse_iscsictl_verbose_sessions(
+            verbose_session_block("iqn.test:vol", "portal.example:3260"))
+        plan = connect.VolumeConnectionPlan("vol", "iqn.test:vol", "portal.example:3260", [entry.nickname])
+        self.assertEqual([entry.target_address], plan.session_addresses)
+        self.assertEqual(entry.target_address, sessions[0]["Target portal"])
+
+    def test_overlong_later_address_stops_before_any_host_change(self):
+        with mock.patch.object(connect, "get_volume_storage_target", side_effect=[
+            ("iqn.test:first", "portal.example", 3260), ("iqn.test:second", "a" * 47, 3260)
+        ]), mock.patch.object(connect, "check_freebsd_mutation_prerequisites") as mutation:
+            with self.assertRaisesRegex(connect.ElasticSanConnectError, "46 bytes"):
+                plans = connect.build_connection_plan(None, "rg", "san", "vg", ["first", "second"], 1)
+                connect.execute_connection_plan(plans, "unused", 1)
+        mutation.assert_not_called()
+
     def test_rejects_quotes_braces_hash_semicolon(self):
         for bad_value in ['bad"value', "bad{value", "bad}value", "bad#value", "bad;value"]:
             with self.subTest(bad_value=bad_value):
@@ -690,7 +729,7 @@ class ManagedBlockRenderTests(unittest.TestCase):
         self.assertIn(connect.MANAGED_BLOCK_END, block)
         self.assertIn("esan-vg-vol-s1 {", block)
         self.assertIn('TargetName    = "iqn.example:target"', block)
-        self.assertIn('TargetAddress = "10.0.0.1:3260"', block)
+        self.assertIn('TargetAddress = "10.0.0.1"', block)
         self.assertIn("HeaderDigest  = CRC32C", block)
         self.assertIn("DataDigest    = CRC32C", block)
         self.assertIn("Enable        = On", block)
@@ -923,12 +962,12 @@ class AtomicWriteAndBackupTests(unittest.TestCase):
         with open(self.config_path, "rb") as handle:
             self.assertEqual(b"updated\n", handle.read())
 
-    def test_new_file_gets_default_permissions_when_no_prior_stat(self):
+    def test_new_file_is_private_when_no_prior_stat(self):
         with mock.patch.object(connect.os, "chmod") as chmod_mock:
             connect.write_config_atomically(self.config_path, b"brand new\n", None)
         chmod_mock.assert_called_once()
         _, mode_arg = chmod_mock.call_args.args
-        self.assertEqual(0o644, mode_arg)
+        self.assertEqual(0o600, mode_arg)
         with open(self.config_path, "rb") as handle:
             self.assertEqual(b"brand new\n", handle.read())
 
@@ -1091,7 +1130,7 @@ class SessionParsingTests(unittest.TestCase):
         sessions = connect._parse_iscsictl_verbose_sessions(output)
         self.assertEqual(1, len(sessions))
         self.assertEqual("iqn.example:target", sessions[0]["Target name"])
-        self.assertEqual("10.0.0.4:3260", sessions[0]["Target portal"])
+        self.assertEqual("10.0.0.4", sessions[0]["Target portal"])
         self.assertEqual("Connected", sessions[0]["Session state"])
 
     def test_parses_multiple_sessions_separated_by_blank_line(self):
@@ -1514,7 +1553,7 @@ class BuildConnectionPlanTests(unittest.TestCase):
                 )
         resolve_zone.assert_not_called()
         self.assertEqual("iqn.original", plans[0].target_name)
-        self.assertEqual("portal.example:3260", plans[0].target_address)
+        self.assertEqual("portal.example", plans[0].target_address)
         self.assertEqual(1, len(plans[0].nicknames))
 
     def test_opt_out_does_not_apply_enabled_iqn_normalization_or_validation(self):
@@ -1530,7 +1569,7 @@ class BuildConnectionPlanTests(unittest.TestCase):
                 )
         resolve_zone.assert_not_called()
         self.assertEqual(original_iqn, plans[0].target_name)
-        self.assertEqual("portal.example:3260", plans[0].target_address)
+        self.assertEqual("portal.example", plans[0].target_address)
         self.assertEqual(
             [connect.build_nickname("vg", "volume1", original_iqn, 1)],
             plans[0].nicknames,
@@ -1698,9 +1737,9 @@ class VipDistributionTests(unittest.TestCase):
                 )
         dns.assert_called_once()
         for plan in plans:
-            self.assertEqual("portal.example:3260", plan.target_address)
+            self.assertEqual("portal.example", plan.target_address)
             self.assertEqual(
-                ["10.0.0.1:3260"] * 11 + ["10.0.0.2:3260"] * 11 + ["10.0.0.3:3260"] * 10,
+                ["10.0.0.1"] * 11 + ["10.0.0.2"] * 11 + ["10.0.0.3"] * 10,
                 plan.session_addresses,
             )
             self.assertEqual(32, len(set(plan.nicknames)))
@@ -1728,7 +1767,7 @@ class VipDistributionTests(unittest.TestCase):
         text = output.getvalue()
         self.assertIn(connect.MULTIPATH_NOTICE, text)
         self.assertIn(
-            "at 10.0.0.1:3260 (11), 10.0.0.2:3260 (11), 10.0.0.3:3260 (10) (32 session(s)", text
+            "at 10.0.0.1 (11), 10.0.0.2 (11), 10.0.0.3 (10) (32 session(s)", text
         )
         self.assertEqual(32, text.count('TargetName    = "iqn.example:volume1"'))
 
@@ -1869,7 +1908,7 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
         acquire_lock.assert_not_called()
 
     def test_multi_session_vip_plan_writes_one_entry_per_session_and_adds_each(self):
-        addresses = ["10.0.0.1:3260", "10.0.0.1:3260", "10.0.0.2:3260"]
+        addresses = ["10.0.0.1", "10.0.0.1", "10.0.0.2"]
         nicknames = [
             connect.build_nickname("vg", "vol1", "iqn.example:vol1", index) for index in (1, 2, 3)
         ]
@@ -2525,7 +2564,7 @@ class EnabledInputPreflightTests(unittest.TestCase):
             [plan.volume_iqn for plan in plans],
         )
         self.assertEqual(
-            ["first.example:3260", "second.example:3260"],
+            ["first.example", "second.example"],
             [plan.target_address for plan in plans],
         )
         for plan in plans:

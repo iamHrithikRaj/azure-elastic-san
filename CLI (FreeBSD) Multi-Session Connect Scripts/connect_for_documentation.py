@@ -624,8 +624,13 @@ def validate_config_scalar(value, field_name):
     return value
 
 
-def format_target_address(hostname, port, volume_name):
-    """Validate raw ARM portal fields before interpolation can conceal nulls/types."""
+def format_target_address(hostname, port=..., volume_name="target"):
+    """Use iscsid's default port to stay within the kernel's 46-byte address field."""
+    if port is Ellipsis and isinstance(hostname, string_types):
+        hostname, separator, port_text = hostname.partition(":")
+        if separator and not re.fullmatch(r"[0-9]+", port_text):
+            raise ElasticSanConnectError("Target portal port must be an integer from 1 to 65535")
+        port = int(port_text) if separator else 3260
     if (
         not isinstance(hostname, string_types)
         or not hostname
@@ -641,9 +646,13 @@ def format_target_address(hostname, port, volume_name):
         raise ElasticSanConnectError(
             "Target portal port for '{}' must be an integer from 1 to 65535".format(volume_name)
         )
-    return validate_config_scalar(
-        "{}:{}".format(hostname, port), "Target address for '{}'".format(volume_name)
-    )
+    address = hostname if port == 3260 else "{}:{}".format(hostname, port)
+    if len(address.encode("ascii")) > 46:
+        raise ElasticSanConnectError(
+            "Target address for '{}' exceeds FreeBSD's 46 bytes; use a shorter hostname "
+            "or VIP distribution.".format(volume_name)
+        )
+    return validate_config_scalar(address, "Target address for '{}'".format(volume_name))
 
 
 def resolve_session_portals(hostname, number_of_sessions, enable_vip_distribution=False):
@@ -737,7 +746,7 @@ class ManagedConfigEntry(object):
     def __init__(self, nickname, target_name, target_address):
         self.nickname = nickname
         self.target_name = target_name
-        self.target_address = target_address
+        self.target_address = format_target_address(target_address)
 
 
 def render_managed_block(entries):
@@ -1075,7 +1084,7 @@ def write_config_atomically(path, new_content_bytes, original_stat):
                         )
                     )
         else:
-            os.chmod(temp_path, 0o644)
+            os.chmod(temp_path, 0o600)
         os.replace(temp_path, path)
     except BaseException:
         if os.path.exists(temp_path):
@@ -1253,6 +1262,7 @@ def _parse_iscsictl_verbose_sessions(output):
                     ", ".join(missing_fields)
                 )
             )
+        fields["Target portal"] = format_target_address(fields["Target portal"])
         sessions.append(dict(fields))
 
     for line in output.splitlines() + [""]:
@@ -1390,12 +1400,12 @@ class VolumeConnectionPlan(object):
     ):
         self.volume_name = volume_name
         self.target_name = target_name
-        self.target_address = target_address
+        self.target_address = format_target_address(target_address)
         self.nicknames = nicknames
         self.session_addresses = (
-            list(session_addresses)
+            [format_target_address(address) for address in session_addresses]
             if session_addresses is not None
-            else [target_address] * len(nicknames)
+            else [self.target_address] * len(nicknames)
         )
         if len(self.session_addresses) != len(nicknames):
             raise ElasticSanConnectError("Every planned session needs exactly one target address")
@@ -1695,7 +1705,13 @@ def add_sessions_for_volume(plan, config_path):
                     except ElasticSanConnectError as removal_error:
                         cleanup_error = str(removal_error)
                         kept.extend(nicknames)
-    if connected_count < len(plan.nicknames):
+    if connected_count == 0:
+        print(
+            "{}: 0 of {} sessions connected. Inspect 'iscsictl -L -v' and check target "
+            "reachability and initiator support before retrying.".format(
+                plan.volume_name, len(plan.nicknames))
+        )
+    elif connected_count < len(plan.nicknames):
         print(
             "{}: {} of {} sessions connected. The initiator accepted {} session(s) to one target "
             "portal; re-run with -s {} (or the limit your initiator supports) to request that many.".format(

@@ -10,9 +10,10 @@ scripts.
 
 Each session is its own `iscsi.conf` stanza. Stock FreeBSD rejects a second
 session whose target name and portal both match an existing one, so on a stock
-initiator use `-s 1`, or `--enable-vip-distribution` with at most one session
-per resolved VIP (see "Session count"). Initiators that permit several sessions
-per target portal can use any count up to 32. The script has no dependency on a
+initiator use `-s 1`, with or without VIP distribution (see "Session count").
+An initiator that allows K sessions to one target portal must use at most K
+total sessions per volume, because redirects can concentrate them on one portal.
+The script has no dependency on a
 Linux script; `disconnect_for_documentation.py` imports helpers from this file,
 so keep both files in the same directory.
 
@@ -52,8 +53,8 @@ the two scripts.
 
 This script intentionally does **not**:
 * call `iscsiadm`, `systemd`, or any Linux package manager;
-* call `iscsictl -R -a` (or otherwise disconnect/remove sessions) -- use
-  `disconnect_for_documentation.py` for the selected volumes (see "Disconnect");
+* call `iscsictl -R -a`; it never removes sessions that existed before the run.
+  Use `disconnect_for_documentation.py` for selected volumes (see "Disconnect");
 * restart the `iscsid` service, start the `iscsictl` rc service, or touch
   sessions it did not create;
 * assemble `gmultipath` devices. Each session exposes its own `/dev/da*`
@@ -80,10 +81,10 @@ python3 connect_for_documentation.py \
   -g my-resource-group -e my-elastic-san -v my-volume-group \
   -n volume1 --enable-vip-distribution
 
-# Match an initiator that allows fewer sessions per target portal (8 per VIP).
+# For an initiator that allows 8 sessions to one target portal, request 8 total.
 python3 connect_for_documentation.py \
   -g my-resource-group -e my-elastic-san -v my-volume-group \
-  -n volume1 --enable-vip-distribution -s 24
+  -n volume1 --enable-vip-distribution -s 8
 
 # Opt in to provisional zonal-affinity IQN routing.
 python3 connect_for_documentation.py \
@@ -203,7 +204,7 @@ session's portal (the FQDN, or a VIP with `--enable-vip-distribution`):
 ```
 esan-my-volume-group-volume1-<16-hex-digest>-s1 {
 	TargetName    = "iqn.2005-03.com.microsoft:<...>"
-	TargetAddress = "portal.example:3260"
+	TargetAddress = "portal.example"
 	HeaderDigest  = CRC32C
 	DataDigest    = CRC32C
 	Enable        = On
@@ -244,8 +245,10 @@ characters -- allowing them through could let a malformed API response inject
 a second statement or stanza into the file.
 Before formatting `TargetAddress`, the raw portal hostname must be a nonempty
 ASCII hostname with valid DNS labels, and the raw port must be an integer from
-1 through 65535 (not a Boolean or string). No hostname rewriting is performed,
-and DNS is queried only for `--enable-vip-distribution`.
+1 through 65535 (not a Boolean or string). Port 3260 is omitted because it is
+iscsid's default; other ports are retained. The final address must fit within
+46 ASCII bytes or planning stops before any host change. DNS is queried only
+for `--enable-vip-distribution`; hostnames are not otherwise rewritten.
 
 We deliberately do not set `LoginTimeout`/`PingTimeout` in the generated
 stanzas. `iscsi.conf(5)` only has them on FreeBSD 14.0 and later (13.x
@@ -273,6 +276,7 @@ While holding that lock, every write to `/etc/iscsi.conf` goes through: write a
 temp file in the same directory → `fsync` → preserve the original file's
 permissions and ownership (where the platform supports it) → `os.replace`
 (atomic rename).
+New config files use mode `0600`; an existing file retains its mode and ownership.
 
 Before the first write, if `/etc/iscsi.conf` already exists, its exact current
 bytes are copied once to `/etc/iscsi.conf.bak.pre-esan-connect.<pid>`, created
@@ -478,7 +482,9 @@ removed without touching a Connected session. Native `iscsictl -R -n` selects
 every session with that target+portal, not an individual nickname. Ambiguous
 cleanup fails closed, retains the entries and requires quiescing I/O and using
 the disconnect script. A partial connection is reported as fewer than requested;
-re-run with the connected count (or the initiator's supported limit).
+When at least one session connected, re-run with that count (or the initiator's
+supported limit). When none connected, inspect `iscsictl -L -v`, reachability,
+and initiator support before retrying; `-s 0` is not supported.
 
 ## VIP distribution (`--enable-vip-distribution`)
 
