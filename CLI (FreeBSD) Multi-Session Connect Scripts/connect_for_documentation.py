@@ -1045,7 +1045,7 @@ def write_config_atomically(path, new_content_bytes, original_stat):
                         )
                     )
         else:
-            os.chmod(temp_path, 0o644)
+            os.chmod(temp_path, 0o600)
         os.replace(temp_path, path)
     except BaseException:
         if os.path.exists(temp_path):
