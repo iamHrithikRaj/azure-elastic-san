@@ -1561,7 +1561,7 @@ class VipDistributionTests(unittest.TestCase):
         text = output.getvalue()
         self.assertIn(connect.MULTIPATH_NOTICE, text)
         self.assertIn(
-            "at 10.0.0.1:3260 (11), 10.0.0.2:3260 (11), 10.0.0.3:3260 (10) (32 session(s)", text
+            "at 10.0.0.1 (11), 10.0.0.2 (11), 10.0.0.3 (10) (32 session(s)", text
         )
         self.assertEqual(32, text.count('TargetName    = "iqn.example:volume1"'))
 
@@ -1693,7 +1693,7 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
         preflight.assert_not_called()
 
     def test_multi_session_vip_plan_writes_one_entry_per_session_and_adds_each(self):
-        addresses = ["10.0.0.1:3260", "10.0.0.1:3260", "10.0.0.2:3260"]
+        addresses = ["10.0.0.1", "10.0.0.1", "10.0.0.2"]
         nicknames = [
             connect.build_nickname("vg", "vol1", "iqn.example:vol1", index) for index in (1, 2, 3)
         ]
@@ -1963,7 +1963,7 @@ class EnabledInputPreflightTests(unittest.TestCase):
             [plan.volume_iqn for plan in plans],
         )
         self.assertEqual(
-            ["first.example:3260", "second.example:3260"],
+            ["first.example", "second.example"],
             [plan.target_address for plan in plans],
         )
         for plan in plans:
