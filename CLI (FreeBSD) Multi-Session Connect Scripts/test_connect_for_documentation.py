@@ -823,12 +823,12 @@ class AtomicWriteAndBackupTests(unittest.TestCase):
         with open(self.config_path, "rb") as handle:
             self.assertEqual(b"updated\n", handle.read())
 
-    def test_new_file_gets_default_permissions_when_no_prior_stat(self):
+    def test_new_file_is_private_when_no_prior_stat(self):
         with mock.patch.object(connect.os, "chmod") as chmod_mock:
             connect.write_config_atomically(self.config_path, b"brand new\n", None)
         chmod_mock.assert_called_once()
         _, mode_arg = chmod_mock.call_args.args
-        self.assertEqual(0o644, mode_arg)
+        self.assertEqual(0o600, mode_arg)
         with open(self.config_path, "rb") as handle:
             self.assertEqual(b"brand new\n", handle.read())
 
