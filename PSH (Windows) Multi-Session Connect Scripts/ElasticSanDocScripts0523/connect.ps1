@@ -313,6 +313,22 @@ function Get-ZonalPersistentTargets {
     $targets
 }
 
+function Get-VolumeConnectionPlan($Volumes, $Inventory) {
+    $seen = @{}
+    foreach ($volume in $Volumes) {
+        if ($seen.ContainsKey($volume.RawIqn)) { continue }
+        $seen[$volume.RawIqn] = $true
+        $live = @($Inventory.LiveTargets | Where-Object {
+            $_ -ieq $volume.RawIqn -or ($_ -is [string] -and $_.StartsWith("$($volume.RawIqn):az-", [StringComparison]::OrdinalIgnoreCase))
+        }).Count
+        $persistent = @($Inventory.PersistentTargets | Where-Object {
+            $_ -ieq $volume.RawIqn -or ($_ -is [string] -and $_.StartsWith("$($volume.RawIqn):az-", [StringComparison]::OrdinalIgnoreCase))
+        }).Count
+        $volume | Add-Member -NotePropertyMembers @{ LiveCount = $live; PersistentCount = $persistent; Skip = ($live + $persistent -gt 0) } -Force
+        $volume
+    }
+}
+
 function Connect-ElasticSanVolumes([string]$ResourceGroup, [string]$SanName, [string]$GroupName, [string[]]$Names,
     [ValidateRange(1,32)][int]$SessionCount = 32, [switch]$ZonalAffinity, [switch]$VipDistribution,
     [string]$Edition = 'Server', [switch]$SkipRecommendedSettings) {
@@ -348,7 +364,7 @@ function Connect-ElasticSanVolumes([string]$ResourceGroup, [string]$SanName, [st
             }
             [pscustomobject]@{
                 Name = $name; RawIqn = $volume.StorageTargetIqn; Iqn = $iqn
-                Port = $port; HostName = $hostname; Portals = @($hostname); Skip = $false
+                Port = "$port"; HostName = $hostname; Portals = @($hostname); NumSession = $SessionCount
             }
         }
     )
@@ -358,11 +374,12 @@ function Connect-ElasticSanVolumes([string]$ResourceGroup, [string]$SanName, [st
     # (prerequisites, recommended settings, reboot gate) run before any existing-state read or change.
     $rebootChanges = @(Initialize-EsanHost -Edition $Edition -SessionCount $SessionCount -SkipRecommendedSettings:$SkipRecommendedSettings)
     $persistentTargets = @(Get-ZonalPersistentTargets)
-    $targets = @((Get-IscsiSession -ErrorAction Stop).TargetNodeAddress) + $persistentTargets
+    $inventory = [pscustomobject]@{
+        LiveTargets = @((Get-IscsiSession -ErrorAction Stop).TargetNodeAddress)
+        PersistentTargets = $persistentTargets
+    }
+    $plans = @(Get-VolumeConnectionPlan $plans $inventory)
     foreach ($plan in $plans) {
-        $plan.Skip = @($targets | Where-Object {
-            $_ -ieq $plan.RawIqn -or ($_ -is [string] -and $_.StartsWith("$($plan.RawIqn):az-", [StringComparison]::OrdinalIgnoreCase))
-        }).Count -gt 0
         if (!$plan.Skip -and $VipDistribution) { $plan.Portals = @(Resolve-VipPortals $plan.HostName) }
     }
     Assert-EsanSessionLimit -Existing $persistentTargets.Count -New ($SessionCount * @($plans | Where-Object { !$_.Skip }).Count)
