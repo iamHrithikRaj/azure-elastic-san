@@ -31,8 +31,9 @@ iSCSI disks. Unless `-SkipRecommendedSettings` is set, it also applies the
 (round robin, 30-second MPIO disk timeout, iSCSI initiator registry values),
 changing only values that differ. If enabling MPIO needs a restart, the script
 stops before any iSCSI change; reboot and re-run it. A pending feature install
-or Component-Based Servicing reboot keeps that gate closed on a rerun, even
-when the Server feature already reports `Installed`.
+or an unavailable MSDSM provider keeps that gate closed on a rerun, even when
+the feature reports `Installed`. Unrelated servicing reboots do not block
+ready MPIO.
 
 Enabling MSDSM automatic iSCSI claiming also records a reboot reason.
 Validation warns that claiming applies after reboot when enabled in this run;
@@ -97,7 +98,9 @@ selection are retained. Similar-prefix unrelated targets are left alone.
 
 Persistent inventory is parsed from English `iscsicli ListPersistentTargets`
 output (`Total of ... persistent targets`, `Target Name`, `Address and Socket`).
-Missing/malformed inventory or native command failure stops cleanup explicitly.
+Missing/malformed inventory stops before cleanup. An already-absent static
+target is harmless after reboot; other cleanup failures are collected while
+later volumes are attempted, then reported as an error.
 Tests cover the assumed text format only; real Windows output and native cleanup
 still require authorized qualification. Cleanup is not transactional, so a
 failure can leave some sessions or saved logins in place.
@@ -106,13 +109,13 @@ failure can leave some sessions or saved logins in place.
 
 Run from this directory with Windows PowerShell 5.1 and Pester 3.4 (the version
 that ships with Windows). Run each file in its own `Invoke-Pester` call: the
-files define overlapping command stubs, so one multi-file run does not isolate
-them.
+files define overlapping command stubs, so each needs a separate process.
 
 ```powershell
 $failed = 0
 foreach ($file in 'connect.Tests.ps1', 'connect.Vip.Tests.ps1', 'connect.Hardening.Tests.ps1', 'disconnect.Tests.ps1') {
-    $failed += (Invoke-Pester -Script ".\$file" -PassThru).FailedCount
+    powershell.exe -NoProfile -Command "Import-Module Pester -RequiredVersion 3.4.0; if ((Invoke-Pester -Script '.\$file' -PassThru).FailedCount) { exit 1 }"
+    $failed += $LASTEXITCODE
 }
 if ($failed) { throw "$failed Pester test(s) failed" }
 ```

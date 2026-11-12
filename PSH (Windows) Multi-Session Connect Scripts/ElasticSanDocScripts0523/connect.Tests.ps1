@@ -194,7 +194,7 @@ Describe 'Default mode through the hardened entry point and golden commands' {
         $sha = [Security.Cryptography.SHA256]::Create()
         try {
             [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($legacy))).Replace('-', '').ToLowerInvariant() |
-                Should Be 'b4da36c12035f54782bd6414e9748b37f38efb3e80325842d87af285c61cc159'
+                Should Be '7ed5a2c8e0e6b4fb7301b2c5c16dd895b7b839dc5027aeb3c4df0ff6a727b64b'
         } finally { $sha.Dispose() }
     }
     It 'retains the default count, FQDN casing and literal native argv with neither switch' {
