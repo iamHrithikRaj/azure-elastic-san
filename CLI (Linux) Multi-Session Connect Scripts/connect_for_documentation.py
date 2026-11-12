@@ -349,10 +349,13 @@ def get_multipath_paths():
     return {words[0]: words[1:] for words in (line.split() for line in out.splitlines()) if len(words) == 4}
 
 
-def register_multipath_devices(outcomes, details):
+def register_multipath_devices(outcomes, details, registered):
     # find_multipaths "strict" only builds maps for known WWIDs. Register just the
     # volumes this run connected instead of changing the host-wide policy.
+    changed = False
     for outcome in outcomes:
+        if outcome.volume_iqn in registered:
+            continue
         disks = _volume_session_details(details, outcome.volume_iqn)[0]
         if not disks:
             continue
@@ -361,6 +364,11 @@ def register_multipath_devices(outcomes, details):
             print("Warning: {} [{}]: could not register the multipath WWID: {}".format(
                 outcome.volume_name, outcome.target_iqn, err or "exit code {}".format(code)
             ), file=sys.stderr)
+        else:
+            registered.add(outcome.volume_iqn)
+            changed = True
+    if not changed:
+        return
     code, _, err = run_command(_command_prefix() + ["multipathd", "reconfigure"])
     if code != 0:
         print("Warning: multipathd reconfigure failed: {}".format(err or "exit code {}".format(code)), file=sys.stderr)
@@ -499,11 +507,12 @@ def validate_connections(outcomes, requested, apply_recommended):
     connected = [(outcome, state) for outcome, state in zip(outcomes, states) if outcome.connected_this_run]
     register_wwids = apply_recommended and bool(connected) and (
         get_multipath_defaults() or {}).get("find_multipaths", "").lower() == "strict"
+    registered = set()
     # multipathd adds paths asynchronously after login; give new volumes a short, bounded wait.
     for attempt in range(MULTIPATH_WAIT_ATTEMPTS if connected else 1):
         details = get_session_details()
         if register_wwids:
-            register_multipath_devices([outcome for outcome, _ in connected if not outcome.failed], details)
+            register_multipath_devices([outcome for outcome, _ in connected if not outcome.failed], details, registered)
         paths = get_multipath_paths()
         if all(_multipath_check(outcome.volume_iqn, len(state.sessions), details, paths)[0]
                for outcome, state in connected if state):

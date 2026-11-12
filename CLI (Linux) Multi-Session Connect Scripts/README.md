@@ -75,7 +75,9 @@ scoped to vendor `MSFT` / product `Virtual HD`. `/etc/multipath.conf` and global
 defaults are never changed; differing `find_multipaths`, `polling_interval` or
 `user_friendly_names` are reported as warnings. With `find_multipaths strict`,
 only volumes connected in this run have their WWIDs registered, after disks attach
-inside the bounded readiness wait.
+inside the bounded readiness wait. Multipath is reloaded only on attempts that
+successfully register a new volume WWID; staggered disk attachment may require
+more than one reload.
 `--skip-recommended-settings` skips the node values, the multipath file and WWID
 registration; prerequisites and CRC32C digests are always requested.
 

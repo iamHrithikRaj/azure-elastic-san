@@ -778,6 +778,83 @@ class FailureAndValidationTests(HardeningTestCase):
 
 
 class MultipathTests(HardeningTestCase):
+    def test_staggered_two_volume_attachment_reloads_only_for_new_registrations(self):
+        self.host.multipath_defaults["find_multipaths"] = "strict"
+        self.host.files[connect.multipath_drop_in_path()] = connect.MULTIPATH_DROP_IN
+        original = connect.get_session_details
+        reads = 0
+
+        def staggered():
+            nonlocal reads
+            reads += 1
+            details = original()
+            if reads < 3:
+                details.pop(iqn("volume2"), None)
+            return details
+
+        with mock.patch.object(connect, "get_session_details", side_effect=staggered):
+            self.run_main(volumes=["volume1", "volume2"])
+        self.assertEqual({iqn("volume1"), iqn("volume2")}, self.host.registered)
+        self.assertEqual(2, len(self.host.ran("sudo", "multipath", "-a")))
+        self.assertEqual(2, len(self.host.ran("sudo", "multipathd", "reconfigure")))
+
+    def test_incomplete_attachment_still_fails_without_reloading_unchanged_wwids(self):
+        self.host.multipath_defaults["find_multipaths"] = "strict"
+        self.host.files[connect.multipath_drop_in_path()] = connect.MULTIPATH_DROP_IN
+        original = connect.get_session_details
+
+        def incomplete():
+            details = original()
+            details.pop(iqn("volume2"), None)
+            return details
+
+        with mock.patch.object(connect, "get_session_details", side_effect=incomplete) as reads:
+            with self.assertRaises(connect.ConnectScriptError):
+                self.run_main(volumes=["volume1", "volume2"])
+        self.assertEqual(connect.MULTIPATH_WAIT_ATTEMPTS, reads.call_count)
+        self.assertEqual({iqn("volume1")}, self.host.registered)
+        self.assertEqual(1, len(self.host.ran("sudo", "multipath", "-a")))
+        self.assertEqual(1, len(self.host.ran("sudo", "multipathd", "reconfigure")))
+        self.assertIn("[FAIL] volume2 [{}] multipath paths: no SCSI disks".format(iqn("volume2")), self.stdout)
+
+    def test_failed_registration_is_retried_before_reload(self):
+        self.host.multipath_defaults["find_multipaths"] = "strict"
+        self.host.files[connect.multipath_drop_in_path()] = connect.MULTIPATH_DROP_IN
+        original = self.host.handle
+        attempts = 0
+
+        def fail_once(command, stdin):
+            nonlocal attempts
+            if command[:3] == ["sudo", "multipath", "-a"]:
+                attempts += 1
+                if attempts == 1:
+                    return 1, "", "registration failed"
+            return original(command, stdin)
+
+        with mock.patch.object(self.host, "handle", side_effect=fail_once):
+            self.run_main()
+        self.assertEqual(2, attempts)
+        self.assertEqual(1, len(self.host.ran("sudo", "multipathd", "reconfigure")))
+
+    def test_reload_failure_warns_and_unready_paths_still_fail(self):
+        self.host.multipath_defaults["find_multipaths"] = "strict"
+        self.host.files[connect.multipath_drop_in_path()] = connect.MULTIPATH_DROP_IN
+        original = self.host.multipathd
+
+        def unavailable(args):
+            if args == ["reconfigure"]:
+                return 1, "", "reload failed"
+            if args[:3] == ["show", "paths", "raw"]:
+                return 0, "", ""
+            return original(args)
+
+        with mock.patch.object(self.host, "multipathd", side_effect=unavailable):
+            with self.assertRaises(connect.ConnectScriptError):
+                self.run_main()
+        self.assertIn("multipathd reconfigure failed: reload failed", self.stderr)
+        self.assertEqual(1, len(self.host.ran("sudo", "multipathd", "reconfigure")))
+        self.assertIn("[FAIL] volume1 [{}] multipath paths: no multipath map".format(iqn("volume1")), self.stdout)
+
     def test_delayed_disks_are_registered_within_the_readiness_wait(self):
         self.host.multipath_defaults["find_multipaths"] = "strict"
         original = self.host.iscsiadm
