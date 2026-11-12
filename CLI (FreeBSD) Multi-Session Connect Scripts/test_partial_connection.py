@@ -10,6 +10,7 @@ from test_connect_for_documentation import connect, RecordingFcntl
 
 class PartialConnectionTests(unittest.TestCase):
     def run_plan(self, addresses, states, reject_at=None, preexisting_entries=False):
+        addresses = [address.removesuffix(":3260") for address in addresses]
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         path = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=".")), "iscsi.conf")
@@ -67,7 +68,7 @@ class PartialConnectionTests(unittest.TestCase):
     def test_timeout_removes_only_unconnected_this_run_sessions_and_their_entries(self):
         plan, path, live, commands, _output, _error = self.run_plan(
             ["192.0.2.1:3260", "192.0.2.2:3260"], ["Connected", "Connecting"])
-        self.assertEqual([item["Target portal"] for item in live], ["192.0.2.1:3260"])
+        self.assertEqual([item["Target portal"] for item in live], ["192.0.2.1"])
         self.assertEqual([entry.nickname for entry in connect.read_managed_entries(path.read_bytes())],
                          plan.nicknames[:1])
         self.assertIn(["iscsictl", "-R", "-n", plan.nicknames[1], "-c", str(path)], commands)

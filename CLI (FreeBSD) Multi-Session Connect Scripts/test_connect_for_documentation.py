@@ -590,7 +590,7 @@ class ManagedBlockRenderTests(unittest.TestCase):
         self.assertIn(connect.MANAGED_BLOCK_END, block)
         self.assertIn("esan-vg-vol-s1 {", block)
         self.assertIn('TargetName    = "iqn.example:target"', block)
-        self.assertIn('TargetAddress = "10.0.0.1:3260"', block)
+        self.assertIn('TargetAddress = "10.0.0.1"', block)
         self.assertIn("HeaderDigest  = CRC32C", block)
         self.assertIn("DataDigest    = CRC32C", block)
         self.assertIn("Enable        = On", block)
@@ -992,7 +992,7 @@ class SessionParsingTests(unittest.TestCase):
         sessions = connect._parse_iscsictl_verbose_sessions(output)
         self.assertEqual(1, len(sessions))
         self.assertEqual("iqn.example:target", sessions[0]["Target name"])
-        self.assertEqual("10.0.0.4:3260", sessions[0]["Target portal"])
+        self.assertEqual("10.0.0.4", sessions[0]["Target portal"])
         self.assertEqual("Connected", sessions[0]["Session state"])
 
     def test_parses_multiple_sessions_separated_by_blank_line(self):
@@ -1378,7 +1378,7 @@ class BuildConnectionPlanTests(unittest.TestCase):
                 )
         resolve_zone.assert_not_called()
         self.assertEqual("iqn.original", plans[0].target_name)
-        self.assertEqual("portal.example:3260", plans[0].target_address)
+        self.assertEqual("portal.example", plans[0].target_address)
         self.assertEqual(1, len(plans[0].nicknames))
 
     def test_opt_out_does_not_apply_enabled_iqn_normalization_or_validation(self):
@@ -1394,7 +1394,7 @@ class BuildConnectionPlanTests(unittest.TestCase):
                 )
         resolve_zone.assert_not_called()
         self.assertEqual(original_iqn, plans[0].target_name)
-        self.assertEqual("portal.example:3260", plans[0].target_address)
+        self.assertEqual("portal.example", plans[0].target_address)
         self.assertEqual(
             [connect.build_nickname("vg", "volume1", original_iqn, 1)],
             plans[0].nicknames,
@@ -1531,9 +1531,9 @@ class VipDistributionTests(unittest.TestCase):
                 )
         dns.assert_called_once()
         for plan in plans:
-            self.assertEqual("portal.example:3260", plan.target_address)
+            self.assertEqual("portal.example", plan.target_address)
             self.assertEqual(
-                ["10.0.0.1:3260"] * 11 + ["10.0.0.2:3260"] * 11 + ["10.0.0.3:3260"] * 10,
+                ["10.0.0.1"] * 11 + ["10.0.0.2"] * 11 + ["10.0.0.3"] * 10,
                 plan.session_addresses,
             )
             self.assertEqual(32, len(set(plan.nicknames)))
