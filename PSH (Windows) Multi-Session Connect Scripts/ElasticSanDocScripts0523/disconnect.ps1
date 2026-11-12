@@ -78,6 +78,7 @@ function Test-DisconnectTargetName([string]$TargetName, [string]$TargetIqn) {
 function Invoke-DisconnectIscsiCli([string[]]$Arguments) {
     $output = @(& iscsicli @Arguments 2>&1)
     $status = $LASTEXITCODE
+    if ($Arguments[0] -eq 'RemoveTarget' -and $status -eq -268500951) { return }
     # iscsicli can return exit zero for an API failure. Unknown/localized
     # status must not be mistaken for successful inventory or cleanup.
     if ($status -ne 0 -or ($output -join "`n").TrimEnd() -cnotmatch '(^|\r?\n)The operation completed successfully\.\z') {
@@ -127,29 +128,34 @@ function Get-DisconnectPersistentTargets {
 ############## Disconnect volumes ###############################
 $persistentTargets = @(Get-DisconnectPersistentTargets)
 $processedIqns = @{}
+$failures = New-Object 'System.Collections.Generic.List[string]'
 foreach($volume in $volumesToDisconnect) {
     if ($processedIqns.ContainsKey($volume.TargetIQN)) { continue }
     $processedIqns[$volume.TargetIQN] = $true
-    $sessions = @(Get-IscsiSession -ErrorAction Stop | Where-Object { Test-DisconnectTargetName $_.TargetNodeAddress $volume.TargetIQN })
-    $persistentLogins = @($persistentTargets | Where-Object { Test-DisconnectTargetName $_.TargetName $volume.TargetIQN })
-    if ($sessions.Count -eq 0 -and $persistentLogins.Count -eq 0) {
-        Write-Host $volume.VolumeName [$($volume.TargetIQN)]: Skipped as this volume is not connected -ForegroundColor Magenta
-        continue  
-    }
+    try {
+        $sessions = @(Get-IscsiSession -ErrorAction Stop | Where-Object { Test-DisconnectTargetName $_.TargetNodeAddress $volume.TargetIQN })
+        $persistentLogins = @($persistentTargets | Where-Object { Test-DisconnectTargetName $_.TargetName $volume.TargetIQN })
+        if ($sessions.Count -eq 0 -and $persistentLogins.Count -eq 0) {
+            Write-Host $volume.VolumeName [$($volume.TargetIQN)]: Skipped as this volume is not connected -ForegroundColor Magenta
+            continue
+        }
 
-    Write-Host $volume.VolumeName [$($volume.TargetIQN)]: Disconnecting volume -ForegroundColor Cyan
-    $targetNames = @{}
-    # remove connected sessions 
-    foreach ($session in $sessions) {
-        $null = Invoke-DisconnectIscsiCli -Arguments @('LogoutTarget', $session.SessionIdentifier)
-        $targetNames[$session.TargetNodeAddress] = $true
-    }
-    # Saved portals can be FQDNs or VIPs and can differ from a live redirect.
-    foreach ($login in $persistentLogins) {
-        $null = Invoke-DisconnectIscsiCli -Arguments @('RemovePersistentTarget', 'ROOT\ISCSIPRT\0000_0', $login.TargetName, '-1', $login.Address, "$($login.Port)")
-        $targetNames[$login.TargetName] = $true
-    }
-    foreach ($targetName in $targetNames.Keys) {
-        $null = Invoke-DisconnectIscsiCli -Arguments @('RemoveTarget', $targetName)
+        Write-Host $volume.VolumeName [$($volume.TargetIQN)]: Disconnecting volume -ForegroundColor Cyan
+        $targetNames = @{}
+        foreach ($session in $sessions) {
+            $null = Invoke-DisconnectIscsiCli -Arguments @('LogoutTarget', $session.SessionIdentifier)
+            $targetNames[$session.TargetNodeAddress] = $true
+        }
+        # Saved portals can be FQDNs or VIPs and can differ from a live redirect.
+        foreach ($login in $persistentLogins) {
+            $null = Invoke-DisconnectIscsiCli -Arguments @('RemovePersistentTarget', 'ROOT\ISCSIPRT\0000_0', $login.TargetName, '-1', $login.Address, "$($login.Port)")
+            $targetNames[$login.TargetName] = $true
+        }
+        foreach ($targetName in $targetNames.Keys) {
+            $null = Invoke-DisconnectIscsiCli -Arguments @('RemoveTarget', $targetName)
+        }
+    } catch {
+        $failures.Add("$($volume.VolumeName): $($_.Exception.Message)")
     }
 }
+if ($failures.Count) { throw "Disconnect failed: $($failures -join '; ')" }
