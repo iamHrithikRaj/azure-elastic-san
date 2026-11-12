@@ -596,6 +596,36 @@ class ExistingStateTests(HardeningTestCase):
 
 
 class FailureAndValidationTests(HardeningTestCase):
+    def test_unknown_initial_snapshot_keeps_record_before_any_setting_update(self):
+        original = self.host.iscsiadm
+
+        def unreadable(args):
+            if args == ["-m", "session"] and (iqn("volume1"), PORTAL) in self.host.nodes:
+                return 5, "", "inventory unreadable"
+            return original(args)
+
+        with mock.patch.object(self.host, "iscsiadm", side_effect=unreadable):
+            with self.assertRaisesRegex(RuntimeError, "Login failed"):
+                connect.connect_volume("volume1", iqn("volume1"), [(HOST, 4)], 3260)
+        self.assertIn((iqn("volume1"), PORTAL), self.host.nodes)
+        self.assertFalse(any("update" in command or "delete" in command for command in self.host.commands))
+        self.assertIn("kept the node record", self.stderr)
+
+    def test_failed_setting_keeps_record_for_a_new_case_variant_session(self):
+        original = self.host.iscsiadm
+
+        def raced(args):
+            if "update" in args:
+                self.host.add_session(iqn("volume1").upper())
+                return 8, "", "setting update failed"
+            return original(args)
+
+        with mock.patch.object(self.host, "iscsiadm", side_effect=raced):
+            with self.assertRaisesRegex(RuntimeError, "Login failed"):
+                connect.connect_volume("volume1", iqn("volume1"), [(HOST, 4)], 3260)
+        self.assertIn((iqn("volume1"), PORTAL), self.host.nodes)
+        self.assertFalse(any("delete" in command for command in self.host.commands))
+
     def test_failed_first_login_removes_only_its_own_record_and_the_run_continues(self):
         targets = dict(TARGETS, volume1=(iqn("volume1"), "bad.example", 3260))
         connect.get_iqns.side_effect = lambda *args: targets[args[-1]]
