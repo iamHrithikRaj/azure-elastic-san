@@ -471,7 +471,7 @@ class FreeBsdMutationPreflightTests(unittest.TestCase):
 
     def test_requires_freebsd_tools_on_path(self):
         with self.assertRaisesRegex(
-            connect.ElasticSanConnectError, "iscsictl, service, sysrc, kldstat, kldload, freebsd-version"
+            connect.ElasticSanConnectError, "iscsictl, service, sysrc, kldload, freebsd-version"
         ):
             self._check(which=None)
 
@@ -491,7 +491,7 @@ class FreeBsdMutationPreflightTests(unittest.TestCase):
 
 
 class KernelDriverTests(unittest.TestCase):
-    def _ensure(self, kldstat_returncode, device_exists, iscsi_load, kldload_error=None):
+    def _ensure(self, device_exists, kldload_error=None):
         """Run ensure_iscsi_kernel_driver against mocked host state.
 
         Returns (mutating argv list, raised error or None) so failure cases can
@@ -499,16 +499,9 @@ class KernelDriverTests(unittest.TestCase):
         """
         exists_results = list(device_exists)
 
-        def run_subprocess(command, description, timeout):
-            if command[0] == "kldstat":
-                return kldstat_returncode, "", ""
-            if command == ["sysrc", "-f", "/boot/loader.conf", "-n", "iscsi_load"]:
-                return (0, iscsi_load + "\n", "") if iscsi_load else (1, "", "unknown variable")
-            raise AssertionError("unexpected read {}".format(command))
-
         run_command = mock.Mock(side_effect=kldload_error)
         error = None
-        with mock.patch.object(connect, "_run_subprocess", side_effect=run_subprocess):
+        with mock.patch.object(connect, "_run_subprocess", side_effect=AssertionError("Driver availability needs no module or loader query")):
             with mock.patch.object(connect, "_run_command", run_command):
                 with mock.patch.object(connect.os.path, "exists", side_effect=lambda _: exists_results.pop(0)):
                     try:
@@ -517,33 +510,27 @@ class KernelDriverTests(unittest.TestCase):
                         error = caught
         return [call.args[0] for call in run_command.call_args_list], error
 
-    def test_loaded_module_is_persisted_in_loader_conf(self):
-        self.assertEqual(
-            ([["sysrc", "-f", "/boot/loader.conf", "iscsi_load=YES"]], None),
-            self._ensure(0, [], ""),
-        )
-
-    def test_loaded_module_already_persisted_changes_nothing(self):
-        self.assertEqual(([], None), self._ensure(0, [], "YES"))
+    def test_available_driver_needs_no_module_or_loader_change(self):
+        self.assertEqual(([], None), self._ensure([True]))
 
     def test_compiled_in_driver_is_accepted_without_kldload_or_loader_change(self):
-        self.assertEqual(([], None), self._ensure(1, [True], ""))
+        self.assertEqual(([], None), self._ensure([True]))
 
-    def test_missing_driver_is_loaded_then_persisted(self):
+    def test_missing_driver_is_loaded_and_device_verified(self):
         self.assertEqual(
-            ([["kldload", "iscsi"], ["sysrc", "-f", "/boot/loader.conf", "iscsi_load=YES"]], None),
-            self._ensure(1, [False, True], ""),
+            ([["kldload", "iscsi"]], None),
+            self._ensure([False, True]),
         )
 
     def test_kldload_failure_stops_without_persisting(self):
         calls, error = self._ensure(
-            1, [False], "", connect.ElasticSanConnectError("kldload iscsi failed: denied")
+            [False], connect.ElasticSanConnectError("kldload iscsi failed: denied")
         )
         self.assertEqual([["kldload", "iscsi"]], calls)
         self.assertRegex(str(error), "could not be loaded: kldload iscsi failed")
 
     def test_missing_device_after_kldload_stops_without_persisting(self):
-        calls, error = self._ensure(1, [False, False], "")
+        calls, error = self._ensure([False, False])
         self.assertEqual([["kldload", "iscsi"]], calls)
         self.assertRegex(str(error), "/dev/iscsi does not exist")
 
@@ -2193,7 +2180,6 @@ class ValidationTests(unittest.TestCase):
         "iscsid_enable": "YES",
         "iscsictl_flags": "-Aa",
         "iscsictl_enable": "YES",
-        "iscsi_load": "YES",
     }
 
     def _validate(self, connected=True, host=None, driver="module", sessions=None, entries=None):
@@ -2213,7 +2199,8 @@ class ValidationTests(unittest.TestCase):
         )
         with mock.patch.object(
             connect, "_query_sysrc", side_effect=lambda variable, config_file=None: values[variable]
-        ), mock.patch.object(connect, "get_iscsi_driver_state", return_value=driver), \
+        ), mock.patch.object(connect.os.path, "exists", return_value=driver != "missing"), \
+                mock.patch.object(connect, "_run_subprocess", side_effect=AssertionError("Driver validation needs no module or loader query")), \
                 mock.patch.object(connect, "list_iscsi_sessions", list_sessions), \
                 mock.patch.object(connect, "read_config_file", return_value=(content, True, None)), \
                 mock.patch("builtins.print") as print_mock:
@@ -2222,27 +2209,19 @@ class ValidationTests(unittest.TestCase):
             )
         return failed, [call.args[0] for call in print_mock.call_args_list]
 
-    def test_healthy_host_passes_with_loaded_or_compiled_in_driver(self):
-        for driver, detail in (
-            ("module", 'iscsi.ko loaded; iscsi_load="YES" in /boot/loader.conf'),
-            ("compiled-in", "compiled into the kernel"),
-        ):
-            with self.subTest(driver=driver):
-                failed, lines = self._validate(driver=driver)
-                self.assertEqual(0, failed)
-                self.assertIn("[PASS] iSCSI kernel driver: " + detail, lines)
-                self.assertIn("[PASS] vol1 [iqn.example:vol1] live sessions: 1 Connected", lines)
-                self.assertIn(
-                    "[PASS] vol1 [iqn.example:vol1] digests: header CRC32C, data CRC32C", lines
-                )
-                self.assertIn("[PASS] vol1 [iqn.example:vol1] managed entries: 1", lines)
-                self.assertEqual("Validation: 6 passed, 0 warnings, 0 failed", lines[-1])
+    def test_healthy_host_passes_with_available_driver(self):
+        failed, lines = self._validate()
+        self.assertEqual(0, failed)
+        self.assertIn("[PASS] iSCSI kernel driver: /dev/iscsi is available", lines)
+        self.assertIn("[PASS] vol1 [iqn.example:vol1] live sessions: 1 Connected", lines)
+        self.assertIn("[PASS] vol1 [iqn.example:vol1] digests: header CRC32C, data CRC32C", lines)
+        self.assertIn("[PASS] vol1 [iqn.example:vol1] managed entries: 1", lines)
+        self.assertEqual("Validation: 6 passed, 0 warnings, 0 failed", lines[-1])
 
     def test_host_problems_fail_and_customized_iscsictl_flags_warn(self):
         cases = [
             ({"iscsid_enable": "NO"}, "module", "[FAIL] iscsid_enable: NO"),
             ({"iscsictl_enable": "NO"}, "module", "[FAIL] iscsictl_enable: NO"),
-            ({"iscsi_load": ""}, "module", "[FAIL] iSCSI kernel driver: iscsi.ko loaded but"),
             ({}, "missing", "[FAIL] iSCSI kernel driver: not loaded"),
             ({"iscsictl_flags": "-A -n other", "iscsictl_enable": "NO"}, "module",
              "[WARN] iscsictl_enable: NO with customized iscsictl_flags '-A -n other'"),
