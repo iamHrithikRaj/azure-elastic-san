@@ -1,7 +1,4 @@
-import subprocess, sys, os, argparse, json, time, re, shutil
-# for compatibility between python2 and python3 
-if hasattr(__builtins__, 'raw_input'):
-      input = raw_input
+import subprocess, sys, os, argparse, json, re, shutil
 
 # check if azure cli is installed
 def check_azcli():
