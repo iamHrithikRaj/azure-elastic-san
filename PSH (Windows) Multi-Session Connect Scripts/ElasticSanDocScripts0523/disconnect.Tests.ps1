@@ -188,7 +188,7 @@ Describe 'Target-scoped Windows disconnect' {
         $script:failedCommand = 'RemoveTarget'
         $script:nativeExit = -268500951
         $script:nativeOutput = 'The target name is not found or is marked as hidden from login.'
-        { . $disconnectBlock } | Should Not Throw
+        . $disconnectBlock
         @($script:nativeCalls | Where-Object { $_[0] -eq 'RemovePersistentTarget' }).Count | Should Be 2
         @($script:nativeCalls | Where-Object { $_[0] -eq 'RemoveTarget' }).Count | Should Be 2
     }
@@ -200,7 +200,9 @@ Describe 'Target-scoped Windows disconnect' {
         ))
         $script:failedCommand = 'RemoveTarget'
         $script:nativeExit = 5
-        { . $disconnectBlock } | Should Throw 'exit 5'
+        $failure = $null
+        try { . $disconnectBlock } catch { $failure = $_.Exception.Message }
+        $failure | Should Match 'exit 5'
         @($script:nativeCalls | Where-Object { $_[0] -eq 'RemovePersistentTarget' }).Count | Should Be 2
     }
     It 'does not tolerate the absent-target code for persistent removal' {
