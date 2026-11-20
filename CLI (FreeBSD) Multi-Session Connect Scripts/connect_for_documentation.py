@@ -1095,6 +1095,13 @@ def list_iscsi_sessions():
     return _parse_iscsictl_verbose_sessions(output)
 
 
+def canonicalize_session_portal(address):
+    host, separator, port = address.rpartition(":")
+    if separator and host and port == "3260" and (":" not in host or (host.startswith("[") and host.endswith("]"))):
+        return host
+    return address
+
+
 def _parse_iscsictl_verbose_sessions(output):
     sessions = []
     fields = {}
@@ -1110,7 +1117,7 @@ def _parse_iscsictl_verbose_sessions(output):
                     ", ".join(missing_fields)
                 )
             )
-        fields["Target portal"] = format_target_address(fields["Target portal"])
+        fields["Target portal"] = canonicalize_session_portal(fields["Target portal"])
         sessions.append(dict(fields))
 
     for line in output.splitlines() + [""]:
