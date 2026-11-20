@@ -656,6 +656,8 @@ function Connect-EsanVolume($Volume) {
     $LoginOptions = '0x00000002'
     for ($i = 0; $i -lt $Volume.NumSession; $i++) {
         iscsicli PersistentLoginTarget $Volume.Iqn.ToLower() t $Volume.HostName.ToLower() $Volume.Port Root\ISCSIPRT\0000_0 -1 * $LoginOptions 1 1 * * * * * * * 0
+        # Saved logins use ~15.6 ms timestamp keys; faster calls overwrite each other.
+        if ($i -lt ($Volume.NumSession - 1)) { Start-Sleep -Milliseconds 100 }
     }
 }
 
