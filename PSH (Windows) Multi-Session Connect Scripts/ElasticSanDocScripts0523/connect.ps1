@@ -397,6 +397,8 @@ function Connect-ElasticSanVolumes([string]$ResourceGroup, [string]$SanName, [st
             for ($i = 0; $i -lt $SessionCount; $i++) {
                 $portal = $plan.Portals[$i % $plan.Portals.Count]
                 Invoke-ZonalIscsiCli -Arguments @('PersistentLoginTarget', $plan.Iqn.ToLowerInvariant(), 't', $portal.ToLowerInvariant(), "$($plan.Port)", 'Root\ISCSIPRT\0000_0', '-1', '*', '0x00000002', '1', '1', '*', '*', '*', '*', '*', '*', '*', '0')
+                # Saved logins use ~15.6 ms timestamp keys; faster calls overwrite each other.
+                if ($i -lt ($SessionCount - 1)) { Start-Sleep -Milliseconds 100 }
             }
         } catch {
             throw "Volume '$($plan.Name)': $($_.Exception.Message) Sessions or persistent entries for this or earlier volumes may remain. No automatic rollback, disconnect or rebalance was attempted. Inspect Get-IscsiSession, Get-IscsiConnection and iscsicli ListPersistentTargets; use an operator-approved target-specific recovery procedure before retrying."
