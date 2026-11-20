@@ -1,6 +1,7 @@
 import contextlib
 import io
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -9,7 +10,8 @@ from test_connect_for_documentation import connect, RecordingFcntl, verbose_sess
 
 
 class PartialConnectionTests(unittest.TestCase):
-    def run_plan(self, addresses, states, reject_at=None, preexisting_entries=False, unrelated_portals=()):
+    def run_plan(self, addresses, states, reject_at=None, preexisting_entries=False, unrelated_portals=(),
+                 indeterminate_at=None, failure_kind="timeout"):
         addresses = [address.removesuffix(":3260") for address in addresses]
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
@@ -22,20 +24,31 @@ class PartialConnectionTests(unittest.TestCase):
         path.write_bytes(original + (connect.render_full_managed_block([plan]) if preexisting_entries else b""))
         live = []
         commands = []
+        run_subprocess = connect._run_subprocess
 
         def native(command, *_args):
             commands.append(command)
             if command[:3] == ["iscsictl", "-A", "-n"]:
                 index = plan.nicknames.index(command[3])
                 if index == reject_at:
-                    raise connect.ElasticSanConnectError("Device busy")
+                    return 1, "", "Device busy"
                 live.append({"Target name": plan.target_name, "Target portal": addresses[index],
                              "Session state": states[index]})
+                if index == indeterminate_at:
+                    if failure_kind == "signal":
+                        return -9, "", "terminated"
+                    process = mock.Mock(returncode=-9, pid=123)
+                    process.wait.side_effect = (
+                        [subprocess.TimeoutExpired(command, 15), None] if failure_kind == "timeout"
+                        else OSError("output collection failed"))
+                    with mock.patch.object(connect.subprocess, "Popen", return_value=process):
+                        return run_subprocess(command, *_args)
             elif command[:3] == ["iscsictl", "-R", "-n"]:
                 address = addresses[plan.nicknames.index(command[3])]
                 live[:] = [item for item in live if item["Target portal"] != address]
             else:
                 raise AssertionError(command)
+            return 0, "", ""
 
         stack.enter_context(mock.patch.object(connect, "fcntl", RecordingFcntl()))
         stack.enter_context(mock.patch.object(connect, "check_freebsd_mutation_prerequisites"))
@@ -50,7 +63,7 @@ class PartialConnectionTests(unittest.TestCase):
                 for item in live + unrelated))
 
         stack.enter_context(mock.patch.object(connect, "list_iscsi_sessions", side_effect=inventory))
-        stack.enter_context(mock.patch.object(connect, "_run_command", side_effect=native))
+        stack.enter_context(mock.patch.object(connect, "_run_subprocess", side_effect=native))
         stack.enter_context(mock.patch.object(connect.time, "monotonic", side_effect=range(1000)))
         stack.enter_context(mock.patch.object(connect.time, "sleep"))
         output = io.StringIO()
@@ -61,6 +74,27 @@ class PartialConnectionTests(unittest.TestCase):
             except connect.ElasticSanConnectError as raised:
                 error = raised
         return plan, path, live, commands, output.getvalue(), error
+
+    def assert_indeterminate_add_is_retained(self, index):
+        for kind in ("timeout", "io", "signal"):
+            with self.subTest(kind=kind):
+                try:
+                    plan, path, live, commands, _output, error = self.run_plan(
+                        ["host"] * 3, ["Connected"] * 3, indeterminate_at=index, failure_kind=kind)
+                    self.assertEqual(len(live), index + 1)
+                    self.assertEqual([entry.nickname for entry in connect.read_managed_entries(path.read_bytes())], plan.nicknames)
+                    self.assertEqual(len(commands), index + 1)
+                    self.assertIn("indeterminate", str(error))
+                    self.assertIn("iscsictl -L -v", str(error))
+                    self.assertIn("Disconnect", str(error))
+                finally:
+                    self.doCleanups()
+
+    def test_first_add_timeout_keeps_all_planned_entries_and_stops(self):
+        self.assert_indeterminate_add_is_retained(0)
+
+    def test_later_add_timeout_keeps_all_planned_entries_and_stops(self):
+        self.assert_indeterminate_add_is_retained(1)
 
     def test_unrelated_ipv6_inventory_does_not_block_connect(self):
         plan, path, live, commands, _output, error = self.run_plan(
