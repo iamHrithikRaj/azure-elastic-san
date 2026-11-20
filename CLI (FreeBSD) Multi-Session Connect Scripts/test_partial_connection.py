@@ -5,11 +5,11 @@ import tempfile
 import unittest
 from unittest import mock
 
-from test_connect_for_documentation import connect, RecordingFcntl
+from test_connect_for_documentation import connect, RecordingFcntl, verbose_session_block
 
 
 class PartialConnectionTests(unittest.TestCase):
-    def run_plan(self, addresses, states, reject_at=None, preexisting_entries=False):
+    def run_plan(self, addresses, states, reject_at=None, preexisting_entries=False, unrelated_portals=()):
         addresses = [address.removesuffix(":3260") for address in addresses]
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
@@ -42,7 +42,14 @@ class PartialConnectionTests(unittest.TestCase):
         stack.enter_context(mock.patch.object(connect, "ensure_iscsid_enabled_and_running"))
         if hasattr(connect, "ensure_freebsd_prerequisites"):
             stack.enter_context(mock.patch.object(connect, "ensure_freebsd_prerequisites"))
-        stack.enter_context(mock.patch.object(connect, "list_iscsi_sessions", side_effect=lambda: list(live)))
+        def inventory():
+            unrelated = [{"Target name": "iqn.test:unrelated", "Target portal": portal, "Session state": "Connected"}
+                         for portal in unrelated_portals]
+            return connect._parse_iscsictl_verbose_sessions("".join(
+                verbose_session_block(item["Target name"], item["Target portal"], item["Session state"])
+                for item in live + unrelated))
+
+        stack.enter_context(mock.patch.object(connect, "list_iscsi_sessions", side_effect=inventory))
         stack.enter_context(mock.patch.object(connect, "_run_command", side_effect=native))
         stack.enter_context(mock.patch.object(connect.time, "monotonic", side_effect=range(1000)))
         stack.enter_context(mock.patch.object(connect.time, "sleep"))
@@ -54,6 +61,23 @@ class PartialConnectionTests(unittest.TestCase):
             except connect.ElasticSanConnectError as raised:
                 error = raised
         return plan, path, live, commands, output.getvalue(), error
+
+    def test_unrelated_ipv6_inventory_does_not_block_connect(self):
+        plan, path, live, commands, _output, error = self.run_plan(
+            ["volume.example"], ["Connected"], unrelated_portals=["[2001:db8::1]:3260", "2001:db8::2"])
+        self.assertIsNone(error)
+        self.assertEqual(len(live), 1)
+        self.assertEqual([entry.nickname for entry in connect.read_managed_entries(path.read_bytes())], plan.nicknames)
+        self.assertEqual(commands, [["iscsictl", "-A", "-n", plan.nicknames[0], "-c", str(path)]])
+
+    def test_native_portals_only_drop_an_unambiguous_default_port(self):
+        portals = ["legacy.example:3260", "192.0.2.9:3260", "[2001:db8::1]:3260",
+                   "2001:db8::2", "2001:db8::3:3260", "other:3261", "native:opaque:portal"]
+        observed = connect._parse_iscsictl_verbose_sessions("".join(
+            verbose_session_block("iqn.test:unrelated", portal) for portal in portals))
+        self.assertEqual([item["Target portal"] for item in observed],
+                         ["legacy.example", "192.0.2.9", "[2001:db8::1]",
+                          "2001:db8::2", "2001:db8::3:3260", "other:3261", "native:opaque:portal"])
 
     def test_synchronous_capacity_rejection_keeps_connected_session_and_only_its_entry(self):
         plan, path, live, commands, output, _error = self.run_plan(
