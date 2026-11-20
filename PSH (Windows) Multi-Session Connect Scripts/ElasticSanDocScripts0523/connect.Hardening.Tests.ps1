@@ -43,7 +43,17 @@ function iscsicli {
     if ($args[0] -eq 'PersistentLoginTarget' -and $script:createdSessions -lt $script:maxNewSessions) {
         $script:createdSessions++
         if ($script:createLiveSessions) { $script:sessions += New-TestSession ([string]$args[1]) -Digest $script:newSessionDigest }
-        $script:persistent += [pscustomobject]@{ TargetName = [string]$args[1] }
+        $entry = [pscustomobject]@{ TargetName = [string]$args[1]; Address = [string]$args[3] }
+        if ($script:timestampKeys) {
+            $key = "$($args[1])#$([Math]::Floor($script:clockMs / 15.625))"
+            if ($script:persistentKeys.ContainsKey($key)) {
+                $script:persistent[$script:persistentKeys[$key]] = $entry
+            } else {
+                $script:persistentKeys[$key] = $script:persistent.Count
+                $script:persistent += $entry
+            }
+        } else { $script:persistent += $entry }
+        $script:clockMs += 11
     }
 }
 
@@ -92,6 +102,9 @@ function Reset-TestHost {
     $script:createdSessions = 0
     $script:createLiveSessions = $true
     $script:newSessionDigest = $true
+    $script:timestampKeys = $false
+    $script:clockMs = 0.0
+    $script:persistentKeys = @{}
 }
 
 function Invoke-TestConnect([switch]$SkipRecommendedSettings) {
@@ -233,6 +246,7 @@ Describe 'Hardened default flow' {
         Mock Get-ItemProperty { New-Object psobject -Property $script:registry }
         Mock New-ItemProperty { $script:registry[$Name] = $Value }
         Mock Get-IscsiSession { $script:sessions }
+        Mock Start-Sleep { $script:clockMs += [double]$Milliseconds + 1000 * [double]$Seconds }
     }
 
     Context 'Preconditions' {
@@ -520,6 +534,22 @@ Describe 'Hardened default flow' {
     }
 
     Context 'Connect and validate' {
+        It 'saves all 32 default requests despite timestamp collisions without a trailing delay' {
+            $script:timestampKeys = $true
+            $script:createLiveSessions = $false
+            Connect-EsanVolume $script:volumes[0]
+            $script:persistent.Count | Should Be 32
+            @(Get-TestLogins).Count | Should Be 32
+            $script:sessions.Count | Should Be 0
+            $script:clockMs | Should Be 3452
+        }
+        It 'does not sleep after a single default submission' {
+            $script:timestampKeys = $true
+            $script:createLiveSessions = $false
+            Connect-EsanVolume (New-TestVolume 'one' 'iqn.test:one' 1)
+            $script:persistent.Count | Should Be 1
+            $script:clockMs | Should Be 11
+        }
         It 'keeps the existing iscsicli command lines and never adds a separate LoginTarget' {
             $script:volumes = @(New-TestVolume 'vol1' 'iqn.test:Vol1' 2 'Portal.Example.Net' 3260)
             Invoke-TestConnect
