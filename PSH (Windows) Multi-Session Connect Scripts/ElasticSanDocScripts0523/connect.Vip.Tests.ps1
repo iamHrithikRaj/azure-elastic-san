@@ -146,7 +146,7 @@ Describe 'Persistent-login configuration without live-session polling' {
             }
             $script:existing.Count | Should Be 0
             Assert-MockCalled Get-IscsiSession -Scope It -Times 1 -Exactly
-            Assert-MockCalled Start-Sleep -Scope It -Times 0 -Exactly
+            Assert-MockCalled Start-Sleep -Scope It -Times ($case.Count - 1) -Exactly -ParameterFilter { $Milliseconds -eq 100 -and !$Seconds }
             Assert-MockCalled Write-Host -Scope It -Times 1 -Exactly -ParameterFilter { "$Object" -like '*Reboot is required*' }
         }
     }

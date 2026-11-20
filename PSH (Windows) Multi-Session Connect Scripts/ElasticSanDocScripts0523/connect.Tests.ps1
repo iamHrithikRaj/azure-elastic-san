@@ -15,6 +15,14 @@ function Get-IscsiSession { [CmdletBinding()]param() }
 function iscsicli {
     $script:nativeCalls.Add(@($args))
     $global:LASTEXITCODE = 0
+    if ($script:timestampKeys) {
+        if ($args[0] -eq 'ListPersistentTargets') { 'Total of 0 persistent targets'; 'The operation completed successfully.'; return }
+        if ($args[0] -eq 'PersistentLoginTarget') {
+            $key = "$($args[1])#$([Math]::Floor($script:clockMs / 15.625))"
+            $script:savedLogins[$key] = [pscustomobject]@{ TargetName = "$($args[1])"; Address = "$($args[3])" }
+            $script:clockMs += 11
+        }
+    }
     'The operation completed successfully.'
 }
 
@@ -178,6 +186,7 @@ Describe 'Unchanged legacy block and golden commands' {
         Mock Get-AzContext { throw 'Legacy execution must not request mapping.' }
         Mock Write-Host {}
     }
+
     It 'matches the entire upstream execution block golden fingerprint' {
         $text = [IO.File]::ReadAllText($connectPath).Replace("`r`n", "`n")
         $marker = '##################### CHECK DEPENDENCY #################################'
@@ -203,5 +212,47 @@ Describe 'Unchanged legacy block and golden commands' {
         Mock Get-IscsiSession { [pscustomobject]@{ TargetNodeAddress = 'iqn.test:one' } }
         . $connectPath 'rg' 'san' 'vg' @('one') 1
         $script:nativeCalls.Count | Should Be 0
+    }
+}
+
+foreach ($definition in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -match '-' }, $false)) {
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+if (-not (Get-Command Initialize-EsanHost -ErrorAction SilentlyContinue)) {
+    function Initialize-EsanHost { [CmdletBinding()]param($Edition, $SessionCount, [switch]$SkipRecommendedSettings) }
+}
+Describe 'Mapped persistent-login timestamp collisions' {
+    BeforeEach {
+        $script:timestampKeys = $true
+        $script:clockMs = 0.0
+        $script:savedLogins = @{}
+        $script:nativeCalls = New-Object 'System.Collections.Generic.List[object]'
+        $script:nativeExit = 0
+        $script:nativeOutput = 'The operation completed successfully.'
+        Mock Start-Sleep { $script:clockMs += [double]$Milliseconds + 1000 * [double]$Seconds }
+        Mock Write-Host {}
+        Mock Get-Service { [pscustomobject]@{ Status = 'Running' } }
+        Mock Get-WindowsFeature { [pscustomobject]@{ InstallState = 'Installed' } }
+        Mock Get-IscsiSession {}
+        Mock Initialize-EsanHost {}
+        Mock Get-AzContext { [pscustomobject]@{ Subscription = [pscustomobject]@{ Id = 'abcdef01-2345-6789-abcd-0123456789ab' } } }
+        Mock Resolve-ZonalPhysicalZone { 'eastus-az3' }
+        Mock Invoke-ZonalProviderRequest {
+            if ($Command -eq 'Get-AzElasticSanVolume') {
+                [pscustomobject]@{ StorageTargetIqn = 'iqn.test:one'; StorageTargetPortalHostname = 'portal.example'; StorageTargetPortalPort = 3260 }
+            }
+        }
+    }
+    AfterEach { $script:timestampKeys = $false }
+    foreach ($count in 1, 32) {
+        It "saves all $count mapped requests without sleeping after the last" {
+            $connector = if (Get-Command Connect-ElasticSanVolumes -ErrorAction SilentlyContinue) { 'Connect-ElasticSanVolumes' } else { 'Connect-ZonalVolumes' }
+            $parameters = @{ ResourceGroup = 'rg'; SanName = 'san'; GroupName = 'vg'; Names = @('one'); SessionCount = $count }
+            if ($connector -eq 'Connect-ElasticSanVolumes') { $parameters.ZonalAffinity = $true }
+            & $connector @parameters
+            $script:savedLogins.Count | Should Be $count
+            @($script:nativeCalls | Where-Object { $_[0] -eq 'PersistentLoginTarget' }).Count | Should Be $count
+            $script:clockMs | Should Be ($count * 11 + ($count - 1) * 100)
+        }
     }
 }
