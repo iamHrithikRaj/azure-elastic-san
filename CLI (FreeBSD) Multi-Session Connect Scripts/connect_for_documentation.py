@@ -132,6 +132,10 @@ class ElasticSanConnectError(Exception):
     """Raised for any expected, actionable failure in this script."""
 
 
+class CompletedCommandError(ElasticSanConnectError):
+    """A command completed with a non-zero exit status, rather than an unknown outcome."""
+
+
 # ---------------------------------------------------------------------------
 # Bounded subprocess execution (shared by Azure CLI and FreeBSD tool calls)
 # ---------------------------------------------------------------------------
@@ -189,7 +193,8 @@ def _run_command(command, description, timeout=AZ_CLI_TIMEOUT_SECONDS):
     returncode, out, err = _run_subprocess(command, description, timeout)
     if returncode != 0:
         detail = err if err else "exit code {}".format(returncode)
-        raise ElasticSanConnectError("{} failed: {}".format(description, detail))
+        error_type = CompletedCommandError if returncode > 0 else ElasticSanConnectError
+        raise error_type("{} failed: {}".format(description, detail))
     return out
 
 
@@ -1196,6 +1201,13 @@ def list_iscsi_sessions():
     return _parse_iscsictl_verbose_sessions(output)
 
 
+def canonicalize_session_portal(address):
+    host, separator, port = address.rpartition(":")
+    if separator and host and port == "3260" and (":" not in host or (host.startswith("[") and host.endswith("]"))):
+        return host
+    return address
+
+
 def _parse_iscsictl_verbose_sessions(output):
     sessions = []
     fields = {}
@@ -1211,7 +1223,7 @@ def _parse_iscsictl_verbose_sessions(output):
                     ", ".join(missing_fields)
                 )
             )
-        fields["Target portal"] = format_target_address(fields["Target portal"])
+        fields["Target portal"] = canonicalize_session_portal(fields["Target portal"])
         sessions.append(dict(fields))
 
     for line in output.splitlines() + [""]:
@@ -1583,7 +1595,12 @@ def add_sessions_for_volume(plan, config_path):
     for nickname, address in zip(plan.nicknames, plan.session_addresses):
         try:
             add_iscsi_session(nickname, config_path)
-        except ElasticSanConnectError as error:
+        except (ElasticSanConnectError, OSError) as error:
+            if not isinstance(error, CompletedCommandError):
+                return list(plan.nicknames), (
+                    "{}: session add outcome is indeterminate: {}. All planned entries were retained. "
+                    "Inspect 'iscsictl -L -v' and run Disconnect for this volume before retrying.".format(
+                        plan.volume_name, error))
             add_error = error
             print("{}: {} {}".format(plan.volume_name, error, SAME_PORTAL_REJECTED_HINT))
             break

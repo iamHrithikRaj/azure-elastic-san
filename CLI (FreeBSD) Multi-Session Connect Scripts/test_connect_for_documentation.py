@@ -1287,7 +1287,7 @@ class AddSessionsForVolumeTests(unittest.TestCase):
         with mock.patch.object(connect, "list_iscsi_sessions", return_value=[]), mock.patch.object(
             connect,
             "add_iscsi_session",
-            side_effect=[None, connect.ElasticSanConnectError("ISCSISADD: Device busy")],
+            side_effect=[None, connect.CompletedCommandError("ISCSISADD: Device busy")],
         ):
             with mock.patch.object(connect, "wait_for_connected_session"), contextlib.redirect_stdout(io.StringIO()) as output:
                 kept, error = connect.add_sessions_for_volume(plan, "/etc/iscsi.conf")
@@ -1300,7 +1300,7 @@ class AddSessionsForVolumeTests(unittest.TestCase):
         with mock.patch.object(connect, "list_iscsi_sessions", return_value=[]), mock.patch.object(
             connect,
             "add_iscsi_session",
-            side_effect=connect.ElasticSanConnectError("kernel rejected request"),
+            side_effect=connect.CompletedCommandError("kernel rejected request"),
         ):
             with self.assertRaisesRegex(
                 connect.ElasticSanConnectError, "^kernel rejected request$"
@@ -1821,7 +1821,7 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
         with mock.patch.object(connect, "ensure_freebsd_prerequisites"):
             with mock.patch.object(connect, "list_iscsi_sessions", return_value=[]):
                 with mock.patch.object(
-                    connect, "add_iscsi_session", side_effect=connect.ElasticSanConnectError("boom")
+                    connect, "add_iscsi_session", side_effect=connect.CompletedCommandError("boom")
                 ):
                     with mock.patch.object(
                         connect,
@@ -1846,7 +1846,7 @@ class ExecuteConnectionPlanIntegrationTests(unittest.TestCase):
         with mock.patch.object(connect, "ensure_freebsd_prerequisites"):
             with mock.patch.object(connect, "list_iscsi_sessions", return_value=[]):
                 with mock.patch.object(
-                    connect, "add_iscsi_session", side_effect=connect.ElasticSanConnectError("boom")
+                    connect, "add_iscsi_session", side_effect=connect.CompletedCommandError("boom")
                 ):
                     with self.assertRaises(connect.ElasticSanConnectError):
                         connect.execute_connection_plan(plans, self.config_path, 1)
@@ -2146,7 +2146,7 @@ class ExistingStatePolicyTests(unittest.TestCase):
                         with mock.patch.object(
                             connect,
                             "add_iscsi_session",
-                            side_effect=[None, connect.ElasticSanConnectError("kernel rejected vol2")],
+                            side_effect=[None, connect.CompletedCommandError("kernel rejected vol2")],
                         ):
                             with mock.patch("builtins.print"):
                                 with self.assertRaisesRegex(

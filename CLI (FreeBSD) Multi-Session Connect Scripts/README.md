@@ -230,6 +230,10 @@ file. Ambiguous cleanup retains entries and stops rather than risk removing a
 healthy session. Always inspect `iscsictl -L -v` before retrying a failed run.
 Service enablement/start is not rolled back.
 
+An add timeout or other indeterminate native result stops further adds and retains
+that volume's entire planned config. Killing the command does not undo a submitted
+session. Inspect `iscsictl -L -v` and run Disconnect for that volume before retrying.
+
 ## Idempotency and reruns
 
 Re-running the script with the same arguments regenerates an identical

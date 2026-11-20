@@ -42,6 +42,20 @@ def session(target_name, state="Connected"):
 
 
 class DisconnectVolumesTests(unittest.TestCase):
+    def test_unrelated_ipv6_inventory_does_not_block_selected_disconnect(self):
+        kept = entry("esan-vg-other-s1", "iqn.example:other")
+        self.write_config([entry("esan-vg-vol1-s1", "iqn.example:vol1"), kept])
+        output = "".join(
+            "Target name: {}\nTarget portal: {}\nSession state: Connected\n\n".format(target, portal)
+            for target, portal in [("iqn.example:vol1", "portal.example:3260"),
+                                   ("iqn.example:unrelated", "[2001:db8::1]:3260"),
+                                   ("iqn.example:unrelated", "2001:db8::2")])
+        with mock.patch.object(connect, "_run_command", return_value=output) as native:
+            disconnect.disconnect_volumes([("vol1", "iqn.example:vol1")], self.config_path)
+        self.assertEqual([call.args[0] for call in native.call_args_list],
+                         [["iscsictl", "-L", "-v"], ["iscsictl", "-R", "-t", "iqn.example:vol1"]])
+        self.assertEqual([item.nickname for item in connect.read_managed_entries(self.read_config())], [kept.nickname])
+
     def setUp(self):
         self.tempdir = tempfile.mkdtemp()
         self.config_path = os.path.join(self.tempdir, "iscsi.conf")
