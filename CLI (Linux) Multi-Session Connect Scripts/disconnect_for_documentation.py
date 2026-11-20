@@ -1,4 +1,4 @@
-import subprocess, sys, os, argparse, json, re, shutil
+import subprocess, sys, os, argparse, json, re, shutil, signal
 
 # check if azure cli is installed
 def check_azcli():
@@ -16,11 +16,38 @@ def get_iqns(subscription, resource_group_name, elastic_san_name, volume_group_n
     ]
     if subscription is not None:
         command.extend(["--subscription", subscription])
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-    if result.returncode != 0:
-        detail = result.stderr.decode("utf-8").strip() or result.stdout.decode("utf-8").strip()
-        raise Exception("Azure CLI failed: {}".format(detail or "exit code {}".format(result.returncode)))
-    storage_target = json.loads(result.stdout.decode("utf-8"))
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=(os.name == "posix")
+    )
+    try:
+        try:
+            out, err = process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                # The CLI launcher may be a shell; kill its descendants as well.
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+            except ProcessLookupError:
+                pass
+            except OSError as error:
+                raise RuntimeError("Azure CLI lookup timed out; termination failed: {}".format(error))
+            try:
+                process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError("Azure CLI lookup timed out; process did not exit after termination")
+            raise RuntimeError("Azure CLI lookup timed out after 10 seconds")
+    finally:
+        process.stdout.close()
+        process.stderr.close()
+    if process.returncode != 0:
+        detail = err.decode("utf-8").strip() or out.decode("utf-8").strip()
+        raise Exception("Azure CLI failed: {}".format(detail or "exit code {}".format(process.returncode)))
+    storage_target = json.loads(out.decode("utf-8"))
     target_iqn = storage_target["targetIqn"]
     target_portal_hostname = storage_target["targetPortalHostname"]
     target_portal_port = storage_target["targetPortalPort"]

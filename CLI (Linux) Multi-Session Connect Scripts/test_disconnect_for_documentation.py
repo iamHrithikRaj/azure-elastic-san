@@ -26,7 +26,7 @@ def completed_process(stdout="", stderr="", returncode=0):
 
 
 class DisconnectTests(unittest.TestCase):
-    def lookup(self, result=None, error=None):
+    def lookup(self, result=None):
         payload = json.dumps({
             "targetIqn": IQN, "targetPortalHostname": "portal.example", "targetPortalPort": 3260,
         }).encode("utf-8")
@@ -35,19 +35,19 @@ class DisconnectTests(unittest.TestCase):
         process.poll.return_value = result.returncode
         with mock.patch.object(disconnect, "check_azcli"), mock.patch.object(
             disconnect.subprocess, "Popen", return_value=process,
-        ):
-            with mock.patch.object(disconnect.subprocess, "run", return_value=result, side_effect=error) as run:
-                value = disconnect.get_iqns("subscription with spaces", "rg", "san", "vg", "volume")
-        return value, run
+        ) as popen:
+            value = disconnect.get_iqns("subscription with spaces", "rg", "san", "vg", "volume")
+        return value, popen, process
 
     def test_lookup_preserves_subscription_boundary_and_bounds_execution(self):
-        value, run = self.lookup()
+        value, popen, process = self.lookup()
         self.assertEqual((IQN, "portal.example", 3260), value)
-        run.assert_called_once_with(
+        popen.assert_called_once_with(
             ["az", "elastic-san", "volume", "show", "-g", "rg", "-e", "san", "-v", "vg",
              "-n", "volume", "--query", "storageTarget", "--subscription", "subscription with spaces"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=(os.name == "posix"),
         )
+        process.communicate.assert_called_once_with(timeout=10)
 
     def test_lookup_nonzero_exit_without_english_error_fails(self):
         with self.assertRaisesRegex(Exception, "denied"):
@@ -57,24 +57,70 @@ class DisconnectTests(unittest.TestCase):
         payload = json.dumps({
             "targetIqn": IQN, "targetPortalHostname": "portal.example", "targetPortalPort": 3260,
         }).encode("utf-8")
-        value, _ = self.lookup(subprocess.CompletedProcess([], 0, payload, b"error diagnostic only"))
+        value, _, _ = self.lookup(subprocess.CompletedProcess([], 0, payload, b"error diagnostic only"))
         self.assertEqual((IQN, "portal.example", 3260), value)
 
     def test_lookup_timeout_kills_and_reaps_cli(self):
-        process = mock.MagicMock()
-        process.__enter__.return_value = process
-        process.__exit__.side_effect = lambda *args: (process.wait(), False)[1]
-        process.communicate.side_effect = [
-            subprocess.TimeoutExpired(["az"], 10), (b"", b""),
-        ]
-        process.poll.return_value = None
-        with mock.patch.object(disconnect, "check_azcli"), mock.patch("time.sleep"), mock.patch.object(
+        self.assert_launcher_timeout(group_kill_closes_pipes=True)
+
+    def test_lookup_stays_bounded_when_a_descendant_keeps_the_pipes_open(self):
+        self.assert_launcher_timeout(group_kill_closes_pipes=False)
+
+    def assert_launcher_timeout(self, group_kill_closes_pipes):
+        class Launcher:
+            pid = 12345
+            returncode = None
+
+            def __init__(self):
+                self.stdout, self.stderr = io.BytesIO(), io.BytesIO()
+                self.child_holds_pipes = True
+                self.elapsed = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def communicate(self, input=None, timeout=None):
+                if timeout is None:
+                    raise AssertionError("unbounded communicate would hang on the descendant's pipe handles")
+                if self.child_holds_pipes:
+                    self.elapsed += timeout
+                    raise subprocess.TimeoutExpired(["az"], timeout)
+                return b"", b""
+
+            def kill(self):
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                if timeout is None:
+                    raise AssertionError("unbounded process wait")
+                return self.returncode
+
+            def poll(self):
+                return self.returncode
+
+        process = Launcher()
+        groups = []
+
+        def terminate_group(pid, sig):
+            groups.append(pid)
+            process.kill()
+            if group_kill_closes_pipes:
+                process.child_holds_pipes = False
+
+        with mock.patch.object(disconnect, "check_azcli"), mock.patch.object(
             disconnect.subprocess, "Popen", return_value=process,
+        ), mock.patch("signal.SIGKILL", 9, create=True), mock.patch.object(disconnect.os, "name", "posix"), mock.patch.object(
+            disconnect.os, "killpg", side_effect=terminate_group, create=True,
         ):
-            with self.assertRaises(subprocess.TimeoutExpired):
+            with self.assertRaisesRegex(RuntimeError, "Azure CLI.*timed out"):
                 disconnect.get_iqns(None, "rg", "san", "vg", "volume")
-        process.kill.assert_called_once_with()
-        process.wait.assert_called()
+        self.assertEqual([process.pid], groups)
+        self.assertLessEqual(process.elapsed, 20)
+        self.assertIsNotNone(process.returncode)
+        self.assertTrue(process.stdout.closed and process.stderr.closed)
 
     def test_import_needs_no_package_manager(self):
         module = importlib.util.module_from_spec(SPEC)
