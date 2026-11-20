@@ -59,6 +59,9 @@ count are registered.
 
 The script calls `AddTarget` once per used portal and saves each login with
 `PersistentLoginTarget`, preserving the multipath and digest options.
+Submissions are spaced by 100 ms, with no delay after the last, to avoid
+Windows timestamp-key collisions silently overwriting saved logins. There is
+no automatic retry or top-up; final validation still reports any shortfall.
 **Reboot is required to establish the saved logins.** It does not poll for
 live sessions after saving them.
 
