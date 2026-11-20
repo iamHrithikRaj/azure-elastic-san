@@ -261,6 +261,8 @@ function Connect-ZonalVolumes([string]$ResourceGroup, [string]$SanName, [string]
         Invoke-ZonalIscsiCli -Arguments @('AddTarget', $plan.Iqn, '*', $plan.HostName, "$($plan.Port)", '*', '0', '*', '*', '*', '*', '*', '*', '*', '*', '*', '0')
         for ($i = 0; $i -lt $SessionCount; $i++) {
             Invoke-ZonalIscsiCli -Arguments @('PersistentLoginTarget', $plan.Iqn, 't', $plan.HostName.ToLowerInvariant(), "$($plan.Port)", 'Root\ISCSIPRT\0000_0', '-1', '*', '0x00000002', '1', '1', '*', '*', '*', '*', '*', '*', '*', '0')
+            # Saved logins use ~15.6 ms timestamp keys; faster calls overwrite each other.
+            if ($i -lt ($SessionCount - 1)) { Start-Sleep -Milliseconds 100 }
         }
         Write-Host "$($plan.Name) [$($plan.Iqn)]: Submitted $SessionCount persistent login requests through the FQDN; verify native session readiness." -ForegroundColor Cyan
     }
