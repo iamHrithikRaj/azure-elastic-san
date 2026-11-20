@@ -15,6 +15,11 @@ function iscsicli {
     $global:LASTEXITCODE = 0
     if ($args[0] -eq 'ListPersistentTargets') { $script:persistentOutput; return }
     $global:LASTEXITCODE = $script:nativeExit
+    if ($script:timestampKeys -and $args[0] -eq 'PersistentLoginTarget') {
+        $key = "$($args[1])#$([Math]::Floor($script:clockMs / 15.625))"
+        $script:savedLogins[$key] = [pscustomobject]@{ TargetName = "$($args[1])"; Address = "$($args[3])" }
+        $script:clockMs += 11
+    }
     $script:nativeOutput
     # PersistentLoginTarget saves configuration; it does not create a live session.
 }
@@ -98,6 +103,7 @@ Describe 'Persistent-login configuration without live-session polling' {
         $script:nativeCalls = New-Object 'System.Collections.Generic.List[object]'
         $script:requests = New-Object 'System.Collections.Generic.List[object]'
         $script:nativeExit = 0; $script:nativeOutput = 'The operation completed successfully.'
+        $script:timestampKeys = $false; $script:clockMs = 0.0; $script:savedLogins = @{}
         # Assumed English CLI format, not a captured native-host fixture.
         $script:persistentOutput = @('Total of 0 persistent targets', 'The operation completed successfully.')
         $script:existing = @(); $script:badSecond = ''; $script:duplicateIqn = $false
@@ -107,7 +113,7 @@ Describe 'Persistent-login configuration without live-session polling' {
         Mock Get-WindowsFeature { [pscustomobject]@{ InstallState = 'Installed' } }
         Mock Get-IscsiSession { $script:existing }
         Mock Write-Host {}
-        Mock Start-Sleep { throw 'Persistent logins must not wait for live sessions.' }
+        Mock Start-Sleep { $script:clockMs += [double]$Milliseconds + 1000 * [double]$Seconds }
         Set-TestConnectionBoundaries
         Mock Get-AzContext {
             # The actual file defines helpers before its first external boundary.
@@ -150,6 +156,16 @@ Describe 'Persistent-login configuration without live-session polling' {
         ($script:nativeCalls[1] -join '|') | Should Be 'AddTarget|iqn.test:one|*|one.EXAMPLE|3261|*|0|*|*|*|*|*|*|*|*|*|0'
         $script:nativeCalls[2][3] | Should Be 'one.example'
         $script:nativeCalls[2][4] | Should Be '3261'
+    }
+    It 'saves all 32 VIP logins with an 11/11/10 split despite shared timestamp keys' {
+        $script:timestampKeys = $true
+        Connect-ElasticSanVolumes 'rg' 'san' 'vg' @('one') 32 -VipDistribution
+        $script:savedLogins.Count | Should Be 32
+        foreach ($portalCount in @(@{ Portal = '10.0.0.8'; Count = 11 }, @{ Portal = '10.0.0.9'; Count = 11 }, @{ Portal = '10.0.0.10'; Count = 10 })) {
+            @($script:savedLogins.Values | Where-Object { $_.Address -eq $portalCount.Portal }).Count | Should Be $portalCount.Count
+        }
+        @($script:nativeCalls | Where-Object { $_[0] -eq 'PersistentLoginTarget' }).Count | Should Be 32
+        $script:clockMs | Should Be 3452
     }
     It 'skips any related live or persistent target, including another zone, without resolving DNS' {
         foreach ($target in @('iqn.test:one','IQN.TEST:ONE:az-eastus-az3','iqn.test:one:az-eastus-az1')) {
